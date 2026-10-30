@@ -1,0 +1,24 @@
+# Local builds and generated artifacts
+build*/
+.cache/
+__pycache__/
+*.pyc
+*.o
+*.a
+*.so
+*.so.*
+*.dll
+*.exe
+*.log
+# Models, secrets and private measurements
+*.gguf
+*.safetensors
+*.bin
+.env
+.env.*
+*.pem
+*.key
+*.private.*
+credentials*
+secrets*
+node_modules/

@@ -1,0 +1,29 @@
+{
+  "project": "ParaFlow",
+  "baseline": "V72b source preparation snapshot",
+  "upstream": "https://github.com/ggml-org/llama.cpp",
+  "upstream_commit": "not yet independently established; do not infer from old benchmark labels",
+  "base_archive_sha256": "9a987be95f7b0e5aa38f13d267d464d1892b292de4d1a2abc0bb622a61f37bf3",
+  "overlays": {
+    "tools/server/server-context.cpp": {
+      "sha256": "60507da3a9af6e190c9ecbdb7b86026b89748e5e8eb31f6913d5d89f19c92a8a",
+      "origin": "r45-mtp-admit-v72b-sm86-20261030/source/tools/server/server-context.cpp"
+    },
+    "common/speculative.cpp": {
+      "sha256": "f08225fe3b9f0f9e12301fe674ef2782887bb42b31ce8bc55b8c57772346a040",
+      "origin": "r45-draft-executor-v68c-sm86-20261029/source/common/speculative.cpp"
+    },
+    "common/speculative.h": {
+      "sha256": "900181bbbd78daa16551458a98848672848e21eae914bee6f3f4c0e09dd37cff",
+      "origin": "r45-draft-executor-v68c-sm86-20261029/source/common/speculative.h"
+    },
+    "ggml/src/ggml-cuda/ggml-cuda.cu": {
+      "sha256": "380e9c1cf25ba90d248da90557e4a9dcd23aed9f325fa9e66f0e104304137742",
+      "origin": "r45-draft-executor-v68d-sm86-20261029/source/ggml/src/ggml-cuda/ggml-cuda.cu"
+    }
+  },
+  "required_build_definitions": [
+    "CMake cache GGML_SCHED_MAX_COPIES=8"
+  ],
+  "validation": "Source assembly pending clean-build verification; previously tested component stack is not proof of this clean build."
+}
