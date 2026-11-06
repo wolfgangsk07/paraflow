@@ -5,6 +5,7 @@
 #include "ggml-cpp.h"
 
 #include <string>
+#include <map>
 #include <unordered_map>
 #include <vector>
 
@@ -15,6 +16,7 @@
 //
 
 struct llama_adapter_cvec {
+    std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
     ggml_tensor * tensor_for(int il) const;
 
     ggml_tensor * apply_to(ggml_context * ctx, ggml_tensor * cur, int  il) const;

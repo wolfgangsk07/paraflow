@@ -454,6 +454,12 @@ bool llama_kv_cache::configure_dynamic_pool() {
 #ifndef GGML_USE_CUDA
     return false;
 #else
+    // A NextN-only draft cache grows its physical page pool on demand instead of reserving its budget.
+    const bool elastic_mtp = !other &&
+            hparams.n_layer_nextn > 0 && hparams.n_layer() > 0 && !layers.empty() &&
+            std::all_of(layers.begin(), layers.end(), [&](const auto & layer) {
+                return layer.il >= hparams.n_layer();
+            });
     const uint32_t page_tokens = std::max(n_pad, 256u);
     GGML_ASSERT(stream_size % page_tokens == 0);
     const uint32_t max_units_per_stream = stream_size / page_tokens;
@@ -571,14 +577,19 @@ bool llama_kv_cache::configure_dynamic_pool() {
         const uint64_t virtual_pages = (buffer_size + granularity - 1) / granularity;
         max_pages = std::min<int64_t>(max_pages, virtual_pages);
         const uint64_t pool_bytes = uint64_t(max_pages) * granularity;
-        if (!ggml_backend_cuda_sparse_kv_set_pool_size(buffer, pool_bytes)) {
+        if (!(elastic_mtp ? ggml_backend_cuda_sparse_kv_set_elastic_pool_size(buffer, pool_bytes) :
+                           ggml_backend_cuda_sparse_kv_set_pool_size(buffer, pool_bytes))) {
             return false;
         }
         const uint64_t actual_pool_bytes = ggml_backend_cuda_sparse_kv_pool_bytes(buffer);
-        if (actual_pool_bytes != pool_bytes + granularity) {
+        if (actual_pool_bytes != (elastic_mtp ? granularity : pool_bytes + granularity)) {
             return false;
         }
-        LLAMA_LOG_INFO("%s: %10s fixed KV pool = %8.2f MiB "
+        if (elastic_mtp) {
+            fprintf(stderr, "MTP_ELASTIC_KV_INIT backend=%s physical=%" PRIu64 " max_data=%" PRIu64 " streams=%u capacity=%u\n",
+                    ggml_backend_buffer_name(buffer), actual_pool_bytes, pool_bytes, n_stream, capacity);
+        }
+        LLAMA_LOG_INFO("%s: %10s initial KV pool = %8.2f MiB "
                 "(%" PRId64 " data pages + 1 shared zero page, shared cap %u)\n",
                 __func__, ggml_backend_buffer_name(buffer),
                 actual_pool_bytes / 1024.0 / 1024.0, max_pages, capacity);
@@ -614,26 +625,6 @@ bool llama_kv_cache::trim() {
     bool success = true;
     for (const auto & [_, buffer] : ctxs_bufs) {
         if (!ggml_backend_cuda_sparse_kv_trim(buffer.get())) {
-            success = false;
-        }
-    }
-    return success;
-#else
-    return false;
-#endif
-}
-
-bool llama_kv_cache::release_physical() {
-    if (!dynamic) {
-        return true;
-    }
-
-    release_empty_streams();
-
-#ifdef GGML_USE_CUDA
-    bool success = true;
-    for (const auto & [_, buffer] : ctxs_bufs) {
-        if (!ggml_backend_cuda_sparse_kv_release_pool(buffer.get())) {
             success = false;
         }
     }
@@ -707,19 +698,15 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         auto & cells = v_cells[seq_to_stream[seq_id]];
         auto & head  = v_heads[seq_to_stream[seq_id]];
 
-        // MTP normally removes at most a few tail positions. The ordered
-        // sequence index avoids scanning the entire reserved context each round.
-        static const bool indexed_remove = [] {
-            const char * setting = std::getenv("LLAMA_KV_INDEXED_REMOVE");
-            return setting && std::atoi(setting) != 0;
-        }();
         uint32_t new_head = cells.size();
-        if (indexed_remove) {
-            new_head = cells.seq_rm_range(seq_id, p0, p1);
-        } else {
-            for (uint32_t i = 0; i < cells.size(); ++i) {
-                if (!cells.pos_in(i, p0, p1)) { continue; }
-                if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id) && new_head == cells.size()) {
+
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (!cells.pos_in(i, p0, p1)) {
+                continue;
+            }
+
+            if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
+                if (new_head == cells.size()) {
                     new_head = i;
                 }
             }
@@ -996,6 +983,200 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
     return cells.seq_pos_max(seq_id);
 }
 
+int32_t llama_kv_cache::seq_stream(llama_seq_id seq_id) const {
+    if (other || n_stream == 1 || seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return -1;
+    }
+
+    return (int32_t) seq_to_stream[seq_id];
+}
+
+bool llama_kv_cache::swap_stream_device(uint32_t sa, uint32_t sb, uint32_t na, uint32_t nb) {
+    const uint32_t n_max = std::max(na, nb);
+    if (n_max == 0) {
+        return true;
+    }
+
+    // one scratch slice per buffer type (device), kept for later exchanges
+    std::map<ggml_backend_buffer_type_t, size_t> need;
+    for (const auto & layer : layers) {
+        for (const ggml_tensor * t : { layer.k_stream[sa], layer.v_stream[sa] }) {
+            if (t == nullptr || t->buffer == nullptr) {
+                continue;
+            }
+            auto & n = need[ggml_backend_buffer_get_type(t->buffer)];
+            n = std::max(n, size_t{na} * t->nb[1]);
+        }
+    }
+    for (const auto & [buft, size] : need) {
+        auto & buf = swap_scratch[buft];
+        if (!buf || ggml_backend_buffer_get_size(buf.get()) < size) {
+            buf.reset(size > 0 ? ggml_backend_buft_alloc_buffer(buft, size) : nullptr);
+            if (size > 0 && !buf) {
+                swap_scratch.erase(buft);
+                return false;
+            }
+        }
+    }
+
+    if (dynamic) {
+        // both streams resident for the longer prefix: this only adds pages, the old rows stay in place
+        for (const uint32_t s : { sa, sb }) {
+            const slot_info sinfo = { s, s, { static_cast<llama_seq_id>(s) }, { { n_max - 1 } } };
+            if (!ensure_mapped(sinfo, std::min(get_size(), GGML_PAD(n_max, 256u)))) {
+                return false;
+            }
+        }
+    }
+
+    auto rows = [](const ggml_tensor * t, uint32_t n) {
+        ggml_tensor v = *t;
+        v.ne[1] = n;
+        return v;
+    };
+    for (const auto & layer : layers) {
+        for (const auto & [ta, tb] : { std::make_pair(layer.k_stream[sa], layer.k_stream[sb]),
+                                        std::make_pair(layer.v_stream[sa], layer.v_stream[sb]) }) {
+            if (ta == nullptr) {
+                continue;
+            }
+            ggml_tensor a_n = rows(ta, na), b_dst = rows(tb, na);
+            ggml_tensor b_n = rows(tb, nb), a_dst = rows(ta, nb);
+            ggml_tensor tmp = a_n;
+            if (na > 0) {
+                auto & buf = swap_scratch.at(ggml_backend_buffer_get_type(ta->buffer));
+                tmp.buffer    = buf.get();
+                tmp.data      = ggml_backend_buffer_get_base(buf.get());
+                tmp.view_src  = nullptr;
+                tmp.view_offs = 0;
+                ggml_backend_tensor_copy(&a_n, &tmp);
+            }
+            if (nb > 0) {
+                ggml_backend_tensor_copy(&b_n, &a_dst);
+            }
+            if (na > 0) {
+                ggml_backend_tensor_copy(&tmp, &b_dst);
+            }
+        }
+    }
+    return true;
+}
+
+int32_t llama_kv_cache::seq_swap_stream(llama_seq_id seq_id_a, llama_seq_id seq_id_b) {
+    if (seq_id_a == seq_id_b) {
+        return 1;
+    }
+
+    // shared cells belong to the other cache's layout; pending stream copies refer to the current layout
+    if (other || n_stream == 1 || !sc_info.empty() ||
+            seq_id_a < 0 || (size_t) seq_id_a >= seq_to_stream.size() ||
+            seq_id_b < 0 || (size_t) seq_id_b >= seq_to_stream.size()) {
+        return 0;
+    }
+
+    const uint32_t sa = seq_to_stream[seq_id_a];
+    const uint32_t sb = seq_to_stream[seq_id_b];
+    if (sa == sb) {
+        return 0;
+    }
+
+    // a stream holds only the sequence mapped to it; the cells move with their sequence
+    const uint32_t na = v_cells[sa].used_max_p1();
+    const uint32_t nb = v_cells[sb].used_max_p1();
+
+    if (!v_trans && swap_stream_device(sa, sb, na, nb)) {
+        std::swap(v_cells[sa], v_cells[sb]);
+        std::swap(v_heads[sa], v_heads[sb]);
+        std::swap(seq_to_stream[seq_id_a], seq_to_stream[seq_id_b]);
+        if (dynamic) {
+            // every page the new prefixes need is mapped already: re-owning them recycles nothing
+            bool ok = release_stream(sa) && release_stream(sb);
+            for (const uint32_t s : { sa, sb }) {
+                const uint32_t n = v_cells[s].used_max_p1();
+                const slot_info sinfo = { s, s, { static_cast<llama_seq_id>(s) }, { { 0 } } };
+                ok = ok && (n == 0 || ensure_mapped(sinfo, std::min(get_size(), GGML_PAD(n, 256u))));
+            }
+            if (!ok) {
+                LLAMA_LOG_ERROR("%s: failed to re-own sparse-KV pages for streams %u <-> %u, clearing sequences %d and %d\n",
+                        __func__, sa, sb, seq_id_a, seq_id_b);
+                seq_rm(seq_id_a, -1, -1);
+                seq_rm(seq_id_b, -1, -1);
+                release_stream(sa);
+                release_stream(sb);
+                return -1;
+            }
+        }
+        return 1;
+    }
+
+    // bytes of the first n cells of one stream tensor (a transposed V stream is copied whole)
+    auto n_bytes = [&](const ggml_tensor * t, bool is_v, uint32_t n) -> size_t {
+        if (n == 0) {
+            return 0;
+        }
+        return is_v && v_trans ? ggml_nbytes(t) : size_t{n} * t->nb[1];
+    };
+
+    struct staged_t {
+        ggml_tensor * dst;
+        std::vector<uint8_t> data;
+    };
+    std::vector<staged_t> staged;
+    staged.reserve(4*layers.size());
+
+    auto stage = [&](ggml_tensor * src, ggml_tensor * dst, bool is_v, uint32_t n) {
+        const size_t size = n_bytes(src, is_v, n);
+        if (size == 0) {
+            return;
+        }
+        staged.push_back({ dst, std::vector<uint8_t>(size) });
+        ggml_backend_tensor_get(src, staged.back().data.data(), 0, size);
+    };
+
+    // stage both prefixes in host memory, so neither stream needs a device scratch copy
+    for (const auto & layer : layers) {
+        stage(layer.k_stream[sa], layer.k_stream[sb], false, na);
+        stage(layer.k_stream[sb], layer.k_stream[sa], false, nb);
+        if (layer.v_stream[sa]) {
+            stage(layer.v_stream[sa], layer.v_stream[sb], true, na);
+            stage(layer.v_stream[sb], layer.v_stream[sa], true, nb);
+        }
+    }
+
+    std::swap(v_cells[sa], v_cells[sb]);
+    std::swap(v_heads[sa], v_heads[sb]);
+    std::swap(seq_to_stream[seq_id_a], seq_to_stream[seq_id_b]);
+
+    if (dynamic) {
+        // the private pages of a stream are owned by the stream id: give both streams the residency of their new
+        // contents (the total is unchanged, so the pool can always serve it back)
+        bool ok = release_stream(sa) && release_stream(sb);
+        for (const uint32_t s : { sa, sb }) {
+            const uint32_t n = v_cells[s].used_max_p1();
+            if (n == 0) {
+                continue;
+            }
+            const slot_info sinfo = { s, s, { static_cast<llama_seq_id>(s) }, { { 0 } } };
+            ok = ok && ensure_mapped(sinfo, std::min(get_size(), GGML_PAD(n, 256u)));
+        }
+        if (!ok) {
+            LLAMA_LOG_ERROR("%s: failed to remap sparse-KV pages for streams %u <-> %u, clearing sequences %d and %d\n",
+                    __func__, sa, sb, seq_id_a, seq_id_b);
+            seq_rm(seq_id_a, -1, -1);
+            seq_rm(seq_id_b, -1, -1);
+            release_stream(sa);
+            release_stream(sb);
+            return -1;
+        }
+    }
+
+    for (const auto & st : staged) {
+        ggml_backend_tensor_set(st.dst, st.data.data(), 0, st.data.size());
+    }
+
+    return 1;
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [ctx, buf] : ctxs_bufs) {
@@ -1040,7 +1221,7 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
 
         std::vector<llama_ubatch> ubatches;
         while (true) {
-            auto ubatch = n_stream == 1 ? balloc.split_simple(n_ubatch) : embd_all ? balloc.split_seq(n_ubatch) : balloc.split_equal(n_ubatch, true, 0);
+            auto ubatch = n_stream == 1 ? balloc.split_simple(n_ubatch) : embd_all ? balloc.split_seq(n_ubatch) : balloc.split_equal(n_ubatch, true, 0, &seq_to_stream);
 
             if (ubatch.n_tokens == 0) {
                 break;
@@ -2538,12 +2719,15 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 
     io.write(&n_stream, sizeof(n_stream));
 
+    // entry s is the stream of sequence s, so a state does not depend on the stream layout (seq_swap_stream)
     for (uint32_t s = 0; s < n_stream; ++s) {
-        cell_ranges_t cr { s, {} };
+        const uint32_t strm = seq_to_stream[s];
+
+        cell_ranges_t cr { strm, {} };
 
         uint32_t cell_count = 0;
 
-        const auto & cells = v_cells[s];
+        const auto & cells = v_cells[strm];
 
         // Count the number of cells with the specified seq_id
         // Find all the ranges of cells with this seq id (or all, when -1)
@@ -2656,7 +2840,8 @@ const slot_info_vec_t *   sinfos_in) {
             continue;
         }
 
-        const uint32_t strm = seq_id == -1 ? s : seq_to_stream[seq_id];
+        // entry s is the stream of sequence s, see state_write()
+        const uint32_t strm = seq_to_stream[seq_id == -1 ? s : seq_id];
 
         slot_info sinfo;
 
@@ -2668,6 +2853,18 @@ const slot_info_vec_t *   sinfos_in) {
             res = false;
         }
         res = res && ensure_mapped(sinfo, get_n_kv(sinfo));
+
+        if (!res) {
+            // No payload has been written yet. Mapping may have failed partway
+            // through the layer buffers, so data cleanup must not touch their
+            // unmapped or read-only zero-page ranges. Roll back ownership only.
+            if (seq_id == -1) {
+                clear(false);
+            } else {
+                seq_rm(seq_id, -1, -1);
+            }
+            throw std::runtime_error("failed to prepare kv cache restore mappings");
+        }
 
         try {
             res = res && state_read_data(io, strm, cell_count, sinfo);
@@ -3203,10 +3400,9 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
         return;
     }
 
-    seq_rm(seq_id, -1, -1);
-
     // zero the K/V data of the failed restore attempt - the attention can still read the data of free cells
     if (sinfo.empty() || sinfo.size() == 0) {
+        seq_rm(seq_id, -1, -1);
         return;
     }
 
@@ -3272,6 +3468,9 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
             }
         }
     }
+    // seq_rm releases sparse owners and can unmap the stream. Zero any partially
+    // restored payload before releasing those mappings.
+    seq_rm(seq_id, -1, -1);
 }
 
 //
@@ -3311,6 +3510,12 @@ llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv,
         llama_kv_cache::slot_info_vec_t sinfos,
         std::vector<llama_ubatch> ubatches) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), sinfos(std::move(sinfos)), ubatches(std::move(ubatches)) {
+}
+
+void llama_kv_cache_context::set_reserve_n_kv(uint32_t value) {
+    GGML_ASSERT(ubatches.empty() && sinfos.size() == 1 && lctx == nullptr && i_cur == 0);
+    GGML_ASSERT(value > 0 && value <= kv->get_size());
+    n_kv = value;
 }
 
 void llama_kv_cache_context::set_reserve_streams(uint32_t n_stream) {
@@ -3450,4 +3655,14 @@ void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
     kv->get_prev_tokens(ubatch, n, res);
+}
+
+llama_sparse_kv_stats llama_get_sparse_kv_stats(void) {
+    llama_sparse_kv_stats res = {};
+#ifdef GGML_USE_CUDA
+    ggml_backend_cuda_sparse_kv_stats(&res.unmap_syncs, &res.sync_us, &res.unmapped, &res.mapped, &res.recycled);
+#endif
+    extern std::atomic<uint64_t> g_rs_find_slot, g_rs_moves, g_rs_extra;
+    res.rs_slots = g_rs_find_slot; res.rs_moves = g_rs_moves; res.rs_extra = g_rs_extra;
+    return res;
 }

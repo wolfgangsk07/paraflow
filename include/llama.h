@@ -354,15 +354,6 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
-        bool managed_weights; // allocate CUDA model weights in migratable managed memory
-    };
-
-    struct llama_model_residency_info {
-        uint64_t managed_bytes;
-        uint64_t cpu_bytes;
-        uint64_t device_free_bytes;
-        uint64_t device_total_bytes;
-        bool faulted;
     };
 
     struct llama_sampler_seq_config {
@@ -661,35 +652,6 @@ extern "C" {
     // Returns the total size of all the tensors in the model in bytes
     LLAMA_API uint64_t llama_model_size(const struct llama_model * model);
 
-    // Managed-weight residency. These calls are valid only for a model loaded
-    // with managed_weights=true and a layer/none split. The caller must ensure
-    // no inference is in flight while changing residency.
-    LLAMA_API bool llama_model_residency_status(
-            const struct llama_model * model,
-            struct llama_model_residency_info * status);
-
-    LLAMA_API bool llama_model_residency_device_status(
-            const struct llama_model * model,
-            int32_t device,
-            struct llama_model_residency_info * status);
-
-    // Move at least bytes from the specified CUDA device to host memory.
-    // Returns the actual number of newly moved bytes, or -1 on failure.
-    LLAMA_API int64_t llama_model_residency_to_cpu(
-            struct llama_model * model,
-            int32_t device,
-            uint64_t bytes);
-
-    // Restore up to bytes of host-resident chunks to the specified CUDA
-    // device. Returns the actual number restored, or -1 on failure.
-    LLAMA_API int64_t llama_model_residency_to_device(
-            struct llama_model * model,
-            int32_t device,
-            uint64_t bytes);
-
-    // Restore every managed weight buffer to its assigned CUDA device.
-    LLAMA_API bool llama_model_residency_to_devices(struct llama_model * model);
-
     // Get the default chat template. Returns nullptr if not available
     // If name is NULL, returns the default chat template
     LLAMA_API const char * llama_model_chat_template(const struct llama_model * model, const char * name);
@@ -800,10 +762,6 @@ extern "C" {
     // state. Active sequences and their contents remain unchanged.
     LLAMA_API bool llama_memory_trim(llama_memory_t mem);
 
-    // Release all backend physical storage after the caller has removed every
-    // live sequence. The next residency request recreates the configured pool.
-    LLAMA_API bool llama_memory_release_physical(llama_memory_t mem);
-
     // Removes all tokens that belong to the specified sequence and have positions in [p0, p1)
     // Returns false if a partial sequence cannot be removed. Removing a whole sequence never fails
     // seq_id < 0 : match any sequence [TAG_LLAMA_SEQ_ID_NEG]
@@ -868,6 +826,20 @@ extern "C" {
     // Number of occupied KV cells for a sequence. Multiple media patches can
     // share one position. Purely recurrent memories return their position span.
     LLAMA_API uint64_t llama_memory_seq_n_cells(
+            llama_memory_t mem,
+              llama_seq_id seq_id);
+
+    // Exchange the storage streams of two sequences (non-unified KV); both keep their contents. Sequences in
+    // adjacent streams are decoded in one ubatch. No decode may be in flight for either sequence.
+    // Returns 1 when exchanged, 0 when unchanged (not supported / not possible now), -1 when the exchange failed
+    // and both sequences were cleared.
+    LLAMA_API int32_t llama_memory_seq_swap_stream(
+            llama_memory_t mem,
+              llama_seq_id seq_id_a,
+              llama_seq_id seq_id_b);
+
+    // Storage stream of a sequence, -1 when the memory does not keep one stream per sequence
+    LLAMA_API int32_t llama_memory_seq_stream(
             llama_memory_t mem,
               llama_seq_id seq_id);
 
@@ -1175,7 +1147,12 @@ extern "C" {
     // scheduler is reserved for unhinted calls; callers that omit this keep the legacy sizing.
     LLAMA_API void llama_set_decode_pipeline_lanes(struct llama_context * ctx, uint32_t lanes);
 
-    LLAMA_API void llama_set_decode_pipelined(struct llama_context * ctx, bool enable);
+    // Attach an external draft context before activating the pipeline.
+    // The peer context must remain alive through activation; a released peer rejects activation.
+    // Its model must remain alive for the lifetime of this pipeline context.
+    LLAMA_API bool llama_set_decode_pipeline_peer(struct llama_context * ctx, const struct llama_context * peer);
+    // False means activation was rejected. Reserved startup buffers may exist until context destruction.
+    LLAMA_API bool llama_set_decode_pipelined(struct llama_context * ctx, bool enable);
 
     // lane hint for the next pipelined decode(s). decodes of the same lane reuse a
     // private scheduler + graph, so a lane must always carry the same set of sequences
@@ -1188,27 +1165,9 @@ extern "C" {
     // ticket id of the most recent llama_decode() call (0 if none was issued yet)
     LLAMA_API uint64_t llama_decode_ticket_last(const struct llama_context * ctx);
 
-    // wait until the logits of the given decode are readable; returns 0 on success,
-    // -1 if the ticket is unknown or was recycled (too many decodes issued since)
-    LLAMA_API int32_t llama_decode_ticket_wait(struct llama_context * ctx, uint64_t ticket);
-
-    // non-blocking: true if llama_decode_ticket_wait() would return without blocking
+    // non-blocking: true if the logits of the given decode are readable
     // (also true for unknown/recycled tickets and tickets that degrade to a full sync)
     LLAMA_API bool llama_decode_ticket_ready(const struct llama_context * ctx, uint64_t ticket);
-
-    // logits row for batch index i of the given decode (NULL if i produced no logits or
-    // the ticket is unknown). Only valid after llama_decode_ticket_wait() returned 0.
-    LLAMA_API float * llama_decode_ticket_logits_ith(struct llama_context * ctx, uint64_t ticket, int32_t i);
-
-    // number of interleaved prompt chunks still executing on the prefill backends
-    // (0 when prefill runs on the shared backends). non-blocking; the caller uses it
-    // to bound the chunks in flight so kernel submission never throttles the host
-    LLAMA_API int32_t llama_prefill_inflight(struct llama_context * ctx);
-
-    // number of active prefill ring slots (LLAMA_PIPE_PF_RING), 0 when disabled.
-    // when >0 the server can route independent requests' prompt chunks to distinct
-    // slots (own streams) via llama_set_decode_pipelane so they overlap across stages
-    LLAMA_API int32_t llama_pf_ring_active(struct llama_context * ctx);
 
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)

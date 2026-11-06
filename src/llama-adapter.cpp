@@ -13,6 +13,14 @@
 
 // vec
 
+std::map<ggml_backend_buffer_type_t, size_t> llama_adapter_cvec::memory_breakdown() const {
+    std::map<ggml_backend_buffer_type_t, size_t> result;
+    for (const auto & buffer : bufs) {
+        result[ggml_backend_buffer_get_type(buffer.get())] += ggml_backend_buffer_get_size(buffer.get());
+    }
+    return result;
+}
+
 ggml_tensor * llama_adapter_cvec::tensor_for(int il) const {
     if (il < 0 || il < layer_start || il > layer_end || (size_t) il >= tensors.size()) {
         return nullptr;
@@ -442,6 +450,12 @@ llama_adapter_lora * llama_adapter_lora_init(llama_model * model, const char * p
 }
 
 llama_adapter_lora * llama_adapter_lora_init_from_file_ptr(llama_model * model, FILE * file) {
+    if (!model) { return nullptr; }
+    std::lock_guard<std::recursive_mutex> config_guard(model->pipeline_configuration->mutex);
+    if (model->pipeline_configuration->users) {
+        LLAMA_LOG_ERROR("%s: load all adapter weights before pipeline startup approval\n", __func__);
+        return nullptr;
+    }
     if (!file) {
         LLAMA_LOG_ERROR("%s: file is NULL\n", __func__);
         return nullptr;
@@ -506,6 +520,7 @@ void llama_adapter_lora_free(llama_adapter_lora * adapter) {
     }
 
     if (adapter->model != nullptr) {
+        std::lock_guard<std::recursive_mutex> config_guard(adapter->model->pipeline_configuration->mutex);
         adapter->model->loras.erase(adapter);
         adapter->model = nullptr;
     }

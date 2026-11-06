@@ -107,7 +107,6 @@ public:
     void clear(bool data) override;
 
     bool trim() override;
-    bool release_physical() override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
@@ -122,6 +121,9 @@ public:
         const auto base = kv_base->seq_n_cells(seq_id), swa = kv_swa->seq_n_cells(seq_id);
         return base > swa ? base : swa;
     }
+
+    int32_t seq_swap_stream(llama_seq_id seq_id_a, llama_seq_id seq_id_b) override;
+    int32_t seq_stream(llama_seq_id seq_id) const override { return kv_base->seq_stream(seq_id); }
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 

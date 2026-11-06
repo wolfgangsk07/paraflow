@@ -560,6 +560,56 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t D = S_v * S_v * H_v;
     const int64_t K = cparams.n_rs_seq + 1;
 
+    if (auto * journal = mctx_cur->get_j_l(il)) {
+        // Extra cells may still be waiting for verification acceptance.
+        if (mctx_cur->get_n_rs() > n_seqs) {
+            const int64_t extra = mctx_cur->get_n_rs() - n_seqs;
+            auto * ids = ggml_view_1d(ctx0, inp->s_copy_base, extra, n_seqs * inp->s_copy_base->nb[0]);
+            auto * gathered = ggml_get_rows(ctx0, journal, ids);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, gathered,
+                    ggml_view_2d(ctx0, journal, journal->ne[0], extra, journal->nb[1],
+                        (kv_head + n_seqs) * journal->nb[1])));
+        }
+        const int64_t saved = std::min(n_seq_tokens, K);
+        const int64_t skip = n_seq_tokens - saved;
+        size_t offset = kv_head * journal->nb[1];
+        for (auto * input : {k, v, g, b}) {
+            const int64_t features = input->ne[0] * input->ne[1];
+            auto * tail = ggml_view_4d(ctx0, input, input->ne[0], input->ne[1], saved, n_seqs,
+                    input->nb[1], input->nb[2], input->nb[3], skip * input->nb[2]);
+            auto * destination = ggml_view_4d(ctx0, journal, input->ne[0], input->ne[1], saved, n_seqs,
+                    input->ne[0] * sizeof(float), features * sizeof(float), journal->nb[1], offset);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, destination));
+            offset += features * K * sizeof(float);
+        }
+        GGML_ASSERT(offset == kv_head * journal->nb[1] + size_t(journal->ne[0]) * sizeof(float));
+        const int64_t snapshots = n_seq_tokens > K ? K + 1 : 1;
+        auto * out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, snapshots);
+        // Compact replay needs the pre-tail basis, not just the final matrix.
+        // Mark this contract so an optimized backend cannot omit snapshots.
+        if (n_seq_tokens > K) {
+            out->op_params[1] = 0x52534a32;
+        }
+        res->add_fused_node({n_seq_tokens > 1 ? LLM_FUSED_OP_GDN_CH : LLM_FUSED_OP_GDN_AR, out, il});
+        const size_t scores = S_v * H_v * n_seq_tokens * n_seqs * sizeof(float);
+        const size_t state_bytes = D * n_seqs * sizeof(float);
+        auto * initial = n_seq_tokens > K ?
+            ggml_view_2d(ctx0, out, D, n_seqs, D * sizeof(float), scores + K * state_bytes) :
+            ggml_reshape_2d(ctx0, s, D, n_seqs);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, initial,
+                ggml_view_2d(ctx0, ssm_states_all, D, n_seqs, ssm_states_all->nb[1],
+                    (mem_size + kv_head) * ssm_states_all->nb[1])));
+        auto * final_state = ggml_view_2d(ctx0, out, D, n_seqs, D * sizeof(float), scores);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, final_state,
+                ggml_view_2d(ctx0, ssm_states_all, D, n_seqs, ssm_states_all->nb[1],
+                    kv_head * ssm_states_all->nb[1])));
+        auto * output = ggml_view_4d(ctx0, out, S_v, H_v, n_seq_tokens, n_seqs,
+                S_v * sizeof(float), S_v * H_v * sizeof(float),
+                S_v * H_v * n_seq_tokens * sizeof(float), 0);
+        cb(output, "attn_output", il);
+        return output;
+    }
+
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
     ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
     if (n_seq_tokens > 1) {

@@ -69,10 +69,26 @@ target_include_directories(llama PRIVATE . ${CMAKE_CURRENT_BINARY_DIR})
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
-target_link_libraries(llama PUBLIC ggml)
+add_library(paraflow-core STATIC paraflow-private/pipeline-runtime.cpp)
+set_target_properties(paraflow-core PROPERTIES POSITION_INDEPENDENT_CODE ON CXX_VISIBILITY_PRESET hidden)
+target_compile_features(paraflow-core PRIVATE cxx_std_17)
+target_include_directories(paraflow-core PRIVATE . ../include ../vendor ${CMAKE_CURRENT_BINARY_DIR})
+target_link_libraries(paraflow-core PRIVATE ggml)
+target_link_libraries(llama PUBLIC ggml PRIVATE paraflow-core)
+
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # Bind internal functions within the shared library.
+    target_link_options(llama PRIVATE "-Wl,-Bsymbolic-functions")
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)
     target_compile_definitions(llama PUBLIC  LLAMA_SHARED)
+endif()
+
+# Keep implementation RTTI/template instantiations out of the dynamic ABI.
+if (UNIX AND NOT APPLE AND BUILD_SHARED_LIBS)
+    target_link_options(llama PRIVATE "-Wl,--version-script=${PROJECT_SOURCE_DIR}/cmake/paraflow-private-exports.map")
+    set_property(TARGET llama APPEND PROPERTY LINK_DEPENDS "${PROJECT_SOURCE_DIR}/cmake/paraflow-private-exports.map")
 endif()

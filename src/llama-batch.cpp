@@ -1,5 +1,4 @@
 #include "llama-batch.h"
-#include "llama-ext.h"
 
 #include "llama-impl.h"
 #include "llama-vocab.h"
@@ -12,19 +11,6 @@
 #include <cstring>
 #include <algorithm>
 #include <sstream>
-#include <atomic>
-
-namespace {
-std::atomic<bool> verify_tail_packing{true};
-}
-
-void llama_set_verify_tail_packing(bool enabled) {
-    verify_tail_packing.store(enabled, std::memory_order_relaxed);
-}
-
-bool llama_get_verify_tail_packing() {
-    return verify_tail_packing.load(std::memory_order_relaxed);
-}
 
 llama_batch_allocr::llama_batch_allocr(uint32_t n_pos_per_embd, bool allow_mixed) : n_pos_per_embd(n_pos_per_embd), allow_mixed(allow_mixed) {
     const char * LLAMA_BATCH_DEBUG = getenv("LLAMA_BATCH_DEBUG");
@@ -630,7 +616,8 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
     return ubatch_add(idxs, idxs.size(), false);
 }
 
-llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail) {
+llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail,
+        const std::vector<uint32_t> * seq_to_stream) {
     if (sequential && has_cpl) {
         LLAMA_LOG_ERROR("%s: sequential split is not supported when there are coupled sequences in the input batch (you may need to use the -kvu flag)\n", __func__);
 
@@ -660,14 +647,50 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
                 first_index = *first;
             }
         }
-        if (all_complete && shortest <= n_keep_tail && llama_get_verify_tail_packing()) {
+        if (all_complete && shortest <= n_keep_tail) {
             complete_tail_length = uint32_t(shortest);
         }
     }
 
+    // with a stream map, scan the tokens in stream order and group sequences whose streams are adjacent: the KV
+    // views of one ubatch span a contiguous stream range, while the sequence ids may be sparse
+    const bool by_stream = sequential && seq_to_stream != nullptr;
+    auto stream_of = [&](int32_t i) -> uint32_t {
+        const llama_seq_id seq_id = batch.seq_id[i][0];
+        GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream->size());
+        return (*seq_to_stream)[seq_id];
+    };
+    std::vector<int32_t> order;
+    if (by_stream) {
+        order.resize(batch.n_tokens);
+        for (int32_t i = 0; i < batch.n_tokens; ++i) {
+            order[i] = i;
+        }
+        std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return stream_of(a) < stream_of(b); });
+        if (complete_tail_length > 0) {
+            // start at the lowest stream that completes its tail: the lowest id would cut adjacent streams in two
+            for (const int32_t i : order) {
+                if (used[i]) {
+                    continue;
+                }
+                const auto & indices = seq_set_map[seq_set[i]];
+                const auto remaining = std::count_if(indices.begin(), indices.end(), [&](int32_t k) { return !used[k]; });
+                if ((uint32_t) remaining == complete_tail_length) {
+                    first_index = i;
+                    break;
+                }
+            }
+        }
+        if (first_index > 0) {
+            std::rotate(order.begin(), std::find(order.begin(), order.end(), first_index), order.end());
+        }
+    }
+    uint32_t last_stream = 0;
+
     // determine the non-overlapping sequence sets participating in this ubatch
     for (int32_t offset = 0; offset < batch.n_tokens; ++offset) {
-        const int32_t i = first_index > 0 ? int32_t((int64_t(first_index) + offset) % batch.n_tokens) : offset;
+        const int32_t i = by_stream ? order[offset] :
+            first_index > 0 ? int32_t((int64_t(first_index) + offset) % batch.n_tokens) : offset;
         if (used[i]) {
             continue;
         }
@@ -694,8 +717,10 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
             add = size_t(indices.end() - first) == complete_tail_length;
         }
 
-        // accept only increasing sequence ids
-        if (sequential) {
+        // accept only increasing sequence ids (or adjacent increasing streams)
+        if (by_stream) {
+            add = add && (cur_seq_set.empty() || stream_of(i) == last_stream + 1);
+        } else if (sequential) {
             add = add && (cur_seq_set.empty() || batch.seq_id[i][0] == last_seq_id + 1);
         }
 
@@ -703,6 +728,7 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
             cur_seq_set.push_back(seq_set[i]);
 
             last_seq_id = batch.seq_id[i][0];
+            last_stream = by_stream ? stream_of(i) : 0;
 
             if (cur_seq_set.size() > n_ubatch) {
                 break;
@@ -835,44 +861,7 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
         idxs.insert(idxs.end(), idxs_per_seq[s].begin(), idxs_per_seq[s].end());
     }
 
-    return ubatch_add(idxs, n_seqs, true);
-}
-
-llama_ubatch llama_batch_allocr::split_single_outputs(uint32_t n_ubatch, bool sequential) {
-    if (n_ubatch < 2 || has_cpl) {
-        return {};
-    }
-
-    std::vector<int32_t> idxs;
-    llama_seq_id last_seq_id = -1;
-    for (int32_t i = 0; i < batch.n_tokens; ++i) {
-        if (used[i] || !batch.logits[i] || batch.n_seq_id[i] != 1) {
-            continue;
-        }
-        // Count the original sequence, not its currently unused tokens. A
-        // prompt's last output token must remain in its canonical prompt chunk.
-        const auto found = seq_set_map.find(seq_set[i]);
-        if (found == seq_set_map.end() || found->second.size() != 1) {
-            continue;
-        }
-        const llama_seq_id id = batch.seq_id[i][0];
-        if (sequential && !idxs.empty() && id != last_seq_id + 1) {
-            continue;
-        }
-        idxs.push_back(i);
-        last_seq_id = id;
-        if (idxs.size() >= n_ubatch) {
-            break;
-        }
-    }
-    if (idxs.size() < 2) {
-        return {};
-    }
-    for (const int32_t i : idxs) {
-        used[i] = true;
-        ++n_used;
-    }
-    return ubatch_add(idxs, idxs.size(), true);
+    return ubatch_add(idxs, n_seqs, true, by_stream);
 }
 
 llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
@@ -949,7 +938,7 @@ void llama_batch_allocr::clear() {
     std::fill(seq_idx.begin(), seq_idx.end(), -1);
 }
 
-llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, uint32_t n_seqs, bool equal_seqs) {
+llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, uint32_t n_seqs, bool equal_seqs, bool seq_unq_in_order) {
     const uint32_t n_tokens = idxs.size();
 
     assert(n_tokens%n_seqs == 0);
@@ -1037,7 +1026,18 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         seq_id_ptr += udata->n_seq_id[i];
     }
 
-    for (uint32_t s = 0; s < n_seq_max; ++s) {
+    // the memory pairs the s-th unique sequence with the s-th sequence set of an equal split
+    for (size_t i = 0; seq_unq_in_order && i < idxs.size(); ++i) {
+        for (int32_t s = 0; s < udata->n_seq_id[i]; ++s) {
+            const llama_seq_id seq_id = udata->seq_id[i][s];
+            if (udata->seq_idx[seq_id] < 0) {
+                udata->seq_idx[seq_id] = udata->seq_id_unq.size();
+                udata->seq_id_unq.push_back(seq_id);
+            }
+        }
+    }
+
+    for (uint32_t s = 0; !seq_unq_in_order && s < n_seq_max; ++s) {
         if (seq_set_unq.test(s)) {
             udata->seq_idx[s] = udata->seq_id_unq.size();
             udata->seq_id_unq.push_back(s);

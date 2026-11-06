@@ -422,6 +422,7 @@ static ggml_backend_buffer_t ggml_backend_cpu_device_buffer_from_host_ptr(ggml_b
 }
 
 static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    if (op->op == GGML_OP_GATED_DELTA_NET && ggml_get_op_params_i32(op, 1) == 0x52534a31) { return false; }
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
 
@@ -507,6 +508,7 @@ static const struct ggml_backend_device_i ggml_backend_cpu_device_i = {
     /* .event_new            = */ NULL,
     /* .event_free           = */ NULL,
     /* .event_synchronize    = */ NULL,
+    /* .event_query          = */ NULL,
 };
 
 // CPU backend - backend (reg)

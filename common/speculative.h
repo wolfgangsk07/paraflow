@@ -90,7 +90,7 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const common_batch & batch);
 
-// V68: same as common_speculative_process, with the target NextN rows of the batch (n_tokens x n_embd, batch order)
+// same as common_speculative_process, with the target NextN rows of the batch (n_tokens x n_embd, batch order)
 // supplied by the caller instead of read from ctx_tgt; lets a thread other than the target owner run the catch-up
 bool common_speculative_process_tgt_embd(common_speculative * spec, const common_batch & batch, const float * h_tgt);
 
@@ -100,9 +100,6 @@ void common_speculative_set_enabled(common_speculative * spec, llama_seq_id seq_
 // In-process exact continuation, valid while this speculative context is alive.
 std::function<void()> common_speculative_checkpoint(common_speculative * spec, llama_seq_id seq_id);
 
-// Copy the complete MTP continuation between identical, idle draft replicas. KV is transferred by the caller.
-bool common_speculative_transfer_sequence(common_speculative * src, common_speculative * dst, llama_seq_id seq_id);
-
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 
@@ -111,11 +108,6 @@ void common_speculative_draft(common_speculative * spec);
 // Only an independent, single-head MTP implementation supports this interface.
 bool common_speculative_supports_draft_step(const common_speculative * spec);
 void common_speculative_draft_step(common_speculative * spec);
-// V59: launch one step without waiting for the draft device; returns false if no sequence is drafting.
-// collect completes it (implicitly done before any other draft decode through this spec).
-bool common_speculative_draft_step_launch(common_speculative * spec);
-void common_speculative_draft_step_collect(common_speculative * spec);
-bool common_speculative_draft_step_pending(const common_speculative * spec);
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);

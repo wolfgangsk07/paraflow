@@ -1,6 +1,9 @@
 #include "llama-context.h"
 #include "llama-index-runs.h"
 #include "llama-pipeline-reserve.h"
+#include "paraflow-private/pipeline-shapes.hpp"
+
+thread_local uint32_t llama_recurrent_reserve_sequences = 0;
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -29,25 +32,17 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
-#if defined(__linux__)
-#include <execinfo.h>
-#endif
 
-// A generation graph in a mixed car gets a separate allocator, on the SAME
-// prefill backend instances/streams. Preserve per-device work ordering and the
-// existing prefill fences; changing graph topology cannot flush queued prompts.
-namespace {
+// MTP context: the drafting graph (every row is an output) gets its own allocator
+// on the SAME backend instances/streams as the catch-up graph (KV writes, no logits),
+// so alternating between the two topologies never reallocates (and syncs) the buffers.
 struct llama_pf_generation {
     ggml_backend_sched_ptr scheduler;
     llm_graph_result_ptr result;
     uint32_t max_tokens = 0;
-    uint64_t calls = 0;
-    bool draft_head = false;
 };
-std::mutex llama_pf_generation_mutex;
-std::unordered_map<const llama_context *, std::unique_ptr<llama_pf_generation>> llama_pf_generations;
-std::unordered_map<const llama_context *, llama_nextn_copy_stats> llama_nextn_copies;
-// V41: per-context metadata for drain-free checkpoint capture (side table; no layout change).
+
+// per-context metadata for drain-free checkpoint capture
 struct llama_ckpt_capture_state {
     std::vector<uint64_t>     id;          // ticket id described by this ring entry
     std::vector<int32_t>      n_seqs;      // distinct sequences in that ticket's batch
@@ -59,42 +54,14 @@ struct llama_ckpt_capture_state {
     uint64_t sync_count = 0;
     uint64_t last_full_sync_ticket = 0;
     uint64_t fast = 0, full = 0, verified = 0, mismatches = 0;
-    std::vector<const void *> pfset;       // V50: backend set (prefill_backend_ptrs) that ran the ticket, else null
+    std::vector<const void *> pfset;       // backend set (prefill_backend_ptrs) that ran the ticket, else null
     std::unordered_map<int64_t, std::vector<ggml_backend_event_t>> async_events;
     int64_t  async_next = 1;
     uint64_t async_enqueued = 0, async_sync = 0, async_unmapped = 0;
 };
-std::mutex llama_ckpt_mutex;
-std::unordered_map<const llama_context *, llama_ckpt_capture_state> llama_ckpt_states;
-llama_ckpt_capture_state & llama_ckpt_state(const llama_context * ctx) {
-    std::lock_guard<std::mutex> lock(llama_ckpt_mutex);
-    return llama_ckpt_states[ctx];
-}
-void llama_ckpt_erase(const llama_context * ctx) {
-    std::lock_guard<std::mutex> lock(llama_ckpt_mutex);
-    llama_ckpt_states.erase(ctx);
-}
-struct llama_nextn_hint { const llama_context * owner = nullptr; bool required = true; };
-thread_local llama_nextn_hint llama_nextn_pending;
-static std::pair<bool,bool> llama_consume_nextn_hint(const llama_context * ctx) {
-    if (llama_nextn_pending.owner != ctx) return {false, true};
-    const bool required = llama_nextn_pending.required;
-    llama_nextn_pending.owner = nullptr;
-    return {true, required};
-}
 
-llama_pf_generation * llama_pf_generation_find(const llama_context * ctx) {
-    std::lock_guard<std::mutex> lock(llama_pf_generation_mutex);
-    const auto it = llama_pf_generations.find(ctx);
-    return it == llama_pf_generations.end() ? nullptr : it->second.get();
-}
-void llama_pf_generation_erase(const llama_context * ctx) {
-    std::lock_guard<std::mutex> lock(llama_pf_generation_mutex);
-    llama_pf_generations.erase(ctx);
-    llama_nextn_copies.erase(ctx);
-    { std::lock_guard<std::mutex> ck(llama_ckpt_mutex); llama_ckpt_states.erase(ctx); }
-    if (llama_nextn_pending.owner == ctx) llama_nextn_pending.owner = nullptr;
-}
+static llama_ckpt_capture_state & llama_ckpt_state(const llama_context * ctx) {
+    return ctx->ckpt();
 }
 
 //
@@ -248,11 +215,13 @@ llama_context::llama_context(
     loras(std::make_unique<llama_adapter_loras>()),
     // MTP uses the embd input for the hidden state
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd(),
-                llm_arch_supports_mixed_batch(model.arch) && params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT)) {
+                llm_arch_supports_mixed_batch(model.arch) && params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT)),
+    ckpt_state(std::make_unique<llama_ckpt_capture_state>()) {
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
 
+    pipeline_lifetime->context = this;
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
 
@@ -462,9 +431,6 @@ llama_context::llama_context(
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
         graph_reuse_disable = LLAMA_GRAPH_REUSE_DISABLE ? (atoi(LLAMA_GRAPH_REUSE_DISABLE) != 0) : graph_reuse_disable;
 
-        const char * subbatch_cache = getenv("LLAMA_PIPE_SUBBATCH_CACHE");
-        pipe_subbatch_stats.enabled = !subbatch_cache || atoi(subbatch_cache) != 0;
-
         if (graph_reuse_disable) {
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
         }
@@ -519,20 +485,16 @@ llama_context::llama_context(
                 __func__, cparams.n_ctx_seq, hparams.n_ctx_train);
     }
 
+    // A native MTP draft context runs one NextN block and the output head. When both
+    // sit on one GPU, bind the context to that device only: the draft graph then has
+    // a single split and can use owned input snapshots (see set_input_snapshots).
     ggml_backend_dev_t mtp_context_device = nullptr;
-    const char * mtp_device_setting = std::getenv("LLAMA_MTP_CONTEXT_DEVICE_ONLY");
-    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && mtp_device_setting && std::atoi(mtp_device_setting) != 0 &&
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
             (model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) && hparams.n_layer_nextn == 1 &&
             model.dev_layer(hparams.n_layer()) == model.dev_output() &&
             ggml_backend_dev_type(model.dev_output()) == GGML_BACKEND_DEVICE_TYPE_GPU) {
         mtp_context_device = model.dev_output();
-        fprintf(stderr, "MTP_CONTEXT_DEVICE_ONLY device=%s model_devices=%zu target_unchanged=1\n",
-                ggml_backend_dev_name(mtp_context_device), model.n_devices());
-    }
-
-    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && mtp_device_setting &&
-            std::atoi(mtp_device_setting) != 0 && !mtp_context_device) {
-        throw std::runtime_error("LLAMA_MTP_CONTEXT_DEVICE_ONLY requires one Qwen native MTP block and its output head colocated on a GPU; adjust tensor split or use the independent filtered-head path");
+        LLAMA_LOG_INFO("%s: MTP context bound to %s\n", __func__, ggml_backend_dev_name(mtp_context_device));
     }
 
     if (!hparams.vocab_only) {
@@ -696,8 +658,14 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    {
+        std::lock_guard<std::mutex> guard(pipeline_lifetime->mutex);
+        pipeline_lifetime->context = nullptr;
+    }
+
+    // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
-    llama_pf_generation_erase(this);
+    pf_generation.reset();
     // pipelined decode: make sure no async copy still targets a ticket slab, then free events
     for (auto & tk : tickets) {
         for (auto & c : tk.completions) {
@@ -720,6 +688,7 @@ llama_context::~llama_context() {
         f.pending = false;
     }
 
+    // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -737,6 +706,12 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+    for (const auto & frozen : pipeline_frozen_models) {
+        std::lock_guard<std::recursive_mutex> guard(frozen->mutex);
+        GGML_ASSERT(frozen->users > 0);
+        --frozen->users;
+    }
+
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
@@ -857,33 +832,9 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     if (snapshots) ggml_backend_sched_set_input_snapshots(sched.get(), true);
 }
 
-// This opt-in controls only initial workspace reservations. Real PP graphs
-// still pass through the normal allocation check and synchronized growth.
-static bool llama_pipeline_lazy_primary_reserve() {
-    static const bool enabled = [] {
-        const char * value = std::getenv("LLAMA_PIPE_LAZY_PRIMARY_RESERVE");
-        return value && std::atoi(value) != 0;
-    }();
-    return enabled;
-}
-
-static bool llama_pipeline_lazy_global_reserve() {
-    static const bool enabled = [] {
-        const char * value = std::getenv("LLAMA_PIPE_LAZY_GLOBAL_RESERVE");
-        return value && std::atoi(value) != 0;
-    }();
-    return enabled;
-}
-
-static uint32_t llama_prefill_initial_reserve_sequences(
-        const llama_model & model, const llama_cparams & params, uint32_t requested) {
-    const char * setting = std::getenv("LLAMA_PIPE_PREFILL_RESERVE_SEQS");
-    if (!setting || std::atoi(setting) <= 0 || params.training || model.hparams.no_alloc ||
-            (model.arch != LLM_ARCH_QWEN3NEXT && model.arch != LLM_ARCH_QWEN35 && model.arch != LLM_ARCH_QWEN35MOE)) {
-        return requested;
-    }
-    return std::min(requested, std::max<uint32_t>(1, std::atoi(setting)));
-}
+// Hybrid recurrent models: the prompt graph's recurrent workspace scales with the
+// number of sequences. Reserve prompt graphs for one sequence; a real multi-sequence
+// prompt batch still takes the scheduler's synchronized allocation-growth path.
 
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
@@ -891,6 +842,10 @@ void llama_context::sched_reserve() {
     }
 
     sched_need_reserve = false;
+    const bool lazy_primary = decode_pipelined &&
+        !cparams.training && !cparams.embeddings && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP && !model.hparams.no_alloc;
+    const bool split_only = model.hparams.no_alloc || lazy_primary;
+
 
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
@@ -898,22 +853,9 @@ void llama_context::sched_reserve() {
 
     const int64_t t_start_us = ggml_time_us();
 
-    // Pipeline decode has separate lane and prompt allocators. Keep this
-    // fallback scheduler's graph/layout information, but allocate its buffers
-    // only if an actual operation routes through it.
-    const bool lazy_primary = llama_pipeline_lazy_primary_reserve() && decode_pipelined &&
-            !cparams.training && !cparams.embeddings && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP &&
-            !model.hparams.no_alloc;
-    const bool split_only = model.hparams.no_alloc || lazy_primary;
-    if (lazy_primary) { fprintf(stderr, "PIPE_LAZY_PRIMARY_RESERVE allocated=0\n"); }
-
     const uint32_t n_seqs = cparams.n_seq_max;
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
     const uint32_t n_seqs_pp = llama_prefill_initial_reserve_sequences(model, cparams, n_seqs);
-    if (n_seqs_pp != n_seqs) {
-        fprintf(stderr, "PIPE_PREFILL_RESERVE main global_sequences=%u initial_sequences=%u tokens=%u\n",
-                n_seqs, n_seqs_pp, n_tokens);
-    }
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
 
@@ -959,13 +901,13 @@ void llama_context::sched_reserve() {
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
         auto * gf = graph_reserve(n_tokens, n_seqs_pp, n_outputs_pp, mctx.get(),
-                split_only, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
+                split_only, split_only ? backend_buf_exp_size.data() : nullptr);
         if (!gf) {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched_new(max_nodes, false);
-                gf = graph_reserve(n_tokens, n_seqs_pp, n_outputs_pp, mctx.get(), split_only);
+                gf = graph_reserve(n_tokens, n_seqs_pp, n_outputs_pp, mctx.get());
             }
             if (!gf) {
                 throw std::runtime_error("failed to allocate compute pp buffers");
@@ -1022,7 +964,7 @@ void llama_context::sched_reserve() {
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
         ggml_backend_t             backend = backend_ptrs[i];
         ggml_backend_buffer_type_t buft    = backend_buft[i];
-        if (!model.hparams.no_alloc) {
+        if (!split_only) {
             backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend);
         }
         if (backend_buf_exp_size[i] > 1) {
@@ -1056,17 +998,6 @@ void llama_context::sched_reserve() {
 }
 
 void llama_context::synchronize() {
-#if defined(__linux__)
-    if (decode_pipelined && getenv("LLAMA_PIPE_TRACE")) {
-        static uint64_t count = 0;
-        if (++count <= 8 || count % 128 == 0) {
-            fprintf(stderr, "PIPE_CONTEXT_SYNC count=%" PRIu64 " ticket=%" PRIu64 " selected=%" PRIu64 "\n", count, ticket_seq, selected_ticket);
-            void * frames[8];
-            const int n = backtrace(frames, 8);
-            backtrace_symbols_fd(frames, n, 2);
-        }
-    }
-#endif
     if (!sched) {
         return;
     }
@@ -1079,20 +1010,9 @@ void llama_context::synchronize() {
             ggml_backend_sched_synchronize(pipe_scheds[i].get());
         }
     }
-    for (const auto & lane : pipe_subbatches) {
-        for (const auto & slot : lane) {
-            if (slot.scheduler) { ggml_backend_sched_synchronize(slot.scheduler.get()); }
-        }
-    }
 
     if (prefill_sched) {
         ggml_backend_sched_synchronize(prefill_sched.get());
-    }
-
-    for (int i = 0; i < pf_ring_n; ++i) {
-        if (pf_ring_scheds[i]) {
-            ggml_backend_sched_synchronize(pf_ring_scheds[i].get());
-        }
     }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
@@ -1153,29 +1073,20 @@ int32_t llama_context::pipeline_stages() const {
     return std::max(n, 1);
 }
 
-static uint32_t llama_pipeline_verify_ubatch_limit(const llama_cparams & params) {
-    uint32_t limit = params.n_ubatch;
-    if (params.n_rs_seq > 0) {
-        const char * setting = std::getenv("LLAMA_PIPE_VERIFY_UBATCH");
-        const int requested = setting ? std::atoi(setting) : 8;
-        if (requested > (int) params.n_rs_seq + 1) {
-            limit = std::min<uint32_t>(limit, requested);
-        }
-    }
-    return limit;
-}
+// Physical ubatch width for MTP verification batches (all rows are outputs). Several
+// sequences' complete verification tails share one graph; 8 rows cost ~40% of 5-card
+// MTP throughput against 32.
 
 void llama_context::set_input_snapshots(bool enable) {
     synchronize();
     sched_reserve();
     const bool available = ggml_backend_sched_set_input_snapshots(sched.get(), enable);
-    auto * old = llama_pf_generation_find(this);
-    if (!enable && old && old->draft_head) {
-        llama_pf_generation_erase(this);
+    if (!enable) {
+        pf_generation.reset();
+        *ckpt_state = {};
     }
-    const char * split_env = std::getenv("LLAMA_MTP_SPLIT_GENERATION");
     if (enable && available && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && !decode_pipelined &&
-            (!split_env || std::atoi(split_env) != 0) && !llama_pf_generation_find(this)) {
+            !pf_generation) {
         // Catch-up writes KV without logits; drafting reads it and produces logits.
         // Keep these topologies in separate allocators on the SAME head stream.
         auto full = memory ? memory->init_full() : nullptr;
@@ -1185,7 +1096,6 @@ void llama_context::set_input_snapshots(bool enable) {
         }
         if (kv) {
             auto helper = std::make_unique<llama_pf_generation>();
-            helper->draft_head = true;
             helper->max_tokens = std::min(cparams.n_seq_max, cparams.n_ubatch);
             const auto nodes = graph_max_nodes(helper->max_tokens);
             helper->scheduler.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(),
@@ -1203,15 +1113,7 @@ void llama_context::set_input_snapshots(bool enable) {
             }
             kv->set_reserve_streams(0);
             if (reserved && ggml_backend_sched_set_input_snapshots(helper->scheduler.get(), true)) {
-                if (std::getenv("LLAMA_PIPE_RESERVE_TRACE")) {
-                    for (auto * backend : backend_ptrs) {
-                        fprintf(stderr, "MTP_GENERATION_RESERVE max_tokens=%u backend=%s bytes=%zu\n",
-                                helper->max_tokens, ggml_backend_name(backend),
-                                ggml_backend_sched_get_buffer_size(helper->scheduler.get(), backend));
-                    }
-                }
-                std::lock_guard<std::mutex> lock(llama_pf_generation_mutex);
-                llama_pf_generations.emplace(this, std::move(helper));
+                pf_generation = std::move(helper);
             }
             sched_cur = nullptr;
             gf_res_cur = nullptr;
@@ -1221,8 +1123,8 @@ void llama_context::set_input_snapshots(bool enable) {
 
 ggml_backend_input_snapshot_stats llama_context::get_input_snapshot_stats() const {
     auto total = ggml_backend_sched_get_input_snapshot_stats(sched.get());
-    const auto * helper = llama_pf_generation_find(this);
-    if (helper && helper->draft_head) {
+    const auto * helper = pf_generation.get();
+    if (helper) {
         const auto next = ggml_backend_sched_get_input_snapshot_stats(helper->scheduler.get());
         total.enabled = total.enabled || next.enabled;
         total.tensors += next.tensors; total.bytes += next.bytes; total.fences += next.fences;
@@ -1230,675 +1132,6 @@ ggml_backend_input_snapshot_stats llama_context::get_input_snapshot_stats() cons
         total.allocated_bytes += next.allocated_bytes;
     }
     return total;
-}
-
-ggml_backend_input_snapshot_stats llama_context::get_generation_input_snapshot_stats() const {
-    ggml_backend_input_snapshot_stats total = {};
-    for (const auto & current : pipe_scheds) {
-        if (!current) continue;
-        const auto next = ggml_backend_sched_get_input_snapshot_stats(current.get());
-        total.enabled = total.enabled || next.enabled;
-        total.tensors += next.tensors; total.bytes += next.bytes; total.fences += next.fences;
-        total.fence_wait_ns += next.fence_wait_ns; total.fallbacks += next.fallbacks;
-        total.allocated_bytes += next.allocated_bytes;
-    }
-    for (const auto & lane : pipe_subbatches) {
-        for (const auto & slot : lane) {
-            if (!slot.scheduler) { continue; }
-            const auto next = ggml_backend_sched_get_input_snapshot_stats(slot.scheduler.get());
-            total.enabled = total.enabled || next.enabled;
-            total.tensors += next.tensors; total.bytes += next.bytes; total.fences += next.fences;
-            total.fence_wait_ns += next.fence_wait_ns; total.fallbacks += next.fallbacks;
-            total.allocated_bytes += next.allocated_bytes;
-        }
-    }
-    return total;
-}
-
-llama_pipeline_subbatch_stats llama_context::get_pipeline_subbatch_stats() const {
-    auto stats = pipe_subbatch_stats;
-    stats.allocated_bytes = 0;
-    for (const auto & lane : pipe_subbatches) {
-        for (const auto & entry : lane) {
-            if (!entry.scheduler) { continue; }
-            for (auto * backend : backend_ptrs) {
-                stats.allocated_bytes += ggml_backend_sched_get_buffer_size(entry.scheduler.get(), backend);
-            }
-        }
-    }
-    return stats;
-}
-
-llama_context::pipeline_subbatch_slot * llama_context::ensure_pipeline_subbatch(int lane, uint32_t ordinal, uint32_t tokens, uint32_t seqs) {
-    GGML_ASSERT(lane >= 0 && lane < n_pipe_scheds && ordinal > 0);
-    if (pipe_subbatches.size() < pipe_scheds.size()) { pipe_subbatches.resize(pipe_scheds.size()); }
-    auto & entries = pipe_subbatches[lane];
-    if (entries.size() < ordinal) { entries.resize(ordinal); }
-    auto & entry = entries[ordinal - 1];
-    static const bool demand_enabled = []() {
-        const char * setting = std::getenv("LLAMA_PIPE_SUBBATCH_DEMAND_RESERVE");
-        return setting && std::atoi(setting) != 0;
-    }();
-    // The small-batch shape enumerator is exhaustive through 32 rows. Wider
-    // configured microbatches retain their original reservation contract until
-    // a separate complete shape bound is available; the gate is per context.
-    const bool demand_reserve = demand_enabled && llama_pipeline_verify_ubatch_limit(cparams) <= 32;
-    GGML_ASSERT(tokens > 0 && seqs > 0);
-    const bool growing = demand_reserve && entry.scheduler &&
-            (tokens > entry.reserved_tokens || seqs > entry.reserved_seqs);
-    if (entry.attempted && !growing) { return entry.scheduler ? &entry : nullptr; }
-    entry.attempted = true;
-    size_t previous_bytes = 0;
-    if (entry.scheduler) {
-        // Finish the owned arena before invalidating its graph or reallocating.
-        // This is before mctx->apply() and before submitting this physical ubatch:
-        // failure may use the existing primary-arena path without replaying work.
-        ggml_backend_sched_synchronize(entry.scheduler.get());
-        for (auto * backend : backend_ptrs) {
-            previous_bytes += ggml_backend_sched_get_buffer_size(entry.scheduler.get(), backend);
-        }
-        entry.result->reset();
-    }
-
-    // The one-time reserve may fence allocation. Publish the new arena only after
-    // every reserve succeeds; memory pressure retains the original scheduling path.
-    const auto saved_sched = sched_cur;
-    const auto saved_result = gf_res_cur;
-    const auto saved_outputs = n_outputs;
-    llama_memory_context_ptr full;
-    llama_kv_cache_context * reserve_kv = nullptr;
-    auto restore = [&]() {
-        if (reserve_kv) { reserve_kv->set_reserve_streams(0); }
-        sched_cur = saved_sched;
-        gf_res_cur = saved_result;
-        n_outputs = saved_outputs;
-    };
-    try {
-        if (memory) { full = memory->init_full(); }
-        reserve_kv = dynamic_cast<llama_kv_cache_context *>(full.get());
-        if (auto * hybrid = dynamic_cast<llama_memory_hybrid_context *>(full.get())) {
-            reserve_kv = const_cast<llama_kv_cache_context *>(hybrid->get_attn());
-        }
-        if (!reserve_kv && !dynamic_cast<llama_memory_recurrent_context *>(full.get())) {
-            throw std::runtime_error("unsupported reserve view");
-        }
-        const char * tight = std::getenv("LLAMA_PIPE_TIGHT_RESERVE");
-        const bool tight_reserve = !tight || std::atoi(tight) != 0;
-        const uint32_t old_max = std::max<uint32_t>(cparams.n_seq_max, cparams.n_outputs_max);
-        uint32_t max_tokens = tight_reserve ? std::min(old_max, llama_pipeline_verify_ubatch_limit(cparams)) : old_max;
-        uint32_t max_seqs = std::min(std::max<uint32_t>(cparams.n_seq_max, 1), max_tokens);
-        const char * lane_setting = std::getenv("LLAMA_PIPE_SUBBATCH_LANE_RESERVE");
-        const bool lane_reserve = tight_reserve && !cparams.embeddings &&
-                lane_setting && std::atoi(lane_setting) != 0 && n_pipe_scheds > 1;
-        const uint64_t rows_per_seq = 1 + uint64_t(cparams.n_rs_seq);
-        if (lane_reserve && lane + 1 < n_pipe_scheds) {
-            const uint32_t lanes = n_pipe_scheds - 1;
-            const uint32_t lane_seqs = std::max<uint64_t>(1,
-                    (uint64_t(cparams.n_seq_max) + lanes - 1) / lanes);
-            max_tokens = std::min<uint64_t>(max_tokens, uint64_t(lane_seqs) * rows_per_seq);
-            max_seqs = std::min(max_seqs, lane_seqs);
-        }
-        // Keep the configured graph-node capacity even if the first tail is tiny.
-        // Reserve the observed monotone envelope only in the opt-in mode. Later
-        // growth is handled here, before applying memory or submitting kernels.
-        const size_t max_nodes = graph_max_nodes(demand_reserve ? std::max(old_max, tokens) : max_tokens);
-        if (demand_reserve) {
-            max_tokens = std::max(tokens, entry.reserved_tokens);
-            max_seqs = std::max(seqs, entry.reserved_seqs);
-        }
-        // Match the primary lane's generation reserve contract. Reserving a
-        // prompt-sized recurrent graph (many rows for one sequence) here can
-        // consume gigabytes for a tiny verification tail. Actual larger graphs
-        // retain process_ubatch's existing synchronized allocation-growth path.
-        auto reserve_shapes = llama_pipeline_reserve_shapes(max_tokens, max_seqs, tight_reserve);
-        if (lane_reserve) {
-            reserve_shapes.erase(std::remove_if(reserve_shapes.begin(), reserve_shapes.end(),
-                    [&](const auto & shape) {
-                        return uint64_t(shape.first) > uint64_t(shape.second) * rows_per_seq;
-                    }), reserve_shapes.end());
-        }
-        GGML_ASSERT(!reserve_shapes.empty());
-        if (!entry.scheduler) {
-            entry.scheduler.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(),
-                    backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
-            if (!entry.scheduler) { throw std::runtime_error("scheduler unavailable"); }
-            entry.result.reset(new llm_graph_result(max_nodes));
-        }
-        sched_cur = entry.scheduler.get();
-        gf_res_cur = entry.result.get();
-        for (const auto & shape : reserve_shapes) {
-            if (reserve_kv) { reserve_kv->set_reserve_streams(shape.second); }
-            if (!graph_reserve(shape.first, shape.second, shape.first, full.get())) {
-                throw std::runtime_error("compute arena unavailable");
-            }
-        }
-        const char * input_env = std::getenv("LLAMA_PIPE_ASYNC_GENERATION_INPUTS");
-        const bool all_cuda = std::all_of(backend_ptrs.begin(), backend_ptrs.end(), [](ggml_backend_t backend) {
-            auto * device = ggml_backend_get_device(backend);
-            if (!device) { return false; }
-            if (ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU) { return true; }
-            auto * registry = ggml_backend_dev_backend_reg(device);
-            return registry && std::strcmp(ggml_backend_reg_name(registry), "CUDA") == 0;
-        });
-        if (input_env && std::atoi(input_env) != 0 && cparams.pipeline_parallel && all_cuda &&
-                (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE)) {
-            if (ggml_backend_sched_set_input_snapshots_ex(entry.scheduler.get(), true, true)) {
-                ggml_backend_sched_set_input_snapshots_active(entry.scheduler.get(), false);
-            }
-        }
-        if (!growing) { ++pipe_subbatch_stats.created_slots; }
-        entry.reserved_tokens = max_tokens;
-        entry.reserved_seqs = max_seqs;
-        if (demand_reserve && std::getenv("LLAMA_PIPE_RESERVE_TRACE")) {
-            fprintf(stderr, "SUBBATCH_DEMAND_RESERVE lane=%d ordinal=%u growing=%d tokens=%u seqs=%u reserve_tokens=%u reserve_seqs=%u previous_bytes=%zu\n",
-                    lane, ordinal, growing, tokens, seqs, max_tokens, max_seqs, previous_bytes);
-        }
-        if (std::getenv("LLAMA_PIPE_RESERVE_TRACE")) {
-            for (auto * backend : backend_ptrs) {
-                fprintf(stderr, "SUBBATCH_RESERVE lane=%d ordinal=%u bounded=%d max_tokens=%u max_seqs=%u shapes=%zu backend=%s bytes=%zu\n",
-                        lane, ordinal, lane_reserve, max_tokens, max_seqs, reserve_shapes.size(),
-                        ggml_backend_name(backend), ggml_backend_sched_get_buffer_size(entry.scheduler.get(), backend));
-            }
-        }
-    } catch (const std::exception & error) {
-        restore();
-        entry.result.reset();
-        entry.scheduler.reset();
-        entry.reserved_tokens = 0;
-        entry.reserved_seqs = 0;
-        ++pipe_subbatch_stats.reserve_failures;
-        LLAMA_LOG_WARN("SUBBATCH_CACHE_FALLBACK lane=%d ordinal=%u reason=%s\n", lane, ordinal, error.what());
-        return nullptr;
-    }
-    restore();
-    return &entry;
-}
-
-ggml_backend_input_snapshot_stats llama_context::get_prefill_input_snapshot_stats() const {
-    ggml_backend_input_snapshot_stats total = {};
-    auto add = [&](ggml_backend_sched_t scheduler) {
-        if (!scheduler) return;
-        const auto next = ggml_backend_sched_get_input_snapshot_stats(scheduler);
-        total.enabled = total.enabled || next.enabled;
-        total.tensors += next.tensors; total.bytes += next.bytes; total.fences += next.fences;
-        total.fence_wait_ns += next.fence_wait_ns; total.fallbacks += next.fallbacks;
-        total.allocated_bytes += next.allocated_bytes;
-    };
-    add(prefill_sched.get());
-    for (const auto & current : pf_ring_scheds) add(current.get());
-    const auto * helper = llama_pf_generation_find(this);
-    if (helper && !helper->draft_head) add(helper->scheduler.get());
-    return total;
-}
-
-void llama_context::set_decode_pipeline_lanes(uint32_t lanes) {
-    GGML_ASSERT(!decode_pipelined && pipe_scheds.empty() && lanes > 0);
-    const char * tight = std::getenv("LLAMA_PIPE_TIGHT_SCHEDS");
-    n_pipe_scheds = !tight || std::atoi(tight) != 0 ? lanes + 1 : 0;
-}
-
-void llama_context::set_decode_pipelined(bool enable) {
-    if (decode_pipelined == enable) {
-        return;
-    }
-
-    // quiesce before switching modes: in-flight decodes must complete with the
-    // output routing they were issued with
-    synchronize();
-    if (memory) { memory->set_pipeline_parallel(enable); }
-
-    const bool lazy_primary = llama_pipeline_lazy_primary_reserve() && !cparams.training &&
-            !cparams.embeddings && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP && !model.hparams.no_alloc;
-    if (enable && lazy_primary) {
-        // synchronize() above completed every user of these old allocations.
-        // Drop only the primary fallback workspace before reserving the lane
-        // workspaces. Model/state/output storage and private schedulers survive.
-        for (auto * backend : backend_ptrs) {
-            fprintf(stderr, "PIPE_PRIMARY_WORKSPACE_RELEASE backend=%s bytes=%zu\n",
-                    ggml_backend_name(backend), ggml_backend_sched_get_buffer_size(sched.get(), backend));
-        }
-        for (auto & res : gf_res_prev) { res.reset(); }
-        gf_res_prev_active = nullptr;
-        sched_new(graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch)), cparams.pipeline_parallel);
-        std::fill(backend_buf_exp_size.begin(), backend_buf_exp_size.end(), 0);
-        sched_need_reserve = true;
-    }
-
-    // Private prompt streams preserve per-device FIFO order. Every car still
-    // owns a completion ticket, and a lane waits for its previous car before it
-    // can reuse a sequence. Snapshots relax host ownership only; no KV, ticket,
-    // allocation or cross-stream dependency is removed.
-    auto enable_prefill_snapshots = [&](ggml_backend_sched_t scheduler, const std::vector<ggml_backend_t> & backends) {
-        const char * setting = std::getenv("LLAMA_PIPE_ASYNC_PREFILL_INPUTS");
-        if (!setting || std::atoi(setting) == 0 || !cparams.pipeline_parallel ||
-                (model.arch != LLM_ARCH_QWEN3NEXT && model.arch != LLM_ARCH_QWEN35 && model.arch != LLM_ARCH_QWEN35MOE) ||
-                backends.size() != backend_ptrs.size()) return;
-        for (size_t i = 0; i < backends.size(); ++i) {
-            auto * device = ggml_backend_get_device(backends[i]);
-            if (!device) return;
-            if (ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
-            auto * registry = ggml_backend_dev_backend_reg(device);
-            if (backends[i] == backend_ptrs[i] || !registry || std::strcmp(ggml_backend_reg_name(registry), "CUDA") != 0) return;
-        }
-        ggml_backend_sched_set_input_snapshots_ex(scheduler, true, true);
-    };
-
-    if (enable) {
-        if (pipe_scheds.empty()) {
-            if (n_pipe_scheds == 0) { n_pipe_scheds = pipeline_stages() + 3; }
-            pipe_scheds.resize(n_pipe_scheds);
-            pipe_gf_res.resize(n_pipe_scheds);
-            n_decode_tickets = std::max(8, 2 * std::max(n_pipe_scheds, pipeline_stages() + 3));
-            tickets.resize(n_decode_tickets);
-        }
-        // private (sched, graph result) ring for generation-sized decodes; sized for
-        // one token per sequence (larger batches stay on the main sched)
-        llama_memory_context_ptr mctx_full;
-        if (memory) { mctx_full = memory->init_full(); }
-        auto * reserve_kv = dynamic_cast<llama_kv_cache_context *>(mctx_full.get());
-        if (auto * hybrid = dynamic_cast<llama_memory_hybrid_context *>(mctx_full.get())) {
-            reserve_kv = const_cast<llama_kv_cache_context *>(hybrid->get_attn());
-        }
-        const bool supported_reserve_view = reserve_kv || dynamic_cast<llama_memory_recurrent_context *>(mctx_full.get());
-        const char * reserve_env = std::getenv("LLAMA_PIPE_TIGHT_RESERVE");
-        const bool tight_reserve = supported_reserve_view && (!reserve_env || std::atoi(reserve_env) != 0);
-        const uint32_t old_tokens_max = std::max<uint32_t>(cparams.n_seq_max, cparams.n_outputs_max);
-        const uint32_t n_tokens_max = tight_reserve ? std::min(old_tokens_max, llama_pipeline_verify_ubatch_limit(cparams)) : old_tokens_max;
-        const uint32_t n_seqs_max = std::min(std::max<uint32_t>(cparams.n_seq_max, 1), n_tokens_max);
-        const auto reserve_shapes = llama_pipeline_reserve_shapes(n_tokens_max, n_seqs_max, tight_reserve);
-        const size_t max_nodes = graph_max_nodes(n_tokens_max);
-
-        const char * input_env = std::getenv("LLAMA_PIPE_ASYNC_GENERATION_INPUTS");
-        const bool all_cuda = std::all_of(backend_ptrs.begin(), backend_ptrs.end(), [](ggml_backend_t backend) {
-            auto * device = ggml_backend_get_device(backend);
-            if (!device) return false;
-            if (ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU) return true;
-            auto * registry = ggml_backend_dev_backend_reg(device);
-            return registry && std::strcmp(ggml_backend_reg_name(registry), "CUDA") == 0;
-        });
-        const bool async_generation_inputs = input_env && std::atoi(input_env) != 0 &&
-                cparams.pipeline_parallel && all_cuda &&
-                (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE);
-
-        for (int i = 0; i < n_pipe_scheds; ++i) {
-            if (!pipe_scheds[i]) {
-                pipe_scheds[i].reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(),
-                        backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
-                pipe_gf_res[i].reset(new llm_graph_result(max_nodes));
-
-                // Reserve the normal lane's generation shapes up front. The last
-                // scheduler remains sized for an untagged global batch. A later,
-                // unusually unbalanced lane can still use the scheduler's existing
-                // synchronized allocation-growth path; lane buffers never alias.
-                sched_cur  = pipe_scheds[i].get();
-                gf_res_cur = pipe_gf_res[i].get();
-
-                const bool lane_scheduler = tight_reserve && !cparams.embeddings &&
-                        i + 1 < n_pipe_scheds && n_pipe_scheds > 1;
-                const uint32_t lanes = std::max(n_pipe_scheds - 1, 1);
-                const uint32_t lane_seqs = std::max<uint64_t>(1,
-                        (uint64_t(cparams.n_seq_max) + lanes - 1) / lanes);
-                const uint64_t rows_per_seq = 1 + uint64_t(cparams.n_rs_seq);
-                const uint32_t reserve_tokens = lane_scheduler ?
-                        std::min<uint64_t>(n_tokens_max, uint64_t(lane_seqs) * rows_per_seq) : n_tokens_max;
-                const uint32_t reserve_seqs = lane_scheduler ? std::min(n_seqs_max, lane_seqs) : n_seqs_max;
-                auto lane_shapes = lane_scheduler ?
-                        llama_pipeline_reserve_shapes(reserve_tokens, reserve_seqs, tight_reserve) : reserve_shapes;
-                if (lane_scheduler) {
-                    // Ordinary decode never has multiple rows per sequence; MTP
-                    // verification has at most one plus the configured draft cap.
-                    // Avoid reserving unreachable prompt-like recurrent graphs.
-                    lane_shapes.erase(std::remove_if(lane_shapes.begin(), lane_shapes.end(),
-                            [&](const auto & shape) {
-                                return uint64_t(shape.first) > uint64_t(shape.second) * rows_per_seq;
-                            }), lane_shapes.end());
-                }
-                const bool lazy_global = llama_pipeline_lazy_global_reserve() && tight_reserve &&
-                        !cparams.embeddings && cparams.pipeline_parallel && all_cuda &&
-                        i + 1 == n_pipe_scheds && n_pipe_scheds > 1;
-                if (lazy_global) {
-                    // The untagged allocator remains distinct. Its first real
-                    // graph uses the existing synchronized allocation/growth path.
-                    lane_shapes.clear();
-                    fprintf(stderr, "PIPE_LAZY_GLOBAL_RESERVED slot=%d allocated=0\n", i);
-                } else {
-                    GGML_ASSERT(!lane_shapes.empty());
-                }
-                for (const auto & shape : lane_shapes) {
-                    if (reserve_kv) reserve_kv->set_reserve_streams(shape.second);
-                    if (!graph_reserve(shape.first, shape.second, shape.first, mctx_full.get())) {
-                        LLAMA_LOG_WARN("%s: failed to reserve compute buffers for pipe slot %d (%u tokens, %u sequences)\n",
-                                __func__, i, shape.first, shape.second);
-                    }
-                }
-                if (async_generation_inputs && ggml_backend_sched_set_input_snapshots_ex(pipe_scheds[i].get(), true, true)) {
-                    // Remain conservative until each call has checked prefill fences.
-                    ggml_backend_sched_set_input_snapshots_active(pipe_scheds[i].get(), false);
-                }
-                if (std::getenv("LLAMA_PIPE_RESERVE_TRACE")) {
-                    for (auto * backend : backend_ptrs) {
-                        fprintf(stderr, "PIPE_RESERVE slot=%d slots=%d max_tokens=%u shapes=%zu backend=%s bytes=%zu\n",
-                                i, n_pipe_scheds, reserve_tokens, lane_shapes.size(), ggml_backend_name(backend),
-                                ggml_backend_sched_get_buffer_size(pipe_scheds[i].get(), backend));
-                    }
-                }
-            }
-        }
-
-        if (reserve_kv) reserve_kv->set_reserve_streams(0);
-
-        // private backend instances (own low-priority CUDA streams) where supported;
-        // shared instances otherwise. with private instances, chunk kernels overlap
-        // with decode-lane kernels instead of queueing in front of them, and the
-        // lanes' blocking input syncs no longer wait out the queued chunks.
-        // LLAMA_PIPE_PF_PRIVATE=0 falls back to the shared backends (single stream
-        // per device) for A/B comparison. fills `ptrs` with one backend per device
-        // (private where possible, shared otherwise); `owned` keeps the new instances.
-        const char * env_pf_private = getenv("LLAMA_PIPE_PF_PRIVATE");
-        const bool   pf_private     = !env_pf_private || atoi(env_pf_private) != 0;
-
-        auto build_pf_backends = [&](std::vector<ggml_backend_ptr> & owned, std::vector<ggml_backend_t> & ptrs) {
-            owned.clear();
-            ptrs.clear();
-            for (auto * b : backend_ptrs) {
-                ggml_backend_t nb = nullptr;
-
-                ggml_backend_dev_t dev = ggml_backend_get_device(b);
-                if (pf_private && dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-                    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-
-                    auto fn_init_background = reg ?
-                        (ggml_backend_t (*)(ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_init_background") : nullptr;
-                    if (fn_init_background) {
-                        nb = fn_init_background(dev);
-                    }
-                }
-
-                if (nb) {
-                    owned.emplace_back(nb);
-                    ptrs.push_back(nb);
-                } else {
-                    ptrs.push_back(b);
-                }
-            }
-        };
-
-        if (!prefill_sched) {
-            const uint32_t n_tokens_pp  = std::min(cparams.n_ctx, cparams.n_ubatch);
-            const size_t   max_nodes_pp = graph_max_nodes(n_tokens_pp);
-
-            build_pf_backends(prefill_backends, prefill_backend_ptrs);
-            if (!prefill_backends.empty()) {
-                LLAMA_LOG_INFO("%s: prefill sched uses %zu private background backends\n", __func__, prefill_backends.size());
-            }
-
-            prefill_sched.reset(ggml_backend_sched_new(prefill_backend_ptrs.data(), backend_buft.data(),
-                    prefill_backend_ptrs.size(), max_nodes_pp, /*parallel =*/ true, cparams.op_offload));
-            prefill_gf_res.reset(new llm_graph_result(max_nodes_pp));
-
-            sched_cur       = prefill_sched.get();
-            gf_res_cur      = prefill_gf_res.get();
-            pf_cur          = true;
-            pf_cur_backends = &prefill_backend_ptrs;
-
-            if (!graph_reserve(n_tokens_pp,
-                            llama_prefill_initial_reserve_sequences(model, cparams, cparams.n_seq_max),
-                            llama_prefill_initial_reserve_sequences(model, cparams, cparams.n_seq_max) != cparams.n_seq_max
-                                ? std::min(n_tokens_pp, cparams.n_outputs_max) : n_tokens_pp,
-                            mctx_full.get())) {
-                LLAMA_LOG_WARN("%s: failed to reserve compute buffers for the prefill sched\n", __func__);
-                prefill_sched.reset();
-                prefill_gf_res.reset();
-                prefill_backends.clear();
-                prefill_backend_ptrs.clear();
-            } else {
-                enable_prefill_snapshots(prefill_sched.get(), prefill_backend_ptrs);
-            }
-        }
-
-        // optional ring of independent prompt-sized scheds (LLAMA_PIPE_PF_RING=N).
-        // each slot is its own parallel sched on its own private streams, so chunks
-        // routed round-robin overlap across stages instead of serializing through one
-        // sched's input-copy rotation. replaces prefill_sched for routing when active.
-        if (prefill_sched && pf_ring_n == 0) {
-            const char * env_ring = getenv("LLAMA_PIPE_PF_RING");
-            int ring_req = env_ring ? std::clamp(atoi(env_ring), 0, n_pf_ring_max) : 0;
-
-            if (ring_req > 0) {
-                const uint32_t n_tokens_pp  = std::min(cparams.n_ctx, cparams.n_ubatch);
-                const size_t   max_nodes_pp = graph_max_nodes(n_tokens_pp);
-
-                int made = 0;
-                for (int i = 0; i < ring_req; ++i) {
-                    build_pf_backends(pf_ring_backends[i], pf_ring_backend_ptrs[i]);
-
-                    pf_ring_scheds[i].reset(ggml_backend_sched_new(pf_ring_backend_ptrs[i].data(), backend_buft.data(),
-                            pf_ring_backend_ptrs[i].size(), max_nodes_pp, /*parallel =*/ true, cparams.op_offload));
-                    pf_ring_gf_res[i].reset(new llm_graph_result(max_nodes_pp));
-
-                    sched_cur       = pf_ring_scheds[i].get();
-                    gf_res_cur      = pf_ring_gf_res[i].get();
-                    pf_cur          = true;
-                    pf_cur_backends = &pf_ring_backend_ptrs[i];
-
-                    if (!graph_reserve(n_tokens_pp,
-                            llama_prefill_initial_reserve_sequences(model, cparams, cparams.n_seq_max),
-                            llama_prefill_initial_reserve_sequences(model, cparams, cparams.n_seq_max) != cparams.n_seq_max
-                                ? std::min(n_tokens_pp, cparams.n_outputs_max) : n_tokens_pp,
-                            mctx_full.get())) {
-                        LLAMA_LOG_WARN("%s: failed to reserve compute buffers for prefill ring slot %d - disabling ring\n", __func__, i);
-                        pf_ring_scheds[i].reset();
-                        pf_ring_gf_res[i].reset();
-                        pf_ring_backends[i].clear();
-                        pf_ring_backend_ptrs[i].clear();
-                        break;
-                    }
-                    enable_prefill_snapshots(pf_ring_scheds[i].get(), pf_ring_backend_ptrs[i]);
-                    ++made;
-                }
-
-                pf_ring_n = made;
-                if (pf_ring_n > 0) {
-                    LLAMA_LOG_WARN("%s: prefill sched ring active: %d independent prompt-sized scheds\n", __func__, pf_ring_n);
-                } else {
-                    LLAMA_LOG_WARN("%s: prefill sched ring requested (%d) but none could be reserved\n", __func__, ring_req);
-                }
-            }
-        }
-    }
-
-    // One mixed-generation allocator is sufficient: it shares all prefill
-    // streams and rotates its own immutable scheduler inputs as before.
-    const char * split_env = std::getenv("LLAMA_PIPE_PF_SPLIT_GENERATION");
-    if (enable && prefill_sched && pf_ring_n == 0 && (!split_env || std::atoi(split_env) != 0) &&
-            !llama_pf_generation_find(this)) {
-        auto full = memory ? memory->init_full() : nullptr;
-        auto * kv = dynamic_cast<llama_kv_cache_context *>(full.get());
-        if (auto * hybrid = dynamic_cast<llama_memory_hybrid_context *>(full.get())) {
-            kv = const_cast<llama_kv_cache_context *>(hybrid->get_attn());
-        }
-        const bool supported = kv || dynamic_cast<llama_memory_recurrent_context *>(full.get());
-        if (supported) {
-            auto helper = std::make_unique<llama_pf_generation>();
-            helper->max_tokens = std::min(std::max(cparams.n_seq_max, cparams.n_outputs_max),
-                                          llama_pipeline_verify_ubatch_limit(cparams));
-            const auto nodes = graph_max_nodes(helper->max_tokens);
-            helper->scheduler.reset(ggml_backend_sched_new(prefill_backend_ptrs.data(), backend_buft.data(),
-                    prefill_backend_ptrs.size(), nodes, true, cparams.op_offload));
-            helper->result.reset(new llm_graph_result(nodes));
-            sched_cur = helper->scheduler.get();
-            gf_res_cur = helper->result.get();
-            pf_cur = true;
-            pf_cur_backends = &prefill_backend_ptrs;
-            bool reserved = true;
-            for (const auto & shape : llama_pipeline_reserve_shapes(helper->max_tokens,
-                    std::min(cparams.n_seq_max, helper->max_tokens), true)) {
-                if (kv) kv->set_reserve_streams(shape.second);
-                if (!graph_reserve(shape.first, shape.second, shape.first, full.get())) {
-                    reserved = false;
-                    break;
-                }
-            }
-            if (kv) kv->set_reserve_streams(0);
-            if (reserved) {
-                enable_prefill_snapshots(helper->scheduler.get(), prefill_backend_ptrs);
-                if (std::getenv("LLAMA_PIPE_RESERVE_TRACE")) {
-                    for (auto * backend : prefill_backend_ptrs) {
-                        fprintf(stderr, "PF_GENERATION_RESERVE max_tokens=%u backend=%s bytes=%zu\n",
-                                helper->max_tokens, ggml_backend_name(backend),
-                                ggml_backend_sched_get_buffer_size(helper->scheduler.get(), backend));
-                    }
-                }
-                std::lock_guard<std::mutex> lock(llama_pf_generation_mutex);
-                llama_pf_generations.emplace(this, std::move(helper));
-            }
-        }
-    }
-
-    sched_cur       = nullptr;
-    gf_res_cur      = nullptr;
-    pf_cur          = false;
-    pf_cur_backends = nullptr;
-
-    decode_pipelined = enable;
-    if (!enable && lazy_primary) { sched_need_reserve = true; }
-
-    LLAMA_LOG_INFO("%s: pipelined decode %s\n", __func__, enable ? "enabled" : "disabled");
-}
-
-void llama_context::set_decode_pipelane(int32_t lane) {
-    pipe_lane_hint = lane;
-}
-
-uint64_t llama_context::decode_ticket_last() const {
-    return ticket_seq;
-}
-
-int32_t llama_context::decode_ticket_wait(uint64_t ticket) {
-    if (ticket == 0 || ticket > ticket_seq) {
-        return -1;
-    }
-
-    auto & tk = tickets[ticket % n_decode_tickets];
-    if (tk.id != ticket) {
-        // recycled: the caller let too many decodes pass before waiting
-        return -1;
-    }
-
-    if (tk.fallback || !tk.event_recorded) {
-        synchronize();
-        return 0;
-    }
-
-    for (const auto & c : tk.completions) {
-        if (c.used) { ggml_backend_event_synchronize(c.event); }
-    }
-
-    return 0;
-}
-
-bool llama_context::decode_ticket_select(uint64_t ticket) {
-    if (ticket == 0) {
-        selected_ticket = 0;
-        return true;
-    }
-    if (decode_ticket_wait(ticket) != 0) {
-        return false;
-    }
-    auto & tk = tickets[ticket % n_decode_tickets];
-    if (tk.fallback) {
-        return false;
-    }
-    selected_ticket = ticket;
-    return true;
-}
-
-bool llama_context::decode_ticket_retain(uint64_t ticket) {
-    if (!ticket || !n_decode_tickets || ticket > ticket_seq) { return false; }
-    auto & tk = tickets[ticket % n_decode_tickets];
-    if (tk.id != ticket || tk.fallback) { return false; }
-    tk.retained = true;
-    return true;
-}
-
-bool llama_context::decode_ticket_release(uint64_t ticket) {
-    if (!ticket || !n_decode_tickets || ticket > ticket_seq) { return false; }
-    auto & tk = tickets[ticket % n_decode_tickets];
-    if (tk.id != ticket || !tk.retained) { return false; }
-    tk.retained = false;
-    return true;
-}
-
-int32_t llama_context::decode_ticket_retained_count() const {
-    return std::count_if(tickets.begin(), tickets.end(), [](const decode_ticket & tk) { return tk.retained; });
-}
-
-bool llama_context::decode_ticket_ready(uint64_t ticket) const {
-    if (ticket == 0 || ticket > ticket_seq) {
-        return true; // wait would fail fast
-    }
-
-    const auto & tk = tickets[ticket % n_decode_tickets];
-    if (tk.id != ticket) {
-        return true; // recycled: wait would fail fast
-    }
-
-    if (tk.fallback || !tk.event_recorded) {
-        return true; // wait degrades to a full sync either way
-    }
-
-    for (const auto & c : tk.completions) {
-        if (c.used && !ggml_backend_event_query(c.event)) { return false; }
-    }
-    return true;
-}
-
-int32_t llama_context::prefill_inflight() {
-    int32_t n = 0;
-
-    for (auto & f : pf_fences) {
-        if (!f.pending) {
-            continue;
-        }
-        bool done = true;
-        for (auto & [ev, b] : f.events) {
-            if (!ggml_backend_event_query(ev)) {
-                done = false;
-                break;
-            }
-        }
-        if (done) {
-            f.pending = false;
-        } else {
-            n++;
-        }
-    }
-
-    return n;
-}
-
-float * llama_context::decode_ticket_logits_ith(uint64_t ticket, int32_t i) {
-    if (ticket == 0 || ticket > ticket_seq) {
-        return nullptr;
-    }
-
-    auto & tk = tickets[ticket % n_decode_tickets];
-    if (tk.id != ticket) {
-        return nullptr;
-    }
-
-    if (tk.fallback) {
-        // outputs went to the main buffer (already synchronized by ticket_wait)
-        return get_logits_ith(i);
-    }
-
-    const int32_t row = i < 0 ? tk.n_outputs + i :
-            (size_t) i < tk.output_ids.size() ? tk.output_ids[i] : -1;
-    if (row < 0 || row >= tk.n_outputs) {
-        return nullptr;
-    }
-
-    return tk.data + (size_t) row * model.vocab.n_tokens();
 }
 
 const llama_model & llama_context::get_model() const {
@@ -2459,6 +1692,12 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
     LLAMA_LOG_DEBUG("%s: adapters = %p\n", __func__, (void *) adapters);
 
+    std::lock_guard<std::recursive_mutex> config_guard(model.pipeline_configuration->mutex);
+    for (size_t i = 0; i < n_adapters; ++i) {
+        if (scales[i] != 0.0f && (!adapters[i] || adapters[i]->model != &model || !model.loras.count(adapters[i]))) {
+            throw std::runtime_error("ParaFlow: adapter must be loaded by this model before startup approval");
+        }
+    }
     if (adapters_lora_are_same(adapters, n_adapters, scales)) {
         return;
     }
@@ -2508,20 +1747,17 @@ bool llama_context::set_adapter_cvec(
                 int32_t   il_end) {
     LLAMA_LOG_DEBUG("%s: il_start = %d, il_end = %d\n", __func__, il_start, il_end);
 
+    std::lock_guard<std::recursive_mutex> config_guard(model.pipeline_configuration->mutex);
+    if (data && model.pipeline_configuration->users && cvec->memory_breakdown().empty()) {
+        LLAMA_LOG_ERROR("%s: new control-vector weights require a new startup configuration\n", __func__);
+        return false;
+    }
     bool res = cvec->apply(model, data, len, n_embd, il_start, il_end);
 
     sched_need_reserve = true;
 
     return res;
 }
-
-// temporary profiling for pipelined-decode tuning: breakdown of the CPU time
-// spent inside one llama_decode. printed every 256 pipelined decodes.
-struct llama_ubatch_prof {
-    int64_t build = 0, alloc = 0, input = 0, submit = 0;
-    int     n     = 0;
-};
-static thread_local llama_ubatch_prof g_ubatch_prof;
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
@@ -2534,7 +1770,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // else (prompts, embeddings, non-pipelined) uses the main sched and gf_res_prev
     const bool ring = gf_res_cur != nullptr;
 
-    // the prefill sched (single or ring slot) rotates input copies (n_copies > 1):
+    // the prefill sched rotates input copies (n_copies > 1):
     // reusing a graph there and writing its inputs in place would race the previous
     // in-flight chunk, so prompt chunks always rebuild
     const bool prefill = pf_cur;
@@ -2558,28 +1794,24 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
-        if (pipe_subbatch_graph_kind == 1) { ++pipe_subbatch_stats.primary_reuses; }
-        if (pipe_subbatch_graph_kind == 2) { ++pipe_subbatch_stats.auxiliary_reuses; }
     } else {
-        if (pipe_subbatch_graph_kind == 1) { ++pipe_subbatch_stats.primary_builds; }
-        if (pipe_subbatch_graph_kind == 2) { ++pipe_subbatch_stats.auxiliary_builds; }
         gf_res_prev_active = nullptr;
         res->reset();
 
         ggml_backend_sched_reset(cur_sched());
         ggml_backend_sched_set_eval_callback(cur_sched(), cparams.cb_eval, cparams.cb_eval_user_data);
 
-        const auto t_build0 = ggml_time_us();
+        //const auto t_start_us = ggml_time_us();
 
         gf = model.build_graph(gparams);
+
+        //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
-
-        const auto t_alloc0 = ggml_time_us();
 
         if (!ggml_backend_sched_alloc_graph(cur_sched(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
@@ -2588,45 +1820,23 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         gf_res_prev_active = res;
-        g_ubatch_prof.build += t_alloc0 - t_build0;
-        g_ubatch_prof.alloc += ggml_time_us() - t_alloc0;
     }
 
     // set the input data for the input tensors
     {
-        const auto t_input0 = ggml_time_us();
+        //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
 
-        g_ubatch_prof.input += ggml_time_us() - t_input0;
+        //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
-    const auto t_submit0 = ggml_time_us();
-
-    if (decode_pipelined && ggml_backend_sched_get_input_snapshot_stats(cur_sched()).enabled) {
-        // Prompt schedulers opt in only on private CUDA streams. Their owned
-        // snapshots follow those same FIFO streams. Primary generation streams
-        // retain the conservative quiescent-prefill requirement.
-        const bool ordered_inputs = pf_cur || prefill_inflight() == 0;
-        ggml_backend_sched_set_input_snapshots_active(cur_sched(), ordered_inputs);
-    }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
-    }
-
-    g_ubatch_prof.submit += ggml_time_us() - t_submit0;
-
-    if (decode_pipelined && ++g_ubatch_prof.n >= 256) {
-        // plain stderr: this server build silences the library log callback
-        fprintf(stderr, "ubatch profile (avg us over %d): build=%" PRId64 " alloc=%" PRId64 " input=%" PRId64 " submit=%" PRId64 "\n",
-                g_ubatch_prof.n,
-                g_ubatch_prof.build / g_ubatch_prof.n, g_ubatch_prof.alloc  / g_ubatch_prof.n,
-                g_ubatch_prof.input / g_ubatch_prof.n, g_ubatch_prof.submit / g_ubatch_prof.n);
-        g_ubatch_prof = {};
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -2884,14 +2094,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         llama_ckpt_capture_state & st;
         ~ckpt_decode_close() { st.decode_open = false; }
     } ckpt_close_guard{ckpt_state};
-    const auto nextn_hint = llama_consume_nextn_hint(this);
-    const bool copy_nextn = nextn_hint.second;
     selected_ticket = 0;
-    pipe_subbatch_graph_kind = 0;
-    struct reset_subbatch_kind {
-        int & kind;
-        ~reset_subbatch_kind() { kind = 0; }
-    } subbatch_kind_guard{pipe_subbatch_graph_kind};
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -2996,7 +2199,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     uint32_t decode_ubatch = cparams.n_ubatch;
     if (decode_pipelined && n_outputs_all == n_tokens_all && cparams.n_rs_seq > 0) {
-        decode_ubatch = llama_pipeline_verify_ubatch_limit(cparams);
+        decode_ubatch = pipeline_verify_ubatch();
     }
     while (true) {
         mctx = memory->init_batch(*balloc, decode_ubatch, embd_all);
@@ -3054,8 +2257,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     pf_cur          = false;
     pf_cur_backends = nullptr;
 
-    int generation_slot = -1;
-    uint32_t physical_ordinal = 0;
     decode_ticket * tk = nullptr;
     // Tagged prompt cars need completion tickets even before their last chunk.
     // Untagged fallback prefills keep their shared-buffer output path.
@@ -3100,7 +2301,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         if (can_slab) {
             const size_t logits_need = (size_t) n_vocab * n_outputs_all;
-            const size_t hidden_rows = cparams.embeddings_nextn && copy_nextn ? n_tokens_all : 0;
+            const size_t hidden_rows = cparams.embeddings_nextn ? n_tokens_all : 0;
             const size_t need = logits_need + hidden_rows * hparams.n_embd_out();
             if (need > 0 && (!tk->data || tk->size < need)) {
                 auto * buft = ggml_backend_cpu_buffer_type();
@@ -3133,44 +2334,17 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             if (pipe_scheds[slot]) {
                 sched_cur  = pipe_scheds[slot].get();
                 gf_res_cur = pipe_gf_res[slot].get();
-                // Opt-in LLAMA_PIPE_SUBBATCH_TRADITIONAL=1: ordinary (non-speculative) generation
-                // cars that split into several physical ubatches also use the per-lane ordinal
-                // graph cache, so alternating shapes stop evicting each other's graphs.
-                static const bool subbatch_traditional = []() {
-                    const char * v = std::getenv("LLAMA_PIPE_SUBBATCH_TRADITIONAL");
-                    return v && std::atoi(v) != 0;
-                }();
-                if (n_outputs_all == n_tokens_all && (cparams.n_rs_seq > 0 || subbatch_traditional)) {
-                    generation_slot = slot;
-                    ++pipe_subbatch_stats.logical_calls;
-                }
             }
         }
     }
 
     // prompt-sized pipelined decodes (interleaved chunks) run on a dedicated parallel
-    // sched so that consecutive chunks overlap across the pipeline stages. with the
-    // ring active, route chunks round-robin to independent ring slots (own streams)
-    // instead of the single prefill_sched, so they don't serialize on one sched's
-    // input-copy rotation.
+    // sched so that consecutive chunks overlap across the pipeline stages.
     if (decode_pipelined && prefill_sched &&
             (n_tokens_all > cparams.n_outputs_max || (pipe_lane_hint >= 0 && n_outputs_all < n_tokens_all))) {
-        // lane affinity: the ring is used ONLY for chunks the server explicitly tags
-        // with a prefill lane (set_decode_pipelane >= 0). Each such chunk is a single
-        // request's tokens, so all of a request's chunks share one ring slot (own
-        // stream) -> their KV writes stay ordered, while different lanes overlap.
-        // Untagged / mixed-sequence chunks keep the single prefill_sched (the ring's
-        // round-robin would split a request across streams and race its KV).
-        if (pf_ring_n > 0 && pipe_lane_hint >= 0) {
-            const int slot = pipe_lane_hint % pf_ring_n;
-            sched_cur       = pf_ring_scheds[slot].get();
-            gf_res_cur      = pf_ring_gf_res[slot].get();
-            pf_cur_backends = &pf_ring_backend_ptrs[slot];
-        } else {
-            sched_cur       = prefill_sched.get();
-            gf_res_cur      = prefill_gf_res.get();
-            pf_cur_backends = &prefill_backend_ptrs;
-        }
+        sched_cur       = prefill_sched.get();
+        gf_res_cur      = prefill_gf_res.get();
+        pf_cur_backends = &prefill_backend_ptrs;
         pf_cur = true;
     }
 
@@ -3202,48 +2376,22 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
 
         if (!decode_pipelined && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
-            auto * helper = llama_pf_generation_find(this);
-            const bool generation = helper && helper->draft_head && ubatch.n_tokens <= helper->max_tokens &&
+            // MTP drafting (all rows are outputs) and catch-up (no logits) keep separate allocators.
+            auto * helper = pf_generation.get();
+            const bool generation = helper && ubatch.n_tokens <= helper->max_tokens &&
                     ubatch.n_tokens == ubatch.n_seqs &&
                     std::all_of(ubatch.output, ubatch.output + ubatch.n_tokens,
                                 [](int8_t output) { return output != 0; });
             sched_cur = generation ? helper->scheduler.get() : nullptr;
             gf_res_cur = generation ? helper->result.get() : nullptr;
-            if (generation) ++helper->calls;
-        }
-
-        if (pf_cur && pf_ring_n == 0 && pf_cur_backends == &prefill_backend_ptrs) {
-            auto * helper = llama_pf_generation_find(this);
-            const bool generation = helper && ubatch.n_tokens <= helper->max_tokens &&
-                    std::all_of(ubatch.output, ubatch.output + ubatch.n_tokens,
-                                [](int8_t output) { return output != 0; });
-            sched_cur = generation ? helper->scheduler.get() : prefill_sched.get();
-            gf_res_cur = generation ? helper->result.get() : prefill_gf_res.get();
-            if (generation) ++helper->calls;
         }
 
         ggml_status status;
 
-        if (generation_slot >= 0) {
-            // Preserve both the splitter and the per-ubatch numerical operations.
-            // Only the scheduler/graph ownership differs for ordinals after zero.
-            sched_cur = pipe_scheds[generation_slot].get();
-            gf_res_cur = pipe_gf_res[generation_slot].get();
-            pipe_subbatch_graph_kind = 1;
-            ++pipe_subbatch_stats.physical_subbatches;
-            if (physical_ordinal == 1) { ++pipe_subbatch_stats.multi_calls; }
-            if (physical_ordinal > 0 && pipe_subbatch_stats.enabled) {
-                auto * extra = ensure_pipeline_subbatch(generation_slot, physical_ordinal, ubatch.n_tokens, ubatch.n_seqs);
-                if (extra) {
-                    sched_cur = extra->scheduler.get();
-                    gf_res_cur = extra->result.get();
-                    pipe_subbatch_graph_kind = 2;
-                    ++pipe_subbatch_stats.auxiliary_calls;
-                } else {
-                    ++pipe_subbatch_stats.fallback_calls;
-                }
-            }
-        }
+        stat_ubatches.fetch_add(1, std::memory_order_relaxed);
+        stat_tokens.fetch_add(ubatch.n_tokens, std::memory_order_relaxed);
+        stat_seqs.fetch_add(ubatch.n_seqs_unq, std::memory_order_relaxed);
+        if (n_tokens_prev == 0) { stat_decodes.fetch_add(1, std::memory_order_relaxed); }
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
@@ -3285,7 +2433,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
-        auto * t_h_nextn = cparams.embeddings_nextn && copy_nextn ? res->get_h_nextn() : nullptr;
+        auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
 
         if (t_embd && res->get_embd_pooled()) {
             t_embd = res->get_embd_pooled();
@@ -3435,7 +2583,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
-        ++physical_ordinal;
     } while (mctx->next());
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
@@ -3506,8 +2653,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // backend used by the prefill scheduler. the set can contain private background
     // backends and shared fallbacks; fencing only the private subset can retire a
     // mixed-backend chunk before its shared-backend KV writes have completed. the
-    // server polls llama_prefill_inflight() to bound chunks in flight. with the ring,
-    // a recycled fence slot rebuilds its events for the backend set that ran it.
+    // server bounds the chunks in flight (--pipe-pf-inflight). a recycled
+    // fence slot rebuilds its events for the backend set that ran it.
     if (decode_pipelined && pf_cur && pf_cur_backends && !pf_cur_backends->empty()) {
         auto & active = *pf_cur_backends;
 
@@ -3618,17 +2765,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         ck.pfset[i] = (pf_cur && pf_cur_backends == &prefill_backend_ptrs) ? (const void *) &prefill_backend_ptrs : nullptr;
         // the work issued by this call is covered by the ticket's events
         ck.soft = ckpt_prior_soft && ck.sync_count == ckpt_entry_syncs;
-    }
-
-    if (nextn_hint.first && cparams.embeddings_nextn) {
-        std::lock_guard<std::mutex> lock(llama_pf_generation_mutex);
-        auto & stats = llama_nextn_copies[this];
-        const uint64_t rows = cparams.embeddings_nextn_masked ? n_outputs_all : n_tokens_all;
-        if (copy_nextn) { ++stats.copied_calls; stats.copied_rows += rows; }
-        else {
-            ++stats.skipped_calls; stats.skipped_rows += rows;
-            stats.skipped_bytes += rows * hparams.n_embd_out() * sizeof(float);
-        }
     }
 
     // wait for the computation to finish (automatically done when obtaining the model output)
@@ -3846,9 +2982,7 @@ void llama_context::output_reorder() {
         const uint64_t i1 = output_swaps[s].i1;
 
         if (logits.size > 0) {
-            for (uint64_t k = 0; k < n_vocab; k++) {
-                std::swap(logits.data[i0*n_vocab + k], logits.data[i1*n_vocab + k]);
-            }
+            std::swap_ranges(logits.data + i0*n_vocab, logits.data + (i0 + 1)*n_vocab, logits.data + i1*n_vocab);
         }
 
         if (embd.size > 0) {
@@ -4086,6 +3220,31 @@ ggml_cgraph * llama_context::graph_reserve(
         if (reserve_streams.kv) { reserve_streams.kv->set_reserve_streams(n_seqs); }
     }
 
+    struct recurrent_reserve_scope {
+        unsigned int prior;
+        recurrent_reserve_scope(uint32_t count) : prior(llama_recurrent_reserve_sequences) {
+            llama_recurrent_reserve_sequences = count;
+        }
+        ~recurrent_reserve_scope() { llama_recurrent_reserve_sequences = prior; }
+    } reserve_rs_scope(n_seqs);
+    // Target dynamic KV reserves a small initial workspace. Keep the MTP
+    // workspace fully reserved: bounded reservation caused persistent draft
+    // acceptance loss after interleaved requests. Stored KV is unchanged.
+    struct bounded_kv_reserve_scope {
+        llama_kv_cache_context * kv = nullptr;
+        uint32_t prior = 0;
+        ~bounded_kv_reserve_scope() { if (kv) kv->set_reserve_n_kv(prior); }
+    } bounded_kv;
+    if (cparams.kv_dynamic && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+        bounded_kv.kv = const_cast<llama_kv_cache_context *>(dynamic_cast<const llama_kv_cache_context *>(mctx));
+        if (auto * hybrid = dynamic_cast<const llama_memory_hybrid_context *>(mctx)) {
+            bounded_kv.kv = const_cast<llama_kv_cache_context *>(hybrid->get_attn());
+        }
+        if (bounded_kv.kv) {
+            bounded_kv.prior = bounded_kv.kv->get_n_kv();
+            bounded_kv.kv->set_reserve_n_kv(std::min<uint32_t>(bounded_kv.prior, 2048));
+        }
+    }
     const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
 
     res->reset();
@@ -4101,6 +3260,39 @@ ggml_cgraph * llama_context::graph_reserve(
     this->n_input_tensors = llama_graph_n_input_tensors(gf);
     this->n_outputs = save_n_outputs;
 
+    // Diagnostic only: no synchronization, allocation policy, or graph mutation.
+    const bool memory_trace = std::getenv("PARAFLOW_MEMORY_TRACE") != nullptr;
+    auto trace_memory = [&](const char * phase) {
+        if (!memory_trace) return;
+        int lane = -1;
+        for (size_t i = 0; i < pipe_scheds.size(); ++i) {
+            if (pipe_scheds[i].get() == cur_sched()) lane = (int) i;
+        }
+        const char * role = cur_sched() == prefill_sched.get() ? "prefill" :
+                           (lane >= 0 ? "pipeline" : "primary");
+        for (int bi = 0; bi < ggml_backend_sched_get_n_backends(cur_sched()); ++bi) {
+            auto * backend = ggml_backend_sched_get_backend(cur_sched(), bi);
+            auto dev = ggml_backend_get_device(backend);
+            size_t free = 0, total = 0;
+            if (dev) ggml_backend_dev_memory(dev, &free, &total);
+            fprintf(stderr, "PF_MEMORY phase=%s ctx=%p type=%d role=%s lane=%d sched=%p backend=%s tokens=%u seqs=%u ctx_seq=%u sched_bytes=%zu device_used=%zu device_total=%zu\n",
+                    phase, (void *) this, (int) cparams.ctx_type, role, lane, (void *) cur_sched(),
+                    ggml_backend_name(backend), n_tokens, n_seqs, cparams.n_ctx_seq,
+                    ggml_backend_sched_get_buffer_size(cur_sched(), backend), total - free, total);
+        }
+    };
+    trace_memory("before_reserve");
+    if (memory_trace && gf) {
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            const auto * node = ggml_graph_node(gf, i);
+            if (ggml_nbytes(node) < 1024*1024) continue;
+            fprintf(stderr, "PF_MEMORY_NODE ctx=%p sched=%p name=%s op=%s type=%s bytes=%zu shape=%lld,%lld,%lld,%lld view=%d\n",
+                    (void *) this, (void *) cur_sched(), node->name, ggml_op_name(node->op), ggml_type_name(node->type),
+                    ggml_nbytes(node), (long long)node->ne[0], (long long)node->ne[1],
+                    (long long)node->ne[2], (long long)node->ne[3], node->view_src != nullptr);
+        }
+    }
+
     // initialize scheduler with the specified graph
     if (split_only) {
         if (sizes) {
@@ -4114,6 +3306,7 @@ ggml_cgraph * llama_context::graph_reserve(
         return nullptr;
     }
 
+    trace_memory("after_reserve");
     return gf;
 }
 
@@ -4294,8 +3487,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
             if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0)) {
                 const auto & dev_layer = model.dev_layer(il);
                 // pin via the backend instances of the sched that allocates this graph:
-                // the prefill sched (single or ring slot) runs on private backend
-                // instances of the same devices
+                // the prefill sched runs on private backend instances of the same devices
                 const auto & cur_backends = (pf_cur && pf_cur_backends) ? *pf_cur_backends : backend_ptrs;
                 for (ggml_backend_t backend : cur_backends) {
                     if (ggml_backend_get_device(backend) == dev_layer) {
@@ -4316,6 +3508,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
 class llama_io_write_dummy : public llama_io_write_i {
 public:
     llama_io_write_dummy(bool skip_tensors) : skip_tensors(skip_tensors) {}
+    bool requires_tensor_data() const override { return false; }
 
     void write(const void * /* src */, size_t size) override {
         size_written += size;
@@ -4529,7 +3722,9 @@ public:
         for (const auto & winfo : winfos) {
             auto * buft = ggml_backend_buffer_get_type(winfo.tensor->buffer);
 
-            const int64_t n = winfo.size/ggml_element_size(winfo.tensor);
+            const size_t block_bytes = ggml_type_size(winfo.tensor->type);
+            GGML_ASSERT(winfo.size % block_bytes == 0);
+            const int64_t n = (winfo.size / block_bytes) * ggml_blck_size(winfo.tensor->type);
 
             auto & mbuf = mbufs_new[buft];
 
@@ -4591,6 +3786,14 @@ public:
 
             for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
                 ggml_backend_tensor_copy(mbuf_cur.org[i], mbuf_cur.cpy[i]);
+            }
+            if (has_retained_tensor_storage()) {
+                // Only copied checkpoint tensors survive temporary export storage.
+                for (auto * view : mbuf_cur.org) {
+                    view->view_src = nullptr;
+                    view->data = nullptr;
+                    view->buffer = nullptr;
+                }
             }
         }
     }
@@ -4660,7 +3863,9 @@ public:
         for (const auto & rinfo : rinfos) {
             auto * buft = ggml_backend_buffer_get_type(rinfo.tensor->buffer);
 
-            const int64_t n = rinfo.size/ggml_element_size(rinfo.tensor);
+            const size_t block_bytes = ggml_type_size(rinfo.tensor->type);
+            GGML_ASSERT(rinfo.size % block_bytes == 0);
+            const int64_t n = (rinfo.size / block_bytes) * ggml_blck_size(rinfo.tensor->type);
 
             auto & mbuf = mbufs_new[buft];
 
@@ -4727,8 +3932,9 @@ public:
 
                 const size_t n_copy = std::min(src_size - src_off, dst_size - dst_off);
 
-                const size_t   el   = ggml_element_size(src_t);
-                const int64_t n_el = (int64_t) (n_copy / el);
+                const size_t el = ggml_type_size(src_t->type);
+                GGML_ASSERT(src_t->type == dst_t->type && n_copy % el == 0);
+                const int64_t n_el = (n_copy / el) * ggml_blck_size(src_t->type);
 
                 auto * src_v = ggml_view_1d(ctx_scratch, src_t, n_el, src_off);
                 ggml_backend_view_init(src_v);
@@ -5136,6 +4342,18 @@ void llama_context::perf_reset() {
     // note: the reallocation counters are not reset - they track the lifetime totals for this context
 }
 
+std::map<ggml_backend_buffer_type_t, size_t> llama_context::pipeline_auxiliary_memory_breakdown() const {
+    auto result = cvec->memory_breakdown();
+    if (pf_generation && pf_generation->scheduler) {
+        for (auto backend : backend_ptrs) {
+            auto scheduler = pf_generation->scheduler.get();
+            result[ggml_backend_sched_get_buffer_type(scheduler, backend)] +=
+                    ggml_backend_sched_get_buffer_size(scheduler, backend);
+        }
+    }
+    return result;
+}
+
 llama_memory_breakdown llama_context::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> ret;
     for (const auto & [buft, size] : model.memory_breakdown()) {
@@ -5162,15 +4380,6 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ggml_backend_t             backend = backend_ptr.get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
             ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend);
-        }
-        for (const auto & lane : pipe_subbatches) {
-            for (const auto & slot : lane) {
-                if (!slot.scheduler) { continue; }
-                for (auto * backend : backend_ptrs) {
-                    auto * buft = ggml_backend_sched_get_buffer_type(slot.scheduler.get(), backend);
-                    ret[buft].compute += ggml_backend_sched_get_buffer_size(slot.scheduler.get(), backend);
-                }
-            }
         }
     }
     return ret;
@@ -5677,33 +4886,22 @@ void llama_set_input_snapshots(llama_context * ctx, bool enable) {
     ctx->set_input_snapshots(enable);
 }
 
-void llama_decode_nextn_required(llama_context * ctx, bool required) {
-    const char * setting = std::getenv("LLAMA_PIPE_SKIP_UNUSED_NEXTN");
-    const bool skip = !setting || std::atoi(setting) != 0;
-    llama_nextn_pending = {ctx, required || !skip};
+uint32_t llama_context::pipeline_verify_ubatch() const {
+    const uint32_t lanes = n_pipe_scheds > 1 ? n_pipe_scheds - 1 : std::max(pipeline_stages() + 2, 1);
+    return llama_pipeline_verify_ubatch_limit(cparams, lanes);
 }
 
-llama_nextn_copy_stats llama_get_nextn_copy_stats(const llama_context * ctx) {
-    std::lock_guard<std::mutex> lock(llama_pf_generation_mutex);
-    const auto it = llama_nextn_copies.find(ctx);
-    return it == llama_nextn_copies.end() ? llama_nextn_copy_stats{} : it->second;
+uint32_t llama_pipeline_verify_ubatch(const llama_context * ctx) {
+    return ctx->pipeline_verify_ubatch();
 }
 
-ggml_backend_input_snapshot_stats llama_get_generation_input_snapshot_stats(const llama_context * ctx) {
-    return ctx->get_generation_input_snapshot_stats();
+llama_ubatch_stats llama_context::get_ubatch_stats() const {
+    return { stat_decodes.load(std::memory_order_relaxed), stat_ubatches.load(std::memory_order_relaxed),
+             stat_tokens.load(std::memory_order_relaxed), stat_seqs.load(std::memory_order_relaxed) };
 }
 
-llama_pipeline_subbatch_stats llama_get_pipeline_subbatch_stats(const llama_context * ctx) {
-    return ctx->get_pipeline_subbatch_stats();
-}
-
-uint64_t llama_prefill_generation_split_count(const llama_context * ctx) {
-    const auto * helper = llama_pf_generation_find(ctx);
-    return helper ? helper->calls : 0;
-}
-
-ggml_backend_input_snapshot_stats llama_get_prefill_input_snapshot_stats(const llama_context * ctx) {
-    return ctx->get_prefill_input_snapshot_stats();
+llama_ubatch_stats llama_get_ubatch_stats(const llama_context * ctx) {
+    return ctx ? ctx->get_ubatch_stats() : llama_ubatch_stats{};
 }
 
 ggml_backend_input_snapshot_stats llama_get_input_snapshot_stats(const llama_context * ctx) {
@@ -5714,8 +4912,19 @@ void llama_set_decode_pipeline_lanes(llama_context * ctx, uint32_t lanes) {
     ctx->set_decode_pipeline_lanes(lanes);
 }
 
-void llama_set_decode_pipelined(llama_context * ctx, bool enable) {
-    ctx->set_decode_pipelined(enable);
+bool llama_set_decode_pipeline_peer(llama_context * ctx, const llama_context * peer) {
+    return ctx && ctx->set_pipeline_peer(peer);
+}
+
+bool llama_set_decode_pipelined(llama_context * ctx, bool enable) {
+    if (!ctx) { return false; }
+    try {
+        ctx->set_decode_pipelined(enable);
+        return true;
+    } catch (const std::exception & error) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, error.what());
+        return false;
+    }
 }
 
 void llama_set_decode_pipelane(llama_context * ctx, int32_t lane) {
@@ -5726,24 +4935,8 @@ uint64_t llama_decode_ticket_last(const llama_context * ctx) {
     return ctx->decode_ticket_last();
 }
 
-int32_t llama_decode_ticket_wait(llama_context * ctx, uint64_t ticket) {
-    return ctx->decode_ticket_wait(ticket);
-}
-
 bool llama_decode_ticket_ready(const llama_context * ctx, uint64_t ticket) {
     return ctx->decode_ticket_ready(ticket);
-}
-
-float * llama_decode_ticket_logits_ith(llama_context * ctx, uint64_t ticket, int32_t i) {
-    return ctx->decode_ticket_logits_ith(ticket, i);
-}
-
-int32_t llama_prefill_inflight(llama_context * ctx) {
-    return ctx->prefill_inflight();
-}
-
-int32_t llama_pf_ring_active(llama_context * ctx) {
-    return ctx->pf_ring_active();
 }
 
 float * llama_get_logits(llama_context * ctx) {
@@ -5902,9 +5095,13 @@ int32_t llama_set_adapters_lora(
         GGML_ASSERT(n_adapters == 0 && "invalid llama_set_adapters_lora call");
     }
 
-    ctx->set_adapters_lora(adapters, n_adapters, scales);
-
-    return 0;
+    try {
+        ctx->set_adapters_lora(adapters, n_adapters, scales);
+        return 0;
+    } catch (const std::exception & error) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, error.what());
+        return -1;
+    }
 }
 
 int32_t llama_set_adapter_cvec(
@@ -5933,10 +5130,6 @@ void llama_memory_clear(llama_memory_t mem, bool data) {
 
 bool llama_memory_trim(llama_memory_t mem) {
     return mem == nullptr || mem->trim();
-}
-
-bool llama_memory_release_physical(llama_memory_t mem) {
-    return mem == nullptr || mem->release_physical();
 }
 
 bool llama_memory_seq_rm(
@@ -6022,6 +5215,14 @@ llama_pos llama_memory_seq_pos_max(
 
 uint64_t llama_memory_seq_n_cells(llama_memory_t mem, llama_seq_id seq_id) {
     return mem ? mem->seq_n_cells(seq_id) : 0;
+}
+
+int32_t llama_memory_seq_swap_stream(llama_memory_t mem, llama_seq_id seq_id_a, llama_seq_id seq_id_b) {
+    return mem ? mem->seq_swap_stream(seq_id_a, seq_id_b) : 0;
+}
+
+int32_t llama_memory_seq_stream(llama_memory_t mem, llama_seq_id seq_id) {
+    return mem ? mem->seq_stream(seq_id) : -1;
 }
 
 bool llama_memory_can_shift(llama_memory_t mem) {
@@ -6291,9 +5492,8 @@ bool llama_decode_ticket_is_selected(const llama_context * ctx) {
     return ctx->decode_ticket_selected();
 }
 
-
 //
-// V41: drain-free per-sequence checkpoint capture (opt-in by the caller)
+// drain-free per-sequence checkpoint capture (opt-in by the caller)
 //
 
 LLAMA_API int32_t llama_state_seq_prepare_capture(llama_context * ctx, llama_seq_id seq_id);
@@ -6349,7 +5549,7 @@ LLAMA_API void llama_state_seq_capture_record_verify(const llama_context * ctx, 
 }
 
 //
-// V50: stream-ordered asynchronous checkpoint capture (opt-in by the caller)
+// stream-ordered asynchronous checkpoint capture (opt-in by the caller)
 //
 
 LLAMA_API int64_t llama_state_seq_get_data_async(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags);
@@ -6382,6 +5582,12 @@ int64_t llama_context::state_seq_get_data_async(llama_seq_id seq_id, uint8_t * d
     bool async_ok = decode_pipelined && prefill_sched && !prefill_backend_ptrs.empty() && !ck.soft && !ck.hard &&
         n_decode_tickets > 0 && ck.id.size() == (size_t) n_decode_tickets && ck.pfset.size() == ck.id.size() &&
         !(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+    // Replayed export tensors require the source sequence to be complete.
+    const auto * recurrent = dynamic_cast<const llama_memory_recurrent *>(memory.get());
+    if (const auto * hybrid = dynamic_cast<const llama_memory_hybrid *>(memory.get())) {
+        recurrent = hybrid->get_mem_recr();
+    }
+    if (recurrent && recurrent->compact_s) { async_ok = false; }
     bool pending = false;
     for (int32_t i = 0; async_ok && i < n_decode_tickets; ++i) {
         const auto & tk = tickets[i];

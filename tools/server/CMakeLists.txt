@@ -15,7 +15,7 @@ add_library(${TARGET} STATIC
     server-common.h
     server-decision.cpp
     server-decision.h
-    server-context.cpp
+    paraflow-private/server-runtime.cpp
     server-context.h
     server-stream.cpp
     server-stream.h
@@ -27,6 +27,9 @@ add_library(${TARGET} STATIC
     server-schema.h
 )
 
+# The PIMPL runtime and request/lane policies remain private in the server DSO.
+set_target_properties(${TARGET} PROPERTIES CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON)
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
@@ -34,29 +37,6 @@ endif()
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
-
-# Optional, process-local concurrent CUDA activity timing. The default build has
-# no CUPTI/driver dependency and retains the same server/CLI interface.
-option(LLAMA_SERVER_CUPTI_ACTIVITY "Collect process-local CUDA kernel/copy timing" OFF)
-if (LLAMA_SERVER_CUPTI_ACTIVITY)
-    find_package(CUDAToolkit REQUIRED)
-    if (CUDAToolkit_VERSION VERSION_LESS 12.6 OR NOT CUDAToolkit_VERSION VERSION_LESS 13.0)
-        message(FATAL_ERROR "CUPTI activity record ABI is currently verified for CUDA 12.6-12.x")
-    endif()
-    find_path(LLAMA_CUPTI_INCLUDE_DIR cupti.h
-        HINTS "${CUDAToolkit_LIBRARY_ROOT}/extras/CUPTI/include"
-              "${CUDAToolkit_ROOT}/extras/CUPTI/include"
-              "/usr/local/cuda/extras/CUPTI/include")
-    if (NOT LLAMA_CUPTI_INCLUDE_DIR)
-        message(FATAL_ERROR "LLAMA_SERVER_CUPTI_ACTIVITY requires CUDA CUPTI headers")
-    endif()
-    target_sources(${TARGET} PRIVATE gpu-activity.cpp gpu-activity.h activity-intervals.h)
-    target_include_directories(${TARGET} PRIVATE ${LLAMA_CUPTI_INCLUDE_DIR} ${CUDAToolkit_INCLUDE_DIRS})
-    target_link_libraries(${TARGET} PRIVATE ${CMAKE_DL_LIBS})
-else()
-    target_sources(${TARGET} PRIVATE gpu-activity-stub.cpp gpu-activity.h)
-endif()
-
 
 # llama-server-impl: server logic, reusable by app
 
@@ -90,3 +70,9 @@ install(TARGETS ${TARGET} RUNTIME)
 
 target_link_libraries(${TARGET} PRIVATE llama-server-impl)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+# Keep implementation RTTI/template instantiations out of the dynamic ABI.
+if (UNIX AND NOT APPLE AND BUILD_SHARED_LIBS)
+    target_link_options(llama-server-impl PRIVATE "-Wl,--version-script=${PROJECT_SOURCE_DIR}/cmake/paraflow-private-exports.map")
+    set_property(TARGET llama-server-impl APPEND PROPERTY LINK_DEPENDS "${PROJECT_SOURCE_DIR}/cmake/paraflow-private-exports.map")
+endif()

@@ -13,10 +13,18 @@
 #include "ggml-opt.h"
 
 #include <array>
+#include <atomic>
 #include <map>
+#include <mutex>
 #include <vector>
 
 struct llama_model;
+struct llama_pipeline_model_state;
+struct llama_context;
+struct llama_pipeline_context_state {
+    std::mutex mutex;
+    const llama_context * context = nullptr;
+};
 class llama_batch_allocr;
 class llama_moe_cache;
 
@@ -42,6 +50,9 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
+struct llama_pf_generation;      // defined in llama-context.cpp
+struct llama_ckpt_capture_state;
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -59,8 +70,6 @@ struct llama_context {
     void sched_reserve();
 
     void synchronize();
-
-    llama_pipeline_subbatch_stats get_pipeline_subbatch_stats() const;
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
@@ -147,6 +156,11 @@ struct llama_context {
             llama_memory_context_i * mctx,
                        ggml_status & ret);
 
+    llama_ubatch_stats get_ubatch_stats() const;
+
+    // checkpoint capture bookkeeping, shared by the capture API and its stats getters
+    llama_ckpt_capture_state & ckpt() const { return *ckpt_state; }
+
     int encode(const llama_batch_ext & batch_inp);
     int decode(const llama_batch_ext & batch_inp);
 
@@ -160,12 +174,13 @@ struct llama_context {
 
     bool     decode_pipelined_supported() const;
     int32_t  pipeline_stages() const;
+    uint32_t pipeline_verify_ubatch() const;
     void     set_input_snapshots(bool enable);
     ggml_backend_input_snapshot_stats get_input_snapshot_stats() const;
-    ggml_backend_input_snapshot_stats get_generation_input_snapshot_stats() const;
-    ggml_backend_input_snapshot_stats get_prefill_input_snapshot_stats() const;
+    bool     set_pipeline_peer(const llama_context * peer);
     void     set_decode_pipeline_lanes(uint32_t lanes);
     void     set_decode_pipelined(bool enable);
+    std::map<ggml_backend_buffer_type_t, size_t> pipeline_auxiliary_memory_breakdown() const;
     void     set_decode_pipelane(int32_t lane);
     uint64_t decode_ticket_last() const;
     int32_t  decode_ticket_wait(uint64_t ticket);
@@ -176,8 +191,6 @@ struct llama_context {
     bool     decode_ticket_release(uint64_t ticket);
     int32_t  decode_ticket_retained_count() const;
     bool     decode_ticket_selected() const { return selected_ticket != 0; }
-    int32_t  prefill_inflight();
-    int32_t  pf_ring_active() const { return pf_ring_n; }
 
     //
     // state save/load
@@ -190,7 +203,7 @@ struct llama_context {
     size_t state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags);
 
     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
-    // V41: wait only for unfinished pipelined work that may touch seq_id (else full sync); 1 = full sync used
+    // wait only for unfinished pipelined work that may touch seq_id (else full sync); 1 = full sync used
     int32_t state_seq_prepare_capture(llama_seq_id seq_id);
     int64_t state_seq_get_data_async(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags);
     int32_t state_seq_async_wait(int64_t handle, bool block);
@@ -451,6 +464,15 @@ private:
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 
+    // MTP context: separate allocator for the logits-producing draft graph (null when unused)
+    std::unique_ptr<llama_pf_generation> pf_generation;
+
+    // checkpoint capture state (always allocated)
+    std::unique_ptr<llama_ckpt_capture_state> ckpt_state;
+
+    // decode split statistics (read by other threads, see llama_get_ubatch_stats)
+    std::atomic<uint64_t> stat_decodes{0}, stat_ubatches{0}, stat_tokens{0}, stat_seqs{0};
+
     //
     // pipelined decode (decode tickets)
     //
@@ -494,6 +516,12 @@ private:
     std::vector<decode_ticket> tickets;
     uint64_t      selected_ticket  = 0;
     uint64_t      ticket_seq       = 0;     // id of the most recently issued ticket
+    // Keep shared model configuration alive and stable while pipelines use it.
+    std::shared_ptr<llama_pipeline_context_state> pipeline_lifetime = std::make_shared<llama_pipeline_context_state>();
+    std::weak_ptr<llama_pipeline_context_state> pipeline_peer_lifetime;
+    bool pipeline_has_peer = false;
+    std::vector<std::shared_ptr<llama_pipeline_model_state>> pipeline_frozen_models;
+    bool pipeline_configuration_frozen = false;
     bool          decode_pipelined = false;
 
     // pipelined decode: ring of private (sched, graph result) pairs, one per ticket
@@ -541,26 +569,11 @@ private:
     pf_fence pf_fences[n_pf_fences];
     int      pf_fence_next = 0;
 
-    // optional ring of independent prompt-sized scheds for prefill chunks
-    // (LLAMA_PIPE_PF_RING=N, default 0 = single prefill_sched). each ring slot owns
-    // its own private background backends (own CUDA streams); consecutive chunks
-    // routed round-robin land on different streams and overlap across the pipeline
-    // stages instead of serializing through one sched's input-copy rotation. when
-    // enabled it replaces prefill_sched for routing (prefill_sched stays allocated
-    // for fallback / structural detection). prompt chunks always rebuild their graph.
-    static constexpr int n_pf_ring_max = 4;
-    std::vector<ggml_backend_ptr> pf_ring_backends[n_pf_ring_max];
-    std::vector<ggml_backend_t>   pf_ring_backend_ptrs[n_pf_ring_max];
-    ggml_backend_sched_ptr        pf_ring_scheds[n_pf_ring_max];
-    llm_graph_result_ptr          pf_ring_gf_res[n_pf_ring_max];
-    int pf_ring_n    = 0;   // active ring size (0 = disabled, use prefill_sched)
-    int pf_ring_next = 0;   // round-robin cursor
-
     // overrides for the current decode (null = use the main sched / gf_res_prev)
     ggml_backend_sched_t sched_cur  = nullptr;
     llm_graph_result *   gf_res_cur = nullptr;
 
-    // current decode runs on a prefill sched (single prefill_sched or a ring slot):
+    // current decode runs on the prefill sched:
     // graphs rebuild (parallel input-copy rotation), norm pinning + the prefill fence
     // use the actual backend set (private where available, shared otherwise). set
     // during routing, cleared per decode.
@@ -599,18 +612,4 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
-
-    // An ordinal belongs to exactly one physical ubatch within a lane's ticket.
-    // Separate arenas avoid overwriting any earlier ubatch still on the devices.
-    struct pipeline_subbatch_slot {
-        ggml_backend_sched_ptr scheduler;
-        llm_graph_result_ptr result;
-        bool attempted = false;
-        uint32_t reserved_tokens = 0;
-        uint32_t reserved_seqs = 0;
-    };
-    std::vector<std::vector<pipeline_subbatch_slot>> pipe_subbatches;
-    llama_pipeline_subbatch_stats pipe_subbatch_stats;
-    int pipe_subbatch_graph_kind = 0; // 0: unrelated, 1: primary, 2: auxiliary
-    pipeline_subbatch_slot * ensure_pipeline_subbatch(int lane, uint32_t ordinal, uint32_t tokens, uint32_t seqs);
 };

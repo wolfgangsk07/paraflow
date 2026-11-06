@@ -10,7 +10,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cstdlib>
 #include <iterator>
 #include <cctype>
 #include <climits>
@@ -20,22 +19,11 @@
 #include <unordered_map>
 #include <vector>
 
-#if defined(__GLIBCXX__) && defined(__x86_64__)
-#include <immintrin.h>
-#endif
-
-
 // Direct top-k still runs the original sampler chain and consumes its RNG.
 // It is eligible only when every stage preceding the first top-k is a no-op.
-// AIPET_DIRECT_TOPK_BEGIN
-static const bool common_direct_topk_enabled = [] {
-    const char * value = std::getenv("LLAMA_SAMPLER_DIRECT_TOPK");
-    return !value || std::atoi(value) != 0;
-}();
 static std::atomic<uint64_t> direct_topk_calls{0}, direct_topk_nan_fallbacks{0};
 static std::atomic<uint64_t> direct_topk_input{0}, direct_topk_kept{0}, direct_topk_us{0};
 
-// AIPET_VECTOR_TOPK_BEGIN
 struct common_logit_iterator {
     using iterator_category = std::input_iterator_tag;
     using value_type = llama_token_data;
@@ -55,94 +43,6 @@ struct common_logit_iterator {
     bool operator==(const common_logit_iterator & other) const { return index == other.index; }
     bool operator!=(const common_logit_iterator & other) const { return !(*this == other); }
 };
-
-// libstdc++ partial_sort_copy first fills its output, makes a min-heap, then
-// considers the remaining input in order. Skip only values that cannot replace
-// that heap's minimum. Keep the original heap/sort operations and tie ordering.
-// Other standard libraries/architectures retain the accepted scalar iterator.
-static const int32_t common_vector_topk_width = [] {
-#if defined(__GLIBCXX__) && defined(__x86_64__)
-    const char * value = std::getenv("LLAMA_SAMPLER_VECTOR_TOPK");
-    const int mode = value ? std::atoi(value) : 1;
-    if (mode == 0) { return 0; }
-    if (mode == 4) { return 4; }
-    return __builtin_cpu_supports("avx2") ? 8 : 4;
-#else
-    return 0;
-#endif
-}();
-static std::atomic<uint64_t> vector_topk_calls{0};
-
-#if defined(__GLIBCXX__) && defined(__x86_64__)
-static int32_t common_next_topk_sse(const float * values, int32_t index, int32_t size, float threshold, bool * has_nan) {
-    const __m128 limit = _mm_set1_ps(threshold);
-    while (index <= size - 4) {
-        const __m128 v = _mm_loadu_ps(values + index);
-        const unsigned unordered = _mm_movemask_ps(_mm_cmpunord_ps(v, v));
-        if (unordered) { *has_nan = true; }
-        const unsigned mask = _mm_movemask_ps(_mm_cmpgt_ps(v, limit)) | unordered;
-        if (mask) { return index + __builtin_ctz(mask); }
-        index += 4;
-    }
-    while (index < size) {
-        if (std::isnan(values[index])) { *has_nan = true; return index; }
-        if (values[index] > threshold) { return index; }
-        ++index;
-    }
-    return size;
-}
-
-__attribute__((target("avx2")))
-static int32_t common_next_topk_avx(const float * values, int32_t index, int32_t size, float threshold, bool * has_nan) {
-    const __m256 limit = _mm256_set1_ps(threshold);
-    while (index <= size - 8) {
-        const __m256 v = _mm256_loadu_ps(values + index);
-        const unsigned unordered = _mm256_movemask_ps(_mm256_cmp_ps(v, v, _CMP_UNORD_Q));
-        if (unordered) { *has_nan = true; }
-        const unsigned mask = _mm256_movemask_ps(_mm256_cmp_ps(v, limit, _CMP_GT_OQ)) | unordered;
-        if (mask) { return index + __builtin_ctz(mask); }
-        index += 8;
-    }
-    return common_next_topk_sse(values, index, size, threshold, has_nan);
-}
-#endif
-
-struct common_vector_logit_iterator {
-    using iterator_category = std::input_iterator_tag;
-    using value_type = llama_token_data;
-    using difference_type = std::ptrdiff_t;
-    using pointer = void;
-    using reference = value_type;
-    const float * logits;
-    int32_t index;
-    bool * has_nan;
-    const llama_token_data * heap;
-    int32_t size, heap_size;
-    value_type operator*() const {
-        const float value = logits[index];
-        if (std::isnan(value)) { *has_nan = true; }
-        return { index, value, 0.0f };
-    }
-    common_vector_logit_iterator & operator++() {
-        const int32_t previous = index++;
-#if defined(__GLIBCXX__) && defined(__x86_64__)
-        // Incrementing out of the initial heap fill must not inspect its root:
-        // partial_sort_copy has not made that heap yet.
-        if (previous >= heap_size && index < size) {
-            index = common_vector_topk_width == 8 ?
-                common_next_topk_avx(logits, index, size, heap[0].logit, has_nan) :
-                common_next_topk_sse(logits, index, size, heap[0].logit, has_nan);
-        }
-#else
-        (void) previous;
-#endif
-        return *this;
-    }
-    common_vector_logit_iterator operator++(int) { auto old = *this; ++*this; return old; }
-    bool operator==(const common_vector_logit_iterator & other) const { return index == other.index; }
-    bool operator!=(const common_vector_logit_iterator & other) const { return !(*this == other); }
-};
-// AIPET_VECTOR_TOPK_END
 
 static int32_t common_direct_topk_limit(const common_params_sampling & params, const llama_model * model) {
     if (params.mirostat != 0 || params.n_probs != 0 || !params.logit_bias.empty() ||
@@ -167,13 +67,11 @@ static int32_t common_direct_topk_limit(const common_params_sampling & params, c
     }
     return 0;
 }
-// AIPET_DIRECT_TOPK_END
 
 common_sampler_direct_topk_stats common_sampler_get_direct_topk_stats() {
-    return { common_direct_topk_enabled, direct_topk_calls.load(std::memory_order_relaxed),
+    return { direct_topk_calls.load(std::memory_order_relaxed),
         direct_topk_nan_fallbacks.load(std::memory_order_relaxed), direct_topk_input.load(std::memory_order_relaxed),
-        direct_topk_kept.load(std::memory_order_relaxed), direct_topk_us.load(std::memory_order_relaxed),
-        common_vector_topk_width, vector_topk_calls.load(std::memory_order_relaxed) };
+        direct_topk_kept.load(std::memory_order_relaxed), direct_topk_us.load(std::memory_order_relaxed) };
 }
 
 // the ring buffer works similarly to std::deque, but with a fixed capacity
@@ -294,26 +192,20 @@ struct common_sampler {
     }
 
     bool set_logits_direct(int32_t n_vocab, const float * logits) {
-        if (!common_direct_topk_enabled || direct_top_k <= 0 || n_vocab <= 0) { return false; }
+        if (direct_top_k <= 0 || n_vocab <= 0) { return false; }
         const int64_t begin = ggml_time_us();
         const int32_t count = std::min(n_vocab, direct_top_k);
         cur.resize(count);
         bool has_nan = false;
         const auto compare = [](const llama_token_data & a, const llama_token_data & b) { return a.logit > b.logit; };
-        if (common_vector_topk_width) {
-            std::partial_sort_copy(common_vector_logit_iterator{logits, 0, &has_nan, cur.data(), n_vocab, count},
-                common_vector_logit_iterator{logits, n_vocab, &has_nan, cur.data(), n_vocab, count}, cur.begin(), cur.end(), compare);
-        } else {
-            std::partial_sort_copy(common_logit_iterator{logits, 0, &has_nan},
-                common_logit_iterator{logits, n_vocab, &has_nan}, cur.begin(), cur.end(), compare);
-        }
+        std::partial_sort_copy(common_logit_iterator{logits, 0, &has_nan},
+            common_logit_iterator{logits, n_vocab, &has_nan}, cur.begin(), cur.end(), compare);
         if (has_nan) {
             direct_topk_nan_fallbacks.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
         cur_p = { cur.data(), cur.size(), -1, true };
         direct_topk_calls.fetch_add(1, std::memory_order_relaxed);
-        if (common_vector_topk_width) { vector_topk_calls.fetch_add(1, std::memory_order_relaxed); }
         direct_topk_input.fetch_add(n_vocab, std::memory_order_relaxed);
         direct_topk_kept.fetch_add(count, std::memory_order_relaxed);
         direct_topk_us.fetch_add(ggml_time_us() - begin, std::memory_order_relaxed);
@@ -893,65 +785,6 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     if (grammar_should_apply(gsmpl)) {
         llama_sampler_apply(grmr,  &cur_p);
-    }
-
-    llama_sampler_apply(chain, &cur_p);
-
-    id = common_sampler_selected_token(cur_p);
-
-    return id;
-}
-
-llama_token common_sampler_sample_from(struct common_sampler * gsmpl, int32_t n_vocab, const float * logits, bool grammar_first) {
-    GGML_ASSERT(logits != nullptr);
-
-    const auto tm = gsmpl->tm();
-
-    llama_token id = LLAMA_TOKEN_NULL;
-
-    auto & grmr    = gsmpl->grmr;
-    auto & rbudget = gsmpl->rbudget;
-    auto & chain   = gsmpl->chain;
-    auto & cur_p   = gsmpl->cur_p; // initialized by set_logits_from
-
-    gsmpl->set_logits_from(n_vocab, logits);
-
-    // apply reasoning budget first
-    llama_sampler_apply(rbudget, &cur_p);
-
-    if (grammar_first && grammar_should_apply(gsmpl)) {
-        llama_sampler_apply(grmr, &cur_p);
-    }
-
-    llama_sampler_apply(chain, &cur_p);
-
-    id = common_sampler_selected_token(cur_p);
-
-    if (grammar_first || !grammar_should_apply(gsmpl)) {
-        return id;
-    }
-
-    // check if it the sampled token fits the grammar (grammar-based rejection sampling)
-    {
-        llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
-        llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
-
-        llama_sampler_apply(grmr, &single_token_data_array);
-
-        const bool is_valid = single_token_data_array.data[0].logit != -INFINITY;
-        if (is_valid) {
-            return id;
-        }
-    }
-
-    // resampling:
-    // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
-    gsmpl->set_logits_from(n_vocab, logits);
-
-    llama_sampler_apply(rbudget, &cur_p);
-
-    if (grammar_should_apply(gsmpl)) {
-        llama_sampler_apply(grmr, &cur_p);
     }
 
     llama_sampler_apply(chain, &cur_p);

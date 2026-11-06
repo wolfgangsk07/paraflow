@@ -462,7 +462,7 @@ struct hash_node {
     int buffer_id;
     struct buffer_address addr;
     bool allocated;
-    size_t size_floor; // V56: monotone planned size (0 = none)
+    size_t size_floor; // monotone planned size (0 = none)
 };
 
 struct tensor_alloc {
@@ -495,17 +495,11 @@ struct ggml_gallocr {
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
 
-    // V56 (GGML_GALLOC_MONOTONE): floors applied during the current plan
+    // planned sizes never shrink: floors applied during the current plan
     struct ggml_tensor ** floor_tensors;
     size_t * floor_sizes;
     int n_floor, cap_floor;
 };
-
-static bool ggml_gallocr_monotone(void) {
-    static int v = -1;
-    if (v < 0) { const char * e = getenv("GGML_GALLOC_MONOTONE"); v = e && atoi(e) != 0; }
-    return v != 0;
-}
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
     ggml_gallocr_t galloc = (ggml_gallocr_t)calloc(1, sizeof(struct ggml_gallocr));
@@ -678,7 +672,7 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                     const ggml_backend_buffer_type_t pb = galloc->bufts[p_hn->buffer_id];
                     struct ggml_tensor * owner = ggml_impl_is_view(parent) ? parent->view_src : parent;
                     if (ggml_gallocr_planned_size(galloc, pb, owner) < ggml_gallocr_planned_size(galloc, galloc->bufts[buffer_id], node)) {
-                        continue; // V56: floored node would not fit the parent's planned block
+                        continue; // floored node would not fit the parent's planned block
                     }
                 }
                 if (p_hn->n_children == 1 && p_hn->n_views == 0) {
@@ -876,7 +870,10 @@ static bool ggml_gallocr_reserve_n_impl(
     }
 
     galloc->n_floor = 0;
-    if (ggml_gallocr_monotone() && galloc->node_allocs && galloc->n_nodes == graph->n_nodes && galloc->n_leafs == graph->n_leafs) {
+    // Keep every node's planned size at least as large as in earlier plans of this allocator.
+    // Graphs that alternate between shapes (pipelined decode lanes, prompt vs generation cars)
+    // otherwise shrink and regrow the buffers on every switch, each time with a full sync.
+    if (galloc->node_allocs && galloc->n_nodes == graph->n_nodes && galloc->n_leafs == graph->n_leafs) {
         const int need = graph->n_nodes * (1 + GGML_MAX_SRC) + graph->n_leafs;
         if (galloc->cap_floor < need) {
             free(galloc->floor_tensors); free(galloc->floor_sizes);

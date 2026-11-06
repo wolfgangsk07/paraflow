@@ -263,25 +263,6 @@ public:
         return false;
     }
 
-    // Remove this sequence from [p0, p1), using its existing position index.
-    // Return the smallest cell that became empty, or size() if none did.
-    uint32_t seq_rm_range(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-        assert(seq_id >= 0 && seq_id < LLAMA_MAX_SEQ);
-
-        const auto & positions = seq_pos[seq_id];
-        auto it = positions.lower_bound({p0, 0});
-        uint32_t first_empty = size();
-        while (it != positions.end() && it->first < p1) {
-            const uint32_t i = it->second;
-            // seq_rm erases only this entry; advance before invalidating it.
-            ++it;
-            if (seq_rm(i, seq_id) && i < first_empty) {
-                first_empty = i;
-            }
-        }
-        return first_empty;
-    }
-
     // return true if the cell becomes empty (i.e. it did not contain seq_id before the call)
     bool seq_keep(uint32_t i, llama_seq_id seq_id) {
         assert(i < pos.size());

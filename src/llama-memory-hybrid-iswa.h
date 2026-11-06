@@ -63,7 +63,6 @@ public:
     void clear(bool data) override;
 
     bool trim() override;
-    bool release_physical() override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
@@ -75,6 +74,10 @@ public:
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
     uint64_t seq_n_cells(llama_seq_id seq_id) const override { return mem_attn->seq_n_cells(seq_id); }
+
+    // the recurrent states are indexed by sequence id and need no exchange
+    int32_t seq_swap_stream(llama_seq_id seq_id_a, llama_seq_id seq_id_b) override;
+    int32_t seq_stream(llama_seq_id seq_id) const override { return mem_attn->seq_stream(seq_id); }
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 

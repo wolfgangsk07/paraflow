@@ -9,10 +9,16 @@
 
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+struct llama_pipeline_model_state {
+    std::recursive_mutex mutex;
+    size_t users = 0;
+};
 
 struct llama_cparams;
 struct llama_ubatch;
@@ -846,6 +852,7 @@ struct llama_model {
 
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
+    std::shared_ptr<llama_pipeline_model_state> pipeline_configuration = std::make_shared<llama_pipeline_model_state>();
 
     // which tensors can be prefetched - driven by TENSOR_READ_LAZY
     std::unordered_set<const ggml_tensor *> can_prefetch;
@@ -887,12 +894,6 @@ struct llama_model {
     ggml_backend_buffer_type_t select_buft(int il) const;
 
     bool has_tensor_overrides() const;
-
-    bool residency_status(llama_model_residency_info & status) const;
-    bool residency_device_status(int32_t device, llama_model_residency_info & status) const;
-    int64_t residency_to_cpu(int32_t device, uint64_t bytes);
-    int64_t residency_to_device(int32_t device, uint64_t bytes);
-    bool residency_to_devices();
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 

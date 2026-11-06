@@ -4,8 +4,6 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
-#include <cstdlib>
-
 //
 // llama_memory_hybrid_iswa
 //
@@ -67,7 +65,21 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         filter_recr == nullptr ?
             [&](int32_t il) { return hparams.is_recr(il); }
             : filter_recr
-    )) {}
+    )) {
+    if (mem_attn->get_base()->get_n_stream() > 1) {
+        mem_recr->set_cell_hint(&mem_attn->get_base()->get_seq_to_stream());
+    }
+}
+
+int32_t llama_memory_hybrid_iswa::seq_swap_stream(llama_seq_id seq_id_a, llama_seq_id seq_id_b) {
+    const int32_t res = mem_attn->seq_swap_stream(seq_id_a, seq_id_b);
+    if (res == 1 && seq_id_a != seq_id_b) {
+        // keep each recurrent state in the cell of its stream (see llama_memory_recurrent::set_cell_hint)
+        mem_recr->seq_move_cell(seq_id_a, (uint32_t) mem_attn->seq_stream(seq_id_a), seq_id_b);
+        mem_recr->seq_move_cell(seq_id_b, (uint32_t) mem_attn->seq_stream(seq_id_b), seq_id_a);
+    }
+    return res;
+}
 
 llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     do {
@@ -79,11 +91,8 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
         while (true) {
             llama_ubatch ubatch;
 
-            const char * canonical_env = std::getenv("LLAMA_PIPE_CANONICAL_PREFILL");
-            const bool canonical_prefill = (canonical_env ? std::atoi(canonical_env) != 0 : pipeline_parallel) &&
-                    balloc.get_n_outputs() < balloc.get_n_tokens();
-            if (embd_all || canonical_prefill) {
-                // Keep prompt chunk boundaries independent of batch peers.
+            if (embd_all) {
+                // if all tokens are output, split by sequence
                 ubatch = balloc.split_seq(n_ubatch);
             } else {
                 // Use non-sequential split when KV cache is unified (needed for hellaswag/winogrande/multiple-choice)
@@ -94,7 +103,8 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
                 //   so that the rollback snapshots remain valid
                 const uint32_t n_rs_seq = mem_recr->n_rs_seq;
 
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0,
+                        unified ? nullptr : &mem_attn->get_base()->get_seq_to_stream());
             }
 
             if (ubatch.n_tokens == 0) {
@@ -157,12 +167,6 @@ void llama_memory_hybrid_iswa::clear(bool data) {
 bool llama_memory_hybrid_iswa::trim() {
     const bool attn = mem_attn->trim();
     const bool recr = mem_recr->trim();
-    return attn && recr;
-}
-
-bool llama_memory_hybrid_iswa::release_physical() {
-    const bool attn = mem_attn->release_physical();
-    const bool recr = mem_recr->release_physical();
     return attn && recr;
 }
 

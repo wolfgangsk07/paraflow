@@ -52,6 +52,18 @@ public:
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
+    // states are indexed by sequence id, there are no per-sequence streams to exchange
+    int32_t seq_swap_stream(llama_seq_id seq_id_a, llama_seq_id seq_id_b) override { GGML_UNUSED(seq_id_a); GGML_UNUSED(seq_id_b); return 1; }
+
+    // Move the state of a sequence into cell `dst`, exchanging it with the occupant of `dst`, which must be empty or
+    // `may_displace`. The live rows are copied now (no device work may be pending on either cell). Returns false and
+    // changes nothing when the move is not possible.
+    bool seq_move_cell(llama_seq_id seq_id, uint32_t dst, llama_seq_id may_displace);
+
+    // seq -> preferred cell (the attention stream of a hybrid memory): a ubatch over adjacent streams then finds its
+    // cells in place instead of reordering cells of other lanes every step
+    void set_cell_hint(const std::vector<uint32_t> * hint) { cell_hint = hint; }
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
     bool prepare(const std::vector<llama_ubatch> & ubatches);
@@ -72,6 +84,8 @@ public:
 
     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
     uint32_t n_rs_seq = 0;
+    bool compact_s = false;
+    std::vector<ggml_tensor *> j_l;
 
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
@@ -84,8 +98,12 @@ public:
     // first zero-ed state
     int32_t rs_z = -1;
 
+    const std::vector<uint32_t> * cell_hint = nullptr;
+
     // TODO: optimize for recurrent state needs
     struct mem_cell {
+        uint32_t journal_length = 0;
+        uint32_t journal_input_length = 0;
         llama_pos pos  = -1;
         int32_t   src  = -1; // used to know where states should be copied from
         int32_t   src0 = -1; // like src, but only used when setting the inputs (allowing to copy once)
@@ -133,7 +151,7 @@ private:
     size_t size_p_bytes() const;
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
-    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
+    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, const std::vector<int32_t> & journal_lengths) const;
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
@@ -179,6 +197,10 @@ public:
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
     ggml_tensor * get_p_l(int32_t il) const;
+    ggml_tensor * get_j_l(int32_t il) const;
+    ggml_tensor * journal_for(const ggml_tensor * s) const;
+    bool compact_s_enabled() const;
+    uint32_t journal_input_length(int i) const;
 
     int32_t s_copy(int i) const;
 

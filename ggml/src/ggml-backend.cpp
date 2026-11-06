@@ -2036,32 +2036,22 @@ ggml_backend_sched_t ggml_backend_sched_new(
     return sched;
 }
 
-bool ggml_backend_sched_set_input_snapshots_ex(ggml_backend_sched_t sched, bool enable, bool allow_pipeline) {
+bool ggml_backend_sched_set_input_snapshots(ggml_backend_sched_t sched, bool enable) {
     GGML_ASSERT(sched);
     if (!enable) {
         delete sched->input_staging;
         sched->input_staging = nullptr;
         return true;
     }
-    const char * setting = getenv("GGML_SCHED_ASYNC_INPUTS");
-    if ((setting && atoi(setting) == 0) || (!allow_pipeline && sched->n_copies != 1)) return false;
+    if (sched->n_copies != 1) return false;
     int gpus = 0;
     for (int b = 0; b < sched->n_backends; ++b) {
         auto dev = ggml_backend_get_device(sched->backends[b]);
         gpus += dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU;
     }
-    if (gpus == 0 || (!allow_pipeline && gpus != 1)) return false;
+    if (gpus != 1) return false;
     if (!sched->input_staging) sched->input_staging = new ggml_backend_sched_input_staging(sched);
     return true;
-}
-
-bool ggml_backend_sched_set_input_snapshots(ggml_backend_sched_t sched, bool enable) {
-    return ggml_backend_sched_set_input_snapshots_ex(sched, enable, false);
-}
-
-void ggml_backend_sched_set_input_snapshots_active(ggml_backend_sched_t sched, bool active) {
-    GGML_ASSERT(sched);
-    if (sched->input_staging) sched->input_staging->active = active;
 }
 
 struct ggml_backend_input_snapshot_stats ggml_backend_sched_get_input_snapshot_stats(ggml_backend_sched_t sched) {

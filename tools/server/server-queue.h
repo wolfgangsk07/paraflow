@@ -14,7 +14,8 @@
 // in most cases, use server_response_reader to post new tasks and retrieve results
 struct server_queue {
 private:
-    int id = 0;
+    server_task_id id = 0;
+    bool update_requested = false;
     bool running  = false;
     bool sleeping = false;
     bool req_stop_sleeping = false;
@@ -50,7 +51,7 @@ public:
     ~server_queue() { worker_stop(); }
 
     // Add a new task to the end of the queue
-    int post(server_task && task, bool front = false);
+    server_task_id post(server_task && task, bool front = false);
 
     // multi-task version of post()
     int post(std::vector<server_task> && tasks, bool front = false);
@@ -59,17 +60,14 @@ public:
     void defer(server_task && task);
 
     // Get the next id for creating a new task
-    int get_new_id();
+    server_task_id get_new_id();
+
+    // Coalesce internal scheduler wakeups without allocating a request ID.
+    void request_update();
 
     // Call when the state of one slot is changed, it will move one task from deferred to main queue
     // prioritize tasks that use the specified slot (otherwise, pop the first deferred task)
     void pop_deferred_task(int id_slot, bool vip_only = false);
-
-    // Remove requests which still need the inference context but have not
-    // entered a slot yet. Runtime discard uses this to finish every waiting
-    // HTTP request before destroying the context instead of leaving it to
-    // resume during a later lease.
-    std::vector<server_task> take_pending_context_tasks();
 
     // if sleeping, request exiting sleep state and wait until it is done
     // returns immediately if not sleeping
@@ -150,7 +148,8 @@ public:
     }
 
 private:
-    void cleanup_pending_task(int id_target);
+    server_task_id get_new_id_locked();
+    void cleanup_pending_task(server_task_id id_target);
 
     // process all pending tasks in the queue
     // returns true if the queue is terminated, false if there is no more task to process
@@ -169,7 +168,7 @@ private:
     bool running = true;
 
     // for keeping track of all tasks waiting for the result
-    std::unordered_set<int> waiting_task_ids;
+    std::unordered_set<server_task_id> waiting_task_ids;
 
     // the main result queue (using ptr for polymorphism)
     std::vector<server_task_result_ptr> queue_results;
@@ -179,25 +178,25 @@ private:
 
 public:
     // add the id_task to the list of tasks waiting for response
-    void add_waiting_task_id(int id_task);
+    void add_waiting_task_id(server_task_id id_task);
 
-    void add_waiting_task_ids(const std::unordered_set<int> & id_tasks);
+    void add_waiting_task_ids(const std::unordered_set<server_task_id> & id_tasks);
 
     // when the request is finished, we can remove task associated with it
-    void remove_waiting_task_id(int id_task);
+    void remove_waiting_task_id(server_task_id id_task);
 
     // remove multiple tasks from waiting list
-    void remove_waiting_task_ids(const std::unordered_set<int> & id_tasks);
+    void remove_waiting_task_ids(const std::unordered_set<server_task_id> & id_tasks);
 
     // This function blocks the thread until there is a response for one of the id_tasks
-    server_task_result_ptr recv(const std::unordered_set<int> & id_tasks);
+    server_task_result_ptr recv(const std::unordered_set<server_task_id> & id_tasks);
 
     // same as recv(), but have timeout in seconds
     // if timeout is reached, nullptr is returned
-    server_task_result_ptr recv_with_timeout(const std::unordered_set<int> & id_tasks, int timeout);
+    server_task_result_ptr recv_with_timeout(const std::unordered_set<server_task_id> & id_tasks, int timeout);
 
     // single-task version of recv()
-    server_task_result_ptr recv(int id_task);
+    server_task_result_ptr recv(server_task_id id_task);
 
     // Send a new result to a waiting id_task
     void send(server_task_result_ptr && result);
@@ -214,7 +213,7 @@ public:
 // it provides a generator-like API for server responses
 // support pooling connection state and aggregating multiple results
 struct server_response_reader {
-    std::unordered_set<int> id_tasks;
+    std::unordered_set<server_task_id> id_tasks;
     server_queue & queue_tasks;
     server_response & queue_results;
     size_t received_count = 0;
@@ -232,7 +231,7 @@ struct server_response_reader {
         stop();
     }
 
-    int get_new_id() {
+    server_task_id get_new_id() {
         return queue_tasks.get_new_id();
     }
 

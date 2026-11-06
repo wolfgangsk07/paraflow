@@ -36,10 +36,7 @@
 struct common_sampler;
 
 struct common_sampler_direct_topk_stats {
-    bool enabled;
     uint64_t calls, nan_fallbacks, input_candidates, kept_candidates, selection_us;
-    int32_t vector_width;
-    uint64_t vector_calls;
 };
 common_sampler_direct_topk_stats common_sampler_get_direct_topk_stats();
 
@@ -76,11 +73,6 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 //
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
 
-// same as common_sampler_sample, but reads the raw logits row from the caller instead of
-// the llama_context, and does NOT synchronize the context. used with pipelined decode
-// tickets (llama_decode_ticket_logits_ith) so that sampling one in-flight decode does not
-// drain the others. backend samplers are not supported on this path.
-llama_token common_sampler_sample_from(struct common_sampler * gsmpl, int32_t n_vocab, const float * logits, bool grammar_first = false);
 
 // generalized version of common_sampler_sample
 //

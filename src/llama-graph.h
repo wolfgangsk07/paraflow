@@ -287,6 +287,7 @@ public:
     bool can_reuse(const llm_graph_params & params) override;
 
     ggml_tensor * s_copy;  // I32 [n_rs]
+    ggml_tensor * journal_lengths = nullptr;
     ggml_tensor * s_copy_base; // I32 [n_rs], source row without a rollback-plane offset
 
     // views of s_copy, computed once per graph

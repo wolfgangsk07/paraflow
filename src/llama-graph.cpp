@@ -405,6 +405,11 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
         GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
         int32_t * data = (int32_t *) s_copy->data;
 
+        if (journal_lengths && journal_lengths->buffer) {
+            GGML_ASSERT(ggml_backend_buffer_is_host(journal_lengths->buffer));
+            auto * lengths = (int32_t *) journal_lengths->data;
+            for (uint32_t i = 0; i < n_rs; ++i) { lengths[i] = mctx->journal_input_length(i); }
+        }
         // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
         for (uint32_t i = 0; i < n_rs; ++i) {
             data[i] = mctx->s_copy(i);
@@ -3858,6 +3863,12 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     ggml_set_input(inp->s_copy_base);
     ggml_set_name(inp->s_copy_base, "rs_s_copy_base");
 
+    if (mctx_cur->compact_s_enabled()) {
+        inp->journal_lengths = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
+        ggml_set_input(inp->journal_lengths);
+        ggml_set_name(inp->journal_lengths, "rs_journal_lengths");
+    }
+
     inp->s_copy_main = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);
     inp->s_copy_tail = ggml_view_1d(ctx0, inp->s_copy, n_rs - 1, inp->s_copy->nb[0]);
 
@@ -3882,6 +3893,39 @@ ggml_tensor * llm_graph_context::build_rs(
             int32_t   n_seqs,
         const llm_graph_get_rows_fn & get_state_rows) const {
     const auto * kv_state = inp->mctx;
+    if (auto * journal = kv_state->journal_for(s)) {
+        GGML_ASSERT(!get_state_rows);
+        const int64_t count = kv_state->get_n_rs(), head = kv_state->get_head();
+        const int64_t size = kv_state->get_size(), zero = kv_state->get_rs_z();
+        auto * cleared = ggml_view_1d(ctx0, s, state_size * (zero >= 0),
+                zero * s->nb[1] * (zero >= 0));
+        ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, cleared, 0));
+        auto * gathered = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, state_size, count);
+        gathered->op = GGML_OP_GATED_DELTA_NET;
+        gathered->src[0] = s;
+        gathered->src[1] = journal;
+        gathered->src[2] = inp->s_copy;
+        gathered->src[3] = inp->journal_lengths;
+        int32_t params[7] = {1, 0x52534a31, (int32_t) hparams.ssm_d_state,
+                (int32_t) hparams.ssm_n_group, (int32_t) hparams.ssm_dt_rank,
+                (int32_t) cparams.n_rs_seq + 1, (int32_t) size};
+        memcpy(gathered->op_params, params, sizeof(params));
+        auto * output = ggml_view_2d(ctx0, gathered, state_size, n_seqs, gathered->nb[1], 0);
+        ggml_build_forward_expand(gf, output);
+        if (count > n_seqs) {
+            const int64_t extra = count - n_seqs;
+            auto * selected = ggml_view_2d(ctx0, gathered, state_size, extra,
+                    gathered->nb[1], n_seqs * gathered->nb[1]);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, selected,
+                    ggml_view_2d(ctx0, s, state_size, extra, s->nb[1], (head + n_seqs) * s->nb[1])));
+            auto * history = ggml_view_2d(ctx0, s, state_size, size, s->nb[1], size * s->nb[1]);
+            auto * ids = ggml_view_1d(ctx0, inp->s_copy_base, extra, n_seqs * inp->s_copy_base->nb[0]);
+            auto * basis = ggml_get_rows(ctx0, history, ids);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, basis,
+                    ggml_view_2d(ctx0, s, state_size, extra, s->nb[1], (size + head + n_seqs) * s->nb[1])));
+        }
+        return output;
+    }
 
     // a custom getter reads the states of the ubatch straight from the cache, so the gather skips the first
     // state: it still holds the n_rs - n_seqs extra states and copies no state of a single sequence ubatch

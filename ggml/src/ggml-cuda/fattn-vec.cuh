@@ -1,5 +1,3 @@
-
-#include <cstdlib>
 #include "common.cuh"
 #include "fattn-common.cuh"
 
@@ -270,28 +268,6 @@ static __global__ void flash_attn_ext_vec(
         for (int i_KQ_0 = 0; i_KQ_0 < nthreads_KQ; ++i_KQ_0) {
             const int i_KQ = threadIdx.y*WARP_SIZE + (nthreads_KQ == WARP_SIZE ? 0 : (threadIdx.x & ~(nthreads_KQ-1))) + i_KQ_0;
 
-            // A unified KV cache holds many sequences; positions that are masked out for every
-            //     column of this block (other sequences' cells) contribute exactly nothing,
-            //     so the K data does not need to be loaded at all.
-            if (mask) {
-                bool fully_masked = true;
-#pragma unroll
-                for (int j = 0; j < ncols; ++j) {
-                    if (ncols == 1 || ic0 + j < int(ne01.z)) {
-                        fully_masked = fully_masked && __half2float(maskh[j*ne11 + i_KQ]) == -INFINITY;
-                    }
-                }
-                if (__all_sync(0xFFFFFFFF, fully_masked)) {
-#pragma unroll
-                    for (int j = 0; j < ncols; ++j) {
-                        if ((nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ) == uint32_t(i_KQ_0)) {
-                            KQ_reg[j] = -INFINITY;
-                        }
-                    }
-                    continue;
-                }
-            }
-
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
                 float sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
@@ -349,14 +325,9 @@ static __global__ void flash_attn_ext_vec(
 
 #ifdef V_DOT2_F32_F16_AVAILABLE
             half2 KQ_k[ncols];
-            bool KQ_zero = true;
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
                 KQ_k[j] = __half2half2(KQ[j*nthreads + k]);
-                KQ_zero = KQ_zero && __low2float(KQ_k[j]) == 0.0f;
-            }
-            if (KQ_zero) {
-                continue; // masked-out or fully underflowed position, V contributes exactly nothing
             }
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
@@ -383,14 +354,9 @@ static __global__ void flash_attn_ext_vec(
             }
 #else
             float KQ_k[ncols];
-            bool KQ_zero = true;
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
                 KQ_k[j] = KQ[j*nthreads + k];
-                KQ_zero = KQ_zero && KQ_k[j] == 0.0f;
-            }
-            if (KQ_zero) {
-                continue; // masked-out or fully underflowed position, V contributes exactly nothing
             }
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
@@ -572,9 +538,8 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
     const bool need_f16_K = type_K == GGML_TYPE_F16;
     const bool need_f16_V = type_V == GGML_TYPE_F16;
     constexpr size_t nbytes_shared = 0;
-    const char * env = std::getenv("GGML_CUDA_FATTN_VOLTA_VEC");
-    const bool canonical_vec = cc == GGML_CUDA_CC_VOLTA && dst->src[0]->ne[1] <= 8 &&
-            (!env || std::atoi(env) != 0);
+    // Volta: fixed vector-kernel partitioning, so ordinary and speculative decode round identically.
+    const bool canonical_vec = cc == GGML_CUDA_CC_VOLTA && dst->src[0]->ne[1] <= 8;
     launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D,
             need_f16_K, need_f16_V, false, false, WARP_SIZE, false, canonical_vec);
 }
@@ -588,9 +553,7 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    const char * env = std::getenv("GGML_CUDA_FATTN_VOLTA_VEC");
-    const bool canonical_vec = cc == GGML_CUDA_CC_VOLTA && Q->ne[1] <= 8 &&
-            (!env || std::atoi(env) != 0);
+    const bool canonical_vec = cc == GGML_CUDA_CC_VOLTA && Q->ne[1] <= 8;
     if (Q->ne[1] == 1 || canonical_vec) {
         constexpr int cols_per_block = 1;
         if (logit_softcap == 0.0f) {

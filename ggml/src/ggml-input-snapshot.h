@@ -28,18 +28,10 @@ struct ggml_backend_sched_input_staging {
     ggml_backend_sched_t owner;
     std::vector<arena> arenas;
     size_t limit;
-    bool active = true;
     std::atomic<uint64_t> tensors{0}, bytes{0}, fences{0}, wait_ns{0}, fallbacks{0}, allocated{0};
 
     explicit ggml_backend_sched_input_staging(ggml_backend_sched_t sched)
         : owner(sched), arenas(sched->n_backends * sched->n_copies), limit(16 * 1024 * 1024) {
-        if (const char * setting = std::getenv("GGML_SCHED_INPUT_SNAPSHOT_MIB")) {
-            char * end = nullptr;
-            const unsigned long long value = std::strtoull(setting, &end, 10);
-            if (*setting && end && !*end && *setting != '-') {
-                limit = size_t(std::min<unsigned long long>(value, 128)) * 1024 * 1024;
-            }
-        }
     }
     ggml_backend_sched_input_staging(const ggml_backend_sched_input_staging &) = delete;
     arena & get(int backend, int copy) {
@@ -75,7 +67,7 @@ struct ggml_backend_sched_input_staging {
         int copy_slot;
         explicit call(ggml_backend_sched_t sched)
             : state(sched->input_staging), copy_slot(sched->cur_copy) {
-            if (!state || !state->active) return;
+            if (!state) return;
             usable.assign(sched->n_backends, false);
             queued.assign(sched->n_backends, false);
             if (sched->callback_eval) return;

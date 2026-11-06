@@ -21,6 +21,63 @@ Set of LLM REST APIs and a web UI to interact with llama.cpp.
 
 For the full list of features, please refer to [server's changelog](https://github.com/ggml-org/llama.cpp/issues/9291)
 
+## ParaFlow startup options
+
+ParaFlow extends the layer-split server with concurrent pipeline scheduling and a shared, dynamically assigned CUDA KV pool. The scheduling core is included in the source build; no license key, GPU binding, or commercial tier is required.
+
+The table below lists the additions relative to upstream llama.cpp `5aeac37a`. It was checked against both executables' `--help` output. Defaults refer to this source version; use your executable's `--help` when running an older build.
+
+| ParaFlow option | Default | Purpose and dependencies |
+| --- | --- | --- |
+| `--pipe-lanes N` | Auto: GPU/stage count; `1` disables the pipeline | Number of concurrent pipeline lanes for a layer-split model. Requires non-unified KV. This is not the number of request slots. |
+| `--pipe-fuse`, `--pipe-no-fuse` | Enabled | Fold prefill chunks into generation work so long prompts can share the pipeline with decode. |
+| `--pipe-prefill-chunk N` | `768` | Prefill tokens folded into a pipeline work item. Smaller chunks reduce uninterrupted prefill work; the best value depends on the workload and GPU. |
+| `--pipe-prefill-lanes N` | Auto: lanes + 1, at most 8 | Prompt-only lanes that generation work can overtake. `0` disables these extra lanes. Requires `--pipe-fuse`. Extra lanes also reserve workspace. |
+| `--pipe-pf-inflight N` | `8` | Maximum number of prefill chunks in flight. This is separate from request concurrency and the shared KV budget. |
+| `--kv-dynamic`, `--no-kv-dynamic` | Disabled | Give sequences independent logical KV address spaces backed by a fixed shared CUDA page pool. Requires CUDA KV offload, Flash Attention, and non-unified KV. Must be paired with `--kv-dynamic-seq-max`. |
+| `--kv-dynamic-seq-max N` | Unset | Per-sequence context limit, including its prompt and generated tokens. Must be positive and no larger than `-c`. |
+| `--kv-spill`, `--no-kv-spill` | Disabled | When the KV pool is full, freeze an eligible non-VIP request and move its state to host RAM. Requires `--kv-unified` or `--kv-dynamic`. Resuming needs available GPU capacity and sufficient host RAM; this does not enlarge the physical GPU pool. |
+| `--vip`, `--no-vip` | Disabled | Allow a positive-priority request to preempt ordinary work. Ordinary running work is reduced toward `max(0, lanes - active_VIP)` while VIP work is active. |
+| `--system-cache-mib N` | `0`, disabled | Host-RAM budget in MiB for shared system-prompt states. Requires non-unified KV. This is separate from the GPU KV pool, the upstream prompt-cache budget, and the RAM used by suspended requests. |
+| `--loop-guard`, `--no-loop-guard` | Disabled | Optionally stop generation after at least 512 tokens when the output ends in five exact repetitions of a token block, with period at least 10. Legitimate repetitive output can trigger it, so it is opt-in. |
+
+### Shared pool, sequence length, slots, and lanes
+
+These are four separate quantities:
+
+- With dynamic KV, `-c` is the shared GPU token budget. It is not multiplied by `-np`.
+- `--kv-dynamic-seq-max` is the maximum context addressable by one sequence.
+- `-np` is the maximum number of request slots.
+- `--pipe-lanes` controls pipeline lanes. One lane can serve multiple request slots.
+
+For example, `-c 262144 --kv-dynamic-seq-max 32768 -np 24` means a shared 256 Ki-token pool, a 32 Ki-token per-sequence limit, and 24 slots. It does not guarantee that all 24 slots can simultaneously use 32 Ki tokens. The model's supported context and the memory needed for weights, recurrent state, MTP, workspaces, and CUDA graphs still apply. A successful startup is not a full-occupancy capacity test.
+
+The upstream flags `-sm layer`, `-ts`, `-ngl`, `-c`, `-np`, `-b`, `-ub`, `-fa`, `-ctk`, `-ctv`, `--no-kv-unified`, `--load-mode`, and `--spec-type` remain upstream options. In particular, `-ts` specifies allocation ratios, not exact transformer-layer counts. The pipeline needs `--no-kv-unified`; dynamic KV additionally needs `-fa on`.
+
+### Six-GPU Q8 / MTP3 example
+
+This is a short-context starting configuration, not a maximum-capacity claim. Use a model that contains a compatible MTP head. `CUDA_VISIBLE_DEVICES` determines which GPUs participate.
+
+```sh
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 ./build/bin/llama-server \
+  -m /path/to/model-with-mtp.Q8_0.gguf \
+  -ngl 99 -sm layer -ts 1,1,1,1,1,1 \
+  -np 24 -c 12288 -b 512 -ub 64 \
+  -ctk q8_0 -ctv q8_0 -fa on --no-kv-unified \
+  --pipe-lanes 6 --pipe-fuse \
+  --pipe-prefill-chunk 64 --pipe-prefill-lanes 1 \
+  --kv-dynamic --kv-dynamic-seq-max 512 \
+  --no-kv-spill --system-cache-mib 0 \
+  --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-ngl 99 \
+  --host 127.0.0.1 --port 8080
+```
+
+`-ctk` and `-ctv` above configure target-model KV. Draft KV has its own upstream `--spec-draft-type-k` and `--spec-draft-type-v` options; record them separately when comparing results. Request-level `"speculative.n_max": 3` can select a shallower draft depth within the startup reservation. It does not turn an MTP5 startup into an independently reserved native-MTP3 profile.
+
+For interactive service, choose the shared pool and sequence limit from measured memory capacity, then consider `--kv-spill` for occasional oversubscription and `--vip` for priority traffic. Keep host-RAM use visible. For GPU-only decode comparisons, disable spill and record actual PCIe generation/width, GPU clocks, cache hits, acceptance rate, and the common measurement window. CUDA graphs remain enabled by default in CUDA builds.
+
+The recurrent-state replay optimization and KV stream placement are enabled automatically for supported configurations. No project-specific environment variables are needed for normal startup. `PARAFLOW_RECURRENT_REPLAY=0` and `LLAMA_KV_PLACEMENT=0` are diagnostic overrides that change the measured execution path; do not mix their results into a default-path curve. See [the memory build notes](../../docs/paraflow-memory.txt) for build configuration.
+
 ## Usage
 
 <!-- HELP_START -->
@@ -167,7 +224,18 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-cms, --checkpoint-min-step N` | minimum spacing between context checkpoints in tokens (default: 8192, 0 = no minimum)<br/>(env: LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT) |
 | `-cram, --cache-ram N` | set the maximum cache size in MiB (default: 8192, 0 for decision models, -1 - no limit, 0 - disable)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |
 | `-kvu, --kv-unified, -no-kvu, --no-kv-unified` | use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)<br/>(env: LLAMA_ARG_KV_UNIFIED) |
+| `-kvd, --kv-dynamic, -no-kvd, --no-kv-dynamic` | use independent per-sequence KV address spaces backed by one fixed shared CUDA page pool; -c is the shared token budget and --kv-dynamic-seq-max is the per-sequence limit (requires CUDA KV offload, Flash Attention, and non-unified KV)<br/>(env: LLAMA_ARG_KV_DYNAMIC) |
+| `--kv-dynamic-seq-max N` | set the maximum tokens addressable by one dynamic-KV sequence; required with --kv-dynamic, must not exceed -c<br/>(env: LLAMA_ARG_KV_DYNAMIC_SEQ_MAX) |
 | `--cache-idle-slots, --no-cache-idle-slots` | save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)<br/>(env: LLAMA_ARG_CACHE_IDLE_SLOTS) |
+| `--pipe-lanes N` | pipelined decode: number of concurrent lanes for a layer-split model (default: auto = GPU/stage count, 1 = off). REQUIRES non-unified KV; using -kvu disables the pipeline.<br/>(env: LLAMA_ARG_PIPE_LANES) |
+| `--pipe-fuse, --pipe-no-fuse` | pipelined decode: fold prefill chunks into decode cars so decode keeps running during prefill (default: enabled)<br/>(env: LLAMA_ARG_PIPE_FUSE) |
+| `--pipe-prefill-chunk N` | pipelined decode: prefill chunk size folded per car (default: 768)<br/>(env: LLAMA_ARG_PIPE_PREFILL_CHUNK) |
+| `--pipe-prefill-lanes N` | pipelined decode: prompt-only lanes, so generation cars can overtake long prompts (default: -1 = pipeline lanes + 1, 0 = off, max 8; requires --pipe-fuse)<br/>(env: LLAMA_ARG_PIPE_PREFILL_LANES) |
+| `--pipe-pf-inflight N` | pipelined decode: max prefill chunks in flight (default: 8)<br/>(env: LLAMA_ARG_PIPE_PF_INFLIGHT) |
+| `--vip, --no-vip` | enable VIP partial preemption: a priority>0 task suspends non-VIP slots down to max(0, lanes - active_VIP), borrowing a slot to jump the queue (default: disabled)<br/>(env: LLAMA_ARG_VIP) |
+| `--kv-spill, --no-kv-spill` | capacity pager: on KV-full freeze the smallest non-VIP request to RAM instead of OOM-killing it. requires --kv-unified or --kv-dynamic (default: disabled)<br/>(env: LLAMA_ARG_KV_SPILL) |
+| `--system-cache-mib N` | system prefix cache: host RAM budget in MiB for shared system-prompt states, restored into new requests instead of re-prefilling them; LFU-per-byte eviction (default: 0 = off; needs non-unified KV)<br/>(env: LLAMA_ARG_SYSTEM_CACHE_MIB) |
+| `--loop-guard, --no-loop-guard` | stop a generation after 512+ tokens once its output ends in 5 exact repeats of a token block (period >= 10) (default: disabled)<br/>(env: LLAMA_ARG_LOOP_GUARD) |
 | `--context-shift, --no-context-shift` | whether to use context shift on infinite text generation (default: disabled)<br/>(env: LLAMA_ARG_CONTEXT_SHIFT) |
 | `-r, --reverse-prompt PROMPT` | halt generation at PROMPT, return control in interactive mode |
 | `-sp, --special` | special tokens output enabled (default: false) |

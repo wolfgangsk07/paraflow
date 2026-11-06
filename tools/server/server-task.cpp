@@ -1634,7 +1634,6 @@ std::string server_task_result_metrics::to_metrics() {
 
     add_items("counter", counters);
     add_items("gauge",   gauges);
-    prometheus << server_observation_metrics(request_observations);
 
     // labeled counter: one time series per draft position
     if (!metrics.n_accepted_per_pos.empty()) {

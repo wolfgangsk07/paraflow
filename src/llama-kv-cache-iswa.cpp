@@ -161,12 +161,6 @@ bool llama_kv_cache_iswa::trim() {
     return base && swa;
 }
 
-bool llama_kv_cache_iswa::release_physical() {
-    const bool base = kv_base->release_physical();
-    const bool swa  = kv_swa ->release_physical();
-    return base && swa;
-}
-
 bool llama_kv_cache_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     bool res = true;
 
@@ -203,6 +197,30 @@ llama_pos llama_kv_cache_iswa::seq_pos_min(llama_seq_id seq_id) const {
 
 llama_pos llama_kv_cache_iswa::seq_pos_max(llama_seq_id seq_id) const {
     return kv_swa->seq_pos_max(seq_id);
+}
+
+int32_t llama_kv_cache_iswa::seq_swap_stream(llama_seq_id seq_id_a, llama_seq_id seq_id_b) {
+    const int32_t res = kv_base->seq_swap_stream(seq_id_a, seq_id_b);
+    if (res != 1) {
+        return res;
+    }
+
+    const int32_t res_swa = kv_swa->seq_swap_stream(seq_id_a, seq_id_b);
+    if (res_swa == 1) {
+        return 1;
+    }
+
+    // both caches must keep the same stream layout: undo the base exchange, or clear both sequences
+    if (res_swa == 0 && kv_base->seq_swap_stream(seq_id_a, seq_id_b) == 1) {
+        return 0;
+    }
+
+    for (const llama_seq_id seq_id : { seq_id_a, seq_id_b }) {
+        kv_base->seq_rm(seq_id, -1, -1);
+        kv_swa ->seq_rm(seq_id, -1, -1);
+    }
+
+    return -1;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_iswa::memory_breakdown() const {
@@ -261,7 +279,7 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & ba
 
         std::vector<llama_ubatch> ubatches;
         while (true) {
-            auto ubatch = embd_all ? balloc.split_seq(n_ubatch) : balloc.split_equal(n_ubatch, !unified, 0);
+            auto ubatch = embd_all ? balloc.split_seq(n_ubatch) : balloc.split_equal(n_ubatch, !unified, 0, unified ? nullptr : &kv_base->get_seq_to_stream());
 
             if (ubatch.n_tokens == 0) {
                 break;

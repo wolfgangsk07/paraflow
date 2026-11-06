@@ -125,6 +125,13 @@ option(LLAMA_SANITIZE_THREAD    "llama: enable thread sanitizer"    OFF)
 option(LLAMA_SANITIZE_ADDRESS   "llama: enable address sanitizer"   OFF)
 option(LLAMA_SANITIZE_UNDEFINED "llama: enable undefined sanitizer" OFF)
 
+# test-only diagnostics: fault injection (pipelined decode / CUDA graph failure paths),
+# checkpoint capture verification, pipeline event log. Never enabled in release builds.
+option(LLAMA_DIAGNOSTICS "llama: enable test-only diagnostics and fault injection hooks" OFF)
+if (LLAMA_DIAGNOSTICS)
+    add_compile_definitions(GGML_DIAGNOSTICS)
+endif()
+
 # utils
 option(LLAMA_BUILD_COMMON "llama: build common utils library" ${LLAMA_STANDALONE})
 

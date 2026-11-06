@@ -1,0 +1,6 @@
+{
+    local:
+        *server_context_impl*;
+        *server_slot*;
+        *paraflow_private*;
+};

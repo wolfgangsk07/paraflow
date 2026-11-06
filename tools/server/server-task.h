@@ -2,7 +2,6 @@
 
 #include "common.h"
 #include "llama.h"
-#include "request-observation.h"
 
 #include <string>
 #include <unordered_set>
@@ -138,19 +137,20 @@ struct task_result_state {
         bool filter_tool_calls = false);
 };
 
+using server_task_id = int64_t;
+
 struct server_task {
-    int id = -1; // to be filled by server_queue
-    std::string client_request_id; // opaque HTTP observation metadata, never a model input
+    server_task_id id = -1; // to be filled by server_queue
 
     // TODO @ngxson : remove this field and implement a mapping task_id -> idx in the response_reader
     size_t index = 0; // used when there are multiple prompts (batch request)
 
     // used by SERVER_TASK_TYPE_CANCEL
-    int id_target = -1;
+    server_task_id id_target = -1;
     int id_slot   = -1;
 
     // used by parallel sampling (multiple completions from same prompt)
-    int id_parent  = -1;
+    server_task_id id_parent = -1;
     // temporary store of child tasks for scheduling
     // note: accessing to elements is invalid after the task is moved to server_slot
     std::vector<server_task> child_tasks;
@@ -257,8 +257,8 @@ struct server_task {
     }
 
     // utility function
-    static std::unordered_set<int> get_list_id(const std::vector<server_task> & tasks) {
-        std::unordered_set<int> ids(tasks.size());
+    static std::unordered_set<server_task_id> get_list_id(const std::vector<server_task> & tasks) {
+        std::unordered_set<server_task_id> ids(tasks.size());
         for (size_t i = 0; i < tasks.size(); i++) {
             ids.insert(tasks[i].id);
             for (auto & child : tasks[i].child_tasks) {
@@ -279,11 +279,10 @@ struct server_task {
         params.message_spans = tokens.find_message_spans(session.message_delimiters());
     }
 
-    void add_child(int id_parent, int id_child) {
+    void add_child(server_task_id id_parent, server_task_id id_child) {
         server_task copy;
 
         copy.id        = id_child;
-        copy.client_request_id = client_request_id;
         copy.id_parent = id_parent;
         copy.params    = params;
         copy.type      = type;
@@ -323,7 +322,7 @@ struct result_prompt_progress {
 };
 
 struct server_task_result {
-    int id           = -1;
+    server_task_id id = -1;
     int id_slot      = -1;
 
     // TODO @ngxson : remove this field and implement a mapping task_id -> idx in the response_reader
@@ -560,7 +559,6 @@ struct server_task_result_metrics : server_task_result {
     server_metrics metrics;
     uint64_t n_prompt_active = 0;
     uint64_t n_predict_active = 0;
-    std::vector<server_request_observation> request_observations;
 
     virtual json to_json() override;
 

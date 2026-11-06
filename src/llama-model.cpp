@@ -25,10 +25,6 @@
 #include "ggml.h"
 #include "ggml-cpp.h"
 
-#ifdef GGML_USE_CUDA
-#include "ggml-cuda.h"
-#endif
-
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
@@ -37,7 +33,6 @@
 #include <cmath>
 #include <functional>
 #include <map>
-#include <mutex>
 #include <numeric>
 #include <regex>
 #include <sstream>
@@ -1286,8 +1281,6 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
-    mutable std::mutex residency_mutex;
-    bool residency_faulted = false;
 };
 
 bool llama_prec_policy::apply(ggml_tensor * res) const {
@@ -1591,15 +1584,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const int n_gpu_layers = this->n_gpu_layers();
 
     const bool use_mmap_buffer = true;
-
-    if (params.managed_weights && split_mode != LLAMA_SPLIT_MODE_LAYER && split_mode != LLAMA_SPLIT_MODE_NONE) {
-        throw std::runtime_error("managed weights require split mode 'layer' or 'none'");
-    }
-#ifndef GGML_USE_CUDA
-    if (params.managed_weights) {
-        throw std::runtime_error("managed weights require a CUDA build");
-    }
-#endif
 
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
 
@@ -1915,23 +1899,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     //     across disjoint ranges of a file (see get_mapping_ranges)
     pimpl->ctxs_bufs.reserve(ml.ctx_map.size() * ml.files.size());
 
-#ifdef GGML_USE_CUDA
-    {
-    struct managed_weight_alloc_scope {
-        explicit managed_weight_alloc_scope(bool enabled) : enabled(enabled) {
-            if (enabled) {
-                ggml_backend_cuda_set_managed_weight_alloc(true);
-            }
-        }
-        ~managed_weight_alloc_scope() {
-            if (enabled) {
-                ggml_backend_cuda_set_managed_weight_alloc(false);
-            }
-        }
-        bool enabled;
-    } managed_scope(params.managed_weights && !ml.no_alloc);
-#endif
-
     for (auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
         ggml_backend_buffer_type_t buft = ctx_key.buft;
         ggml_context * ctx = ctx_ptr.get();
@@ -2020,10 +1987,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         ctx_bufs.emplace_back(ctx, std::move(buf_ptrs));
     }
 
-#ifdef GGML_USE_CUDA
-    }
-#endif
-
     if (llama_supports_gpu_offload()) {
         const int n_gpu = std::min(n_gpu_layers, n_layer_all);
 
@@ -2065,10 +2028,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         if (!ml.load_all_data(ctx, bufs, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
-    }
-
-    if (params.managed_weights && !residency_to_devices()) {
-        throw std::runtime_error("failed to prefetch managed model weights to their CUDA devices");
     }
 
     if (use_mmap_buffer) {
@@ -2481,6 +2440,12 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
             }
         }
     }
+    std::lock_guard<std::recursive_mutex> config_guard(pipeline_configuration->mutex);
+    for (const auto * adapter : loras) {
+        for (const auto & buffer : adapter->bufs) {
+            ret[ggml_backend_buffer_get_type(buffer.get())] += ggml_backend_buffer_get_size(buffer.get());
+        }
+    }
     return ret;
 }
 
@@ -2772,176 +2737,6 @@ ggml_backend_buffer_type_t llama_model::select_buft(int il) const {
 
 bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
-}
-
-bool llama_model::residency_status(llama_model_residency_info & status) const {
-    std::lock_guard<std::mutex> lock(pimpl->residency_mutex);
-
-    status = {};
-    status.faulted = pimpl->residency_faulted;
-
-#ifdef GGML_USE_CUDA
-    for (const auto & [_, bufs] : pimpl->ctxs_bufs) {
-        for (const auto & buf : bufs) {
-            if (ggml_backend_cuda_buffer_is_managed(buf.get())) {
-                status.managed_bytes += ggml_backend_cuda_buffer_managed_bytes(buf.get());
-                status.cpu_bytes += ggml_backend_cuda_buffer_cpu_bytes(buf.get());
-            }
-        }
-    }
-#endif
-
-    return status.managed_bytes > 0;
-}
-
-bool llama_model::residency_device_status(int32_t device, llama_model_residency_info & status) const {
-    std::lock_guard<std::mutex> lock(pimpl->residency_mutex);
-
-    status = {};
-    status.faulted = pimpl->residency_faulted;
-#ifdef GGML_USE_CUDA
-    if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
-        return false;
-    }
-    size_t free_bytes = 0;
-    size_t total_bytes = 0;
-    ggml_backend_cuda_get_device_memory(device, &free_bytes, &total_bytes);
-    status.device_free_bytes = free_bytes;
-    status.device_total_bytes = total_bytes;
-    for (const auto & [_, bufs] : pimpl->ctxs_bufs) {
-        for (const auto & buf : bufs) {
-            if (ggml_backend_cuda_buffer_is_managed(buf.get()) &&
-                    ggml_backend_cuda_buffer_device(buf.get()) == device) {
-                status.managed_bytes += ggml_backend_cuda_buffer_managed_bytes(buf.get());
-                status.cpu_bytes += ggml_backend_cuda_buffer_cpu_bytes(buf.get());
-            }
-        }
-    }
-#else
-    GGML_UNUSED(device);
-#endif
-    return status.managed_bytes > 0;
-}
-
-int64_t llama_model::residency_to_cpu(int32_t device, uint64_t bytes) {
-    if (bytes == 0 || device < 0) {
-        return -1;
-    }
-
-    std::lock_guard<std::mutex> lock(pimpl->residency_mutex);
-
-#ifdef GGML_USE_CUDA
-    if (device >= ggml_backend_cuda_get_device_count()) {
-        return -1;
-    }
-    std::vector<ggml_backend_buffer_t> managed;
-    for (const auto & [_, bufs] : pimpl->ctxs_bufs) {
-        for (const auto & buf : bufs) {
-            if (ggml_backend_cuda_buffer_is_managed(buf.get()) &&
-                    ggml_backend_cuda_buffer_device(buf.get()) == device) {
-                managed.push_back(buf.get());
-            }
-        }
-    }
-    if (managed.empty()) {
-        return -1;
-    }
-
-    for (auto it = managed.rbegin(); it != managed.rend(); ++it) {
-        ggml_backend_buffer_t buf = *it;
-        const uint64_t total = ggml_backend_cuda_buffer_managed_bytes(buf);
-        const uint64_t cpu = ggml_backend_cuda_buffer_cpu_bytes(buf);
-        if (cpu > total) {
-            pimpl->residency_faulted = true;
-            return -1;
-        }
-        const uint64_t available = total - cpu;
-        if (available == 0) {
-            continue;
-        }
-        const int64_t actual = ggml_backend_cuda_buffer_move_to_cpu(buf, std::min(bytes, available));
-        if (actual < 0) {
-            pimpl->residency_faulted = true;
-            return -1;
-        }
-        if (actual > 0) {
-            return actual;
-        }
-    }
-    return 0;
-#else
-    GGML_UNUSED(device);
-    GGML_UNUSED(bytes);
-    return -1;
-#endif
-}
-
-int64_t llama_model::residency_to_device(int32_t device, uint64_t bytes) {
-    if (bytes == 0 || device < 0) {
-        return -1;
-    }
-
-    std::lock_guard<std::mutex> lock(pimpl->residency_mutex);
-
-#ifdef GGML_USE_CUDA
-    if (device >= ggml_backend_cuda_get_device_count()) {
-        return -1;
-    }
-    for (const auto & [_, bufs] : pimpl->ctxs_bufs) {
-        for (const auto & buf : bufs) {
-            if (!ggml_backend_cuda_buffer_is_managed(buf.get()) ||
-                    ggml_backend_cuda_buffer_device(buf.get()) != device) {
-                continue;
-            }
-            const uint64_t cpu = ggml_backend_cuda_buffer_cpu_bytes(buf.get());
-            if (cpu == 0) {
-                continue;
-            }
-            const int64_t actual = ggml_backend_cuda_buffer_move_to_device(
-                    buf.get(), std::min(bytes, cpu));
-            if (actual < 0) {
-                pimpl->residency_faulted = true;
-                return -1;
-            }
-            if (actual > 0) {
-                return actual;
-            }
-        }
-    }
-    return 0;
-#else
-    GGML_UNUSED(device);
-    GGML_UNUSED(bytes);
-    return -1;
-#endif
-}
-
-bool llama_model::residency_to_devices() {
-    std::lock_guard<std::mutex> lock(pimpl->residency_mutex);
-
-#ifdef GGML_USE_CUDA
-    bool found = false;
-    for (const auto & [_, bufs] : pimpl->ctxs_bufs) {
-        for (const auto & buf : bufs) {
-            if (!ggml_backend_cuda_buffer_is_managed(buf.get())) {
-                continue;
-            }
-            found = true;
-            const uint64_t cpu = ggml_backend_cuda_buffer_cpu_bytes(buf.get());
-            if (cpu > 0 && ggml_backend_cuda_buffer_move_to_device(buf.get(), cpu) < 0) {
-                pimpl->residency_faulted = true;
-                return false;
-            }
-        }
-    }
-    if (!found) {
-        return false;
-    }
-    pimpl->residency_faulted = false;
-    return true;
-#else
-    return false;
-#endif
 }
 
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
@@ -3584,7 +3379,6 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
-        /*.managed_weights             =*/ false,
     };
 
     return result;
@@ -3950,49 +3744,6 @@ llama_ftype llama_model_ftype(const llama_model * model) {
 
 uint64_t llama_model_size(const llama_model * model) {
     return model->size();
-}
-
-bool llama_model_residency_status(
-        const llama_model * model,
-        llama_model_residency_info * status) {
-    if (model == nullptr || status == nullptr) {
-        return false;
-    }
-    return model->residency_status(*status);
-}
-
-bool llama_model_residency_device_status(
-        const llama_model * model,
-        int32_t device,
-        llama_model_residency_info * status) {
-    if (model == nullptr || status == nullptr || device < 0) {
-        return false;
-    }
-    return model->residency_device_status(device, *status);
-}
-
-int64_t llama_model_residency_to_cpu(
-        llama_model * model,
-        int32_t device,
-        uint64_t bytes) {
-    if (model == nullptr) {
-        return -1;
-    }
-    return model->residency_to_cpu(device, bytes);
-}
-
-int64_t llama_model_residency_to_device(
-        llama_model * model,
-        int32_t device,
-        uint64_t bytes) {
-    if (model == nullptr) {
-        return -1;
-    }
-    return model->residency_to_device(device, bytes);
-}
-
-bool llama_model_residency_to_devices(llama_model * model) {
-    return model != nullptr && model->residency_to_devices();
 }
 
 const char * llama_model_chat_template(const llama_model * model, const char * name) {

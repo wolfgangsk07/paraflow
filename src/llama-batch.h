@@ -181,18 +181,15 @@ public:
     llama_ubatch split_simple(uint32_t n_ubatch);
 
     // make ubatches of equal-length sequences sets
-    // if sequential == true, the tokens in the ubatch will have increasing sequential sequence ids
+    // if sequential == true, the tokens in the ubatch will have increasing sequential sequence ids, or, when
+    //   seq_to_stream is given, sequence ids mapped to increasing adjacent streams (in that order)
     // n_keep_tail = minimum trailing tokens of a seq that must land in the same ubatch
-    llama_ubatch split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail);
+    llama_ubatch split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail,
+            const std::vector<uint32_t> * seq_to_stream = nullptr);
 
     // sequence-set-wise split - each ubatch contains a single sequence-set
     // TODO: extend to support multiple _full_ sequences in the ubatch
     llama_ubatch split_seq(uint32_t n_ubatch);
-
-    // Group whole, independent one-token output sequences in a canonical prompt
-    // batch. Never take a remaining tail from a longer sequence. Return empty
-    // without consuming anything when fewer than two sequences can be grouped.
-    llama_ubatch split_single_outputs(uint32_t n_ubatch, bool sequential);
 
     // a helper method for creating a well-defined ubatch of tokens
     // TODO: support embeddings if needed in the future
@@ -203,7 +200,8 @@ private:
 
     // create the next ubatch based on the provided batch indices (idxs) and the number of sequence sets (n_seqs)
     // return llama_ubatch.n_tokens == 0 if the entire batch was consumed
-    llama_ubatch ubatch_add(const std::vector<int32_t> & idxs, uint32_t n_seqs, bool equal_seqs);
+    // seq_unq_in_order: list the unique sequence ids in the order of the tokens instead of by id
+    llama_ubatch ubatch_add(const std::vector<int32_t> & idxs, uint32_t n_seqs, bool equal_seqs, bool seq_unq_in_order = false);
 
     // for debugging, start with LLAMA_BATCH_DEBUG=2
     void ubatch_print(const llama_ubatch & ubatch, int debug);

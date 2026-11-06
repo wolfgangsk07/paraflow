@@ -158,8 +158,6 @@ public:
 
     bool trim() override;
 
-    bool release_physical() override;
-
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
@@ -173,6 +171,9 @@ public:
         if (seq_id < 0 || size_t(seq_id) >= seq_to_stream.size()) { return 0; }
         return v_cells[seq_to_stream[seq_id]].seq_pos_get(seq_id).size();
     }
+
+    int32_t seq_swap_stream(llama_seq_id seq_id_a, llama_seq_id seq_id_b) override;
+    int32_t seq_stream(llama_seq_id seq_id) const override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
@@ -188,6 +189,9 @@ public:
     uint32_t get_size()     const;
     uint32_t get_n_seq_max() const;
     uint32_t get_n_stream() const;
+
+    // sequence id -> stream id; split_equal() groups adjacent streams through it
+    const std::vector<uint32_t> & get_seq_to_stream() const { return seq_to_stream; }
 
     bool get_has_shift() const;
 
@@ -368,6 +372,11 @@ private:
     uint32_t used_cells() const;
     uint32_t get_n_kv_for_stream(const slot_info & sinfo, uint32_t stream) const;
     bool release_stream(uint32_t stream);
+
+    // exchange the first na / nb rows of streams sa and sb on the device; false (nothing exchanged) when no device
+    // scratch is available
+    bool swap_stream_device(uint32_t sa, uint32_t sb, uint32_t na, uint32_t nb);
+    std::map<ggml_backend_buffer_type_t, ggml_backend_buffer_ptr> swap_scratch;
     void release_empty_streams();
     bool configure_dynamic_pool();
 
@@ -447,6 +456,8 @@ public:
     // Adjust only the dummy full-cache view used during graph reservation.
     // Zero restores every stream. Real batch/update contexts are rejected.
     void set_reserve_streams(uint32_t n_stream);
+    // Only valid for dummy full-memory contexts used to reserve graphs.
+    void set_reserve_n_kv(uint32_t value);
 
     uint32_t get_n_kv() const;
 

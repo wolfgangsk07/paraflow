@@ -1,0 +1,11 @@
+ParaFlow integrated memory defaults
+
+Pipeline mode synchronizes and releases the primary fallback compute arena when enabling its own schedulers. The primary graph is reserved without allocating compute storage while pipeline mode is enabled; an actual fallback graph uses the normal scheduler allocator. Disabling pipeline requests normal reservation again. Training, embedding and MTP draft contexts are excluded from this lazy-primary policy.
+
+Graph reservation scopes recurrent full-view rows to its reserved sequence count. Actual recurrent storage, per-request state and MTP rollback snapshots are unchanged.
+
+GGML_SCHED_MAX_COPIES defaults to4 in a fresh CMake build; existing CMake caches retain their chosen value. Explicit overrides remain possible. Published measurements must record the cache value. CUDA graphs remain enabled. No CODEX environment flags or library overlays are required.
+
+Build: cmake -S . -B build -G Ninja -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86
+       cmake --build build --target llama-server -j6
+Use70 for a separate V100 build. Hardware runtime qualification is separate.

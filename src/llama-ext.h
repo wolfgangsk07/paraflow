@@ -10,11 +10,6 @@
 #include <map>
 #include <vector>
 
-// Process-wide policy for future complete verification-tail batches. This
-// changes grouping only; existing output tickets and rollback state stay valid.
-LLAMA_API void llama_set_verify_tail_packing(bool enabled);
-LLAMA_API bool llama_get_verify_tail_packing();
-
 // Single-GPU context input snapshots. Configure before request processing.
 LLAMA_API void llama_set_input_snapshots(llama_context * ctx, bool enable);
 LLAMA_API ggml_backend_input_snapshot_stats llama_get_input_snapshot_stats(const llama_context * ctx);
@@ -29,9 +24,6 @@ LLAMA_API bool llama_decode_ticket_is_selected(const llama_context * ctx);
 LLAMA_API bool llama_decode_ticket_retain(llama_context * ctx, uint64_t ticket);
 LLAMA_API bool llama_decode_ticket_release(llama_context * ctx, uint64_t ticket);
 LLAMA_API int32_t llama_decode_ticket_retained_count(const llama_context * ctx);
-
-// Main-thread policy for future mixed cars; already issued tickets retain their
-// inputs, graph ownership and completion fences. The environment opt-in is required.
 
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
@@ -185,30 +177,28 @@ LLAMA_API uint32_t llama_model_get_tok_embd_rows(const struct llama_model * mode
 // realtime models: number of tokens the output lags behind the audio input, used by mtmd; 0 if not applicable
 LLAMA_API uint32_t llama_model_n_tokens_delay(const struct llama_model * model);
 
-// Number of mixed-car generation microbatches routed onto the dedicated allocator.
-LLAMA_API uint64_t llama_prefill_generation_split_count(const struct llama_context * ctx);
+// Physical ubatch width the context uses for MTP verification batches.
+LLAMA_API uint32_t llama_pipeline_verify_ubatch(const struct llama_context * ctx);
 
-// One-shot delivery hint, consumed by the calling thread's next decode on ctx.
-// Graph construction, model math and KV updates retain their normal behavior.
-struct llama_nextn_copy_stats {
-    uint64_t copied_calls = 0, copied_rows = 0;
-    uint64_t skipped_calls = 0, skipped_rows = 0, skipped_bytes = 0;
+// Decode-call statistics: how many physical ubatches (graph evaluations) the decode calls were split into.
+// Non-unified KV splits a batch at every gap in its sequence-to-stream order. Thread-safe to read.
+struct llama_ubatch_stats {
+    uint64_t decodes;   // llama_decode calls that evaluated at least one ubatch
+    uint64_t ubatches;  // physical ubatches evaluated
+    uint64_t tokens;    // tokens evaluated
+    uint64_t seqs;      // sum over ubatches of the distinct sequences in the ubatch
 };
-LLAMA_API void llama_decode_nextn_required(struct llama_context * ctx, bool required);
-LLAMA_API llama_nextn_copy_stats llama_get_nextn_copy_stats(const struct llama_context * ctx);
+LLAMA_API struct llama_ubatch_stats llama_get_ubatch_stats(const struct llama_context * ctx);
 
-LLAMA_API ggml_backend_input_snapshot_stats llama_get_generation_input_snapshot_stats(const struct llama_context * ctx);
-LLAMA_API ggml_backend_input_snapshot_stats llama_get_prefill_input_snapshot_stats(const struct llama_context * ctx);
-
-// Additional physical verifier subbatches retain independent graph/compute arenas.
-// Counters describe host scheduling and reuse, not GPU idle time.
-struct llama_pipeline_subbatch_stats {
-    bool enabled = true;
-    uint64_t logical_calls = 0, physical_subbatches = 0, multi_calls = 0;
-    uint64_t auxiliary_calls = 0, primary_builds = 0, primary_reuses = 0;
-    uint64_t auxiliary_builds = 0, auxiliary_reuses = 0;
-    uint64_t created_slots = 0, allocated_bytes = 0;
-    uint64_t reserve_failures = 0, fallback_calls = 0;
+// dynamic KV page residency, process-wide (zero without CUDA)
+struct llama_sparse_kv_stats {
+    uint64_t unmap_syncs; // unmap batches, each synchronizes its device
+    uint64_t sync_us;     // time spent in those synchronizations
+    uint64_t unmapped;    // pages unmapped (zero-page aliases included)
+    uint64_t mapped;      // private pages mapped
+    uint64_t recycled;    // mapped pages without owners reclaimed for new data
+    uint64_t rs_slots;    // recurrent ubatch placements
+    uint64_t rs_moves;    // recurrent cells exchanged to make a ubatch contiguous (state copies in the graph)
+    uint64_t rs_extra;    // cells inside placed recurrent ranges that belong to other sequences
 };
-LLAMA_API llama_pipeline_subbatch_stats llama_get_pipeline_subbatch_stats(const struct llama_context * ctx);
-
+LLAMA_API struct llama_sparse_kv_stats llama_get_sparse_kv_stats(void);

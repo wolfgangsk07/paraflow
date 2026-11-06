@@ -82,11 +82,6 @@ struct llama_memory_i {
 
     virtual ~llama_memory_i() = default;
 
-    // Called only at a quiescent context boundary. Recurrent implementations
-    // keep prompt chunk boundaries independent of concurrent pipeline peers.
-    void set_pipeline_parallel(bool enabled) { pipeline_parallel = enabled; }
-
-
     // split the input batch into a set of ubatches and verify that they can fit into the cache
     // return a context object containing the ubatches and memory state required to process them
     // check the llama_memory_context_i::get_status() for the result
@@ -117,13 +112,6 @@ struct llama_memory_i {
     // Implementations without sparse or pageable storage have nothing to do.
     virtual bool trim() { return true; }
 
-    // Return all releasable physical storage to the backend while preserving
-    // the logical allocation contract. This is reserved for an explicit
-    // runtime handoff after every live sequence has been serialized and
-    // removed. Ordinary cache pressure must use trim(), which may recycle
-    // storage internally instead of returning it to the device allocator.
-    virtual bool release_physical() { return trim(); }
-
     virtual bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) = 0;
     virtual void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) = 0;
     virtual void seq_keep(llama_seq_id seq_id) = 0;
@@ -140,6 +128,15 @@ struct llama_memory_i {
         return lo >= 0 && hi >= lo ? uint64_t(hi) - uint64_t(lo) + 1 : 0;
     }
 
+    // Exchange the storage streams of two sequences; each sequence keeps its contents. Lets the caller keep the
+    // sequences that decode together in adjacent streams, so they form one ubatch. No device work may be pending on
+    // either sequence. Returns 1 when exchanged, 0 when unchanged (unsupported or not possible right now) and -1
+    // when the exchange failed midway and both sequences were cleared.
+    virtual int32_t seq_swap_stream(llama_seq_id seq_id_a, llama_seq_id seq_id_b) { return seq_id_a == seq_id_b ? 1 : 0; }
+
+    // storage stream of a sequence, -1 if the memory does not keep one stream per sequence
+    virtual int32_t seq_stream(llama_seq_id seq_id) const { GGML_UNUSED(seq_id); return -1; }
+
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
 
     //
@@ -148,9 +145,6 @@ struct llama_memory_i {
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
-
-protected:
-    bool pipeline_parallel = false;
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

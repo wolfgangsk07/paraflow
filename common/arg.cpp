@@ -1777,7 +1777,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.pipe_lanes = value;
         }
-    ).set_env("LLAMA_PIPE_LANES").set_examples({LLAMA_EXAMPLE_SERVER}));
+    ).set_env("LLAMA_ARG_PIPE_LANES").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--pipe-fuse"},
         {"--pipe-no-fuse"},
@@ -1793,14 +1793,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.pipe_prefill_chunk = value;
         }
-    ).set_env("LLAMA_PIPE_PREFILL_CHUNK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    ).set_env("LLAMA_ARG_PIPE_PREFILL_CHUNK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--pipe-prefill-lanes"}, "N",
+        "pipelined decode: prompt-only lanes, so generation cars can overtake long prompts "
+        "(default: -1 = pipeline lanes + 1, 0 = off, max 8; requires --pipe-fuse)",
+        [](common_params & params, int value) {
+            params.pipe_prefill_lanes = value;
+        }
+    ).set_env("LLAMA_ARG_PIPE_PREFILL_LANES").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--pipe-pf-inflight"}, "N",
-        string_format("pipelined decode: max prefill chunks in flight on the ring path (default: %d)", params.pipe_pf_inflight),
+        string_format("pipelined decode: max prefill chunks in flight (default: %d)", params.pipe_pf_inflight),
         [](common_params & params, int value) {
             params.pipe_pf_inflight = value;
         }
-    ).set_env("LLAMA_PIPE_PF_INFLIGHT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    ).set_env("LLAMA_ARG_PIPE_PF_INFLIGHT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--vip"},
         {"--no-vip"},
@@ -1814,13 +1822,33 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--kv-spill"},
         {"--no-kv-spill"},
-        string_format("capacity pager (大KV避让): on KV-full freeze the smallest non-VIP request to RAM instead of "
+        string_format("capacity pager: on KV-full freeze the smallest non-VIP request to RAM instead of "
             "OOM-killing it. requires --kv-unified or --kv-dynamic (default: %s)",
             params.kv_spill ? "enabled" : "disabled"),
         [](common_params & params, bool value) {
             params.kv_spill = value;
         }
     ).set_env("LLAMA_ARG_KV_SPILL").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--system-cache-mib"}, "N",
+        "system prefix cache: host RAM budget in MiB for shared system-prompt states, restored into new "
+        "requests instead of re-prefilling them; LFU-per-byte eviction (default: 0 = off; needs non-unified KV)",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 1048576) {
+                throw std::invalid_argument("--system-cache-mib must be in 0..1048576");
+            }
+            params.system_cache_mib = value;
+        }
+    ).set_env("LLAMA_ARG_SYSTEM_CACHE_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--loop-guard"},
+        {"--no-loop-guard"},
+        string_format("stop a generation after 512+ tokens once its output ends in 5 exact repeats of a token block "
+            "(period >= 10) (default: %s)", params.loop_guard ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.loop_guard = value;
+        }
+    ).set_env("LLAMA_ARG_LOOP_GUARD").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--context-shift"},
         {"--no-context-shift"},
@@ -2748,13 +2776,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_VIDEO_FPS"));
     add_opt(common_arg(
-        {"--managed-weights"},
-        "allocate CUDA model-weight buffers in managed memory so an external runtime manager can migrate them",
-        [](common_params & params) {
-            params.managed_weights = true;
-        }
-    ).set_env("LLAMA_ARG_MANAGED_WEIGHTS"));
-    add_opt(common_arg(
         {"--video-timestamp-interval"}, "N",
         string_format("interval in milliseconds between text timestamps (default: %" PRId64 ")", params.video_timestamp_interval_ms),
         [](common_params & params, int value) {
@@ -3625,23 +3646,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             key_file.close();
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_API_KEY_FILE"));
-    add_opt(common_arg(
-        {"--runtime-control-key-file"}, "FNAME",
-        "path to file containing keys for the managed-weight runtime control API",
-        [](common_params & params, const std::string & value) {
-            std::ifstream key_file(value);
-            if (!key_file) {
-                throw std::runtime_error(string_format("error: failed to open file '%s'\n", value.c_str()));
-            }
-            std::string key;
-            while (std::getline(key_file, key)) {
-                if (!key.empty()) {
-                    params.runtime_control_keys.push_back(key);
-                }
-            }
-            key_file.close();
-        }
-    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_RUNTIME_CONTROL_KEY_FILE"));
     add_opt(common_arg(
         {"--ssl-key-file"}, "FNAME",
         "path to file a PEM-encoded SSL private key",

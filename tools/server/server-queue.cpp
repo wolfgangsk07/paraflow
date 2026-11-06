@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
+#include <stdexcept>
 #include <thread>
 
 #define QUE_INF(fmt, ...) LOG_INF("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -25,16 +27,16 @@ static bool task_resets_idle_timer(server_task_type type) {
     return type != SERVER_TASK_TYPE_METRICS;
 }
 
-int server_queue::post(server_task && task, bool front) {
+server_task_id server_queue::post(server_task && task, bool front) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     GGML_ASSERT(task.id != -1);
     // if this is cancel task make sure to clean up pending tasks
     if (task.type == SERVER_TASK_TYPE_CANCEL) {
         cleanup_pending_task(task.id_target);
     }
-    const int  task_id     = task.id;
+    const server_task_id task_id = task.id;
     const bool reset_timer = task_resets_idle_timer(task.type);
-    QUE_DBG("new task, id = %d, front = %d\n", task_id, front);
+    QUE_DBG("new task, id = %" PRId64 ", front = %d\n", task_id, front);
     if (front) {
         queue_tasks.push_front(std::move(task));
     } else {
@@ -49,17 +51,21 @@ int server_queue::post(server_task && task, bool front) {
 
 int server_queue::post(std::vector<server_task> && tasks, bool front) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
+    const auto missing = std::count_if(tasks.begin(), tasks.end(), [](const server_task & task) { return task.id == -1; });
+    if (id < 0 || missing > std::numeric_limits<server_task_id>::max() - id) {
+        throw std::overflow_error("server task ID space exhausted");
+    }
     bool reset_timer = false;
     for (auto & task : tasks) {
         if (task.id == -1) {
-            task.id = id++;
+            task.id = get_new_id_locked();
         }
         // if this is cancel task make sure to clean up pending tasks
         if (task.type == SERVER_TASK_TYPE_CANCEL) {
             cleanup_pending_task(task.id_target);
         }
         reset_timer |= task_resets_idle_timer(task.type);
-        QUE_DBG("new task, id = %d/%d, front = %d\n", task.id, (int) tasks.size(), front);
+        QUE_DBG("new task, id = %" PRId64 "/%d, front = %d\n", task.id, (int) tasks.size(), front);
         if (front) {
             queue_tasks.push_front(std::move(task));
         } else {
@@ -75,16 +81,34 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
 
 void server_queue::defer(server_task && task) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
-    QUE_DBG("defer task, id = %d\n", task.id);
+    QUE_DBG("defer task, id = %" PRId64 "\n", task.id);
     queue_tasks_deferred.push_back(std::move(task));
     time_last_task = ggml_time_ms();
     condition_tasks.notify_one();
 }
 
-int server_queue::get_new_id() {
+server_task_id server_queue::get_new_id_locked() {
+    if (id < 0 || id == std::numeric_limits<server_task_id>::max()) {
+        throw std::overflow_error("server task ID space exhausted");
+    }
+    return id++;
+}
+
+server_task_id server_queue::get_new_id() {
     std::unique_lock<std::mutex> lock(mutex_tasks);
-    int new_id = id++;
-    return new_id;
+    return get_new_id_locked();
+}
+
+void server_queue::request_update() {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    if (update_requested) { return; }
+    server_task wake(SERVER_TASK_TYPE_NEXT_RESPONSE);
+    // External request IDs are non-negative; internal wakeups never need responses.
+    wake.id = -2;
+    queue_tasks.push_back(std::move(wake));
+    update_requested = true;
+    time_last_task = ggml_time_ms();
+    condition_tasks.notify_one();
 }
 
 void server_queue::pop_deferred_task(int id_slot, bool vip_only) {
@@ -104,7 +128,7 @@ void server_queue::pop_deferred_task(int id_slot, bool vip_only) {
         bool found = false;
         for (auto it = queue_tasks_deferred.begin(); it != queue_tasks_deferred.end(); ++it) {
             if (it->id_slot == id_slot) {
-                QUE_DBG("pop deferred task (use slot %d), id_task = %d\n", id_slot, it->id);
+                QUE_DBG("pop deferred task (use slot %d), id_task = %" PRId64 "\n", id_slot, it->id);
                 queue_tasks.emplace_front(std::move(*it));
                 queue_tasks_deferred.erase(it);
                 found = true;
@@ -113,47 +137,13 @@ void server_queue::pop_deferred_task(int id_slot, bool vip_only) {
         }
         // if not tasks found using the slot, just pop the first deferred task (default behavior)
         if (!found) {
-            QUE_DBG("pop deferred task, id_task = %d\n", queue_tasks_deferred.front().id);
+            QUE_DBG("pop deferred task, id_task = %" PRId64 "\n", queue_tasks_deferred.front().id);
             queue_tasks.emplace_front(std::move(queue_tasks_deferred.front()));
             queue_tasks_deferred.pop_front();
         }
     }
     time_last_task = ggml_time_ms();
     condition_tasks.notify_one();
-}
-
-std::vector<server_task> server_queue::take_pending_context_tasks() {
-    std::unique_lock<std::mutex> lock(mutex_tasks);
-    std::vector<server_task> result;
-
-    const auto needs_context = [](const server_task & task) {
-        switch (task.type) {
-            case SERVER_TASK_TYPE_COMPLETION:
-            case SERVER_TASK_TYPE_INFILL:
-            case SERVER_TASK_TYPE_EMBEDDING:
-            case SERVER_TASK_TYPE_RERANK:
-            case SERVER_TASK_TYPE_SLOT_SAVE:
-            case SERVER_TASK_TYPE_SLOT_RESTORE:
-            case SERVER_TASK_TYPE_SLOT_ERASE:
-                return true;
-            default:
-                return false;
-        }
-    };
-    const auto take_from = [&](std::deque<server_task> & source) {
-        for (auto it = source.begin(); it != source.end();) {
-            if (!needs_context(*it)) {
-                ++it;
-                continue;
-            }
-            result.emplace_back(std::move(*it));
-            it = source.erase(it);
-        }
-    };
-
-    take_from(queue_tasks);
-    take_from(queue_tasks_deferred);
-    return result;
 }
 
 void server_queue::wait_until_no_sleep() {
@@ -191,13 +181,20 @@ bool server_queue::process_new_tasks(bool is_yielding) {
         }
         server_task task = std::move(queue_tasks.front());
         queue_tasks.pop_front();
+        const bool wake = task.type == SERVER_TASK_TYPE_NEXT_RESPONSE;
         lock.unlock();
 
-        QUE_DBG("processing task, id = %d\n", task.id);
-        if (!callback_new_task(std::move(task), is_yielding)) {
+        QUE_DBG("processing task, id = %" PRId64 "\n", task.id);
+        const bool accepted = callback_new_task(std::move(task), is_yielding);
+        if (wake && accepted) {
+            lock.lock();
+            update_requested = false;
+            lock.unlock();
+        }
+        if (!accepted) {
             // set it aside, do not put it back in the queue, else we offer it again in a loop
             GGML_ASSERT(is_yielding && "a task can only be declined while yielding");
-            QUE_DBG("task declined, id = %d\n", task.id);
+            QUE_DBG("task declined, id = %" PRId64 "\n", task.id);
             lock.lock();
             queue_tasks_unhandled.push_back(std::move(task));
         }
@@ -409,8 +406,9 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
     worker_stop();
 }
 
-void server_queue::cleanup_pending_task(int id_target) {
+void server_queue::cleanup_pending_task(server_task_id id_target) {
     // no need lock because this is called exclusively by post()
+    if (id_target < 0) { return; } // internal wakeups have no cancellable request identity
     auto rm_func = [id_target](const server_task & task) {
         return task.id == id_target;
     };
@@ -430,24 +428,24 @@ void server_queue::cleanup_pending_task(int id_target) {
 // server_response
 //
 
-void server_response::add_waiting_task_id(int id_task) {
-    RES_DBG("add task %d to waiting list. current waiting = %d (before add)\n", id_task, (int) waiting_task_ids.size());
+void server_response::add_waiting_task_id(server_task_id id_task) {
+    RES_DBG("add task %" PRId64 " to waiting list. current waiting = %d (before add)\n", id_task, (int) waiting_task_ids.size());
 
     std::unique_lock<std::mutex> lock(mutex_results);
     waiting_task_ids.insert(id_task);
 }
 
-void server_response::add_waiting_task_ids(const std::unordered_set<int> & id_tasks) {
+void server_response::add_waiting_task_ids(const std::unordered_set<server_task_id> & id_tasks) {
     std::unique_lock<std::mutex> lock(mutex_results);
 
     for (const auto & id_task : id_tasks) {
-        RES_DBG("add task %d to waiting list. current waiting = %d (before add)\n", id_task, (int) waiting_task_ids.size());
+        RES_DBG("add task %" PRId64 " to waiting list. current waiting = %d (before add)\n", id_task, (int) waiting_task_ids.size());
         waiting_task_ids.insert(id_task);
     }
 }
 
-void server_response::remove_waiting_task_id(int id_task) {
-    RES_DBG("remove task %d from waiting list. current waiting = %d (before remove)\n", id_task, (int) waiting_task_ids.size());
+void server_response::remove_waiting_task_id(server_task_id id_task) {
+    RES_DBG("remove task %" PRId64 " from waiting list. current waiting = %d (before remove)\n", id_task, (int) waiting_task_ids.size());
 
     std::unique_lock<std::mutex> lock(mutex_results);
     waiting_task_ids.erase(id_task);
@@ -459,16 +457,16 @@ void server_response::remove_waiting_task_id(int id_task) {
         queue_results.end());
 }
 
-void server_response::remove_waiting_task_ids(const std::unordered_set<int> & id_tasks) {
+void server_response::remove_waiting_task_ids(const std::unordered_set<server_task_id> & id_tasks) {
     std::unique_lock<std::mutex> lock(mutex_results);
 
     for (const auto & id_task : id_tasks) {
-        RES_DBG("remove task %d from waiting list. current waiting = %d (before remove)\n", id_task, (int) waiting_task_ids.size());
+        RES_DBG("remove task %" PRId64 " from waiting list. current waiting = %d (before remove)\n", id_task, (int) waiting_task_ids.size());
         waiting_task_ids.erase(id_task);
     }
 }
 
-static server_task_result_ptr server_response_shutdown_error(const std::unordered_set<int> & id_tasks) {
+static server_task_result_ptr server_response_shutdown_error(const std::unordered_set<server_task_id> & id_tasks) {
     auto result = std::make_unique<server_task_result_error>();
     result->id = id_tasks.empty() ? -1 : *id_tasks.begin();
     result->err_type = ERROR_TYPE_SERVER;
@@ -476,7 +474,7 @@ static server_task_result_ptr server_response_shutdown_error(const std::unordere
     return result;
 }
 
-server_task_result_ptr server_response::recv(const std::unordered_set<int> & id_tasks) {
+server_task_result_ptr server_response::recv(const std::unordered_set<server_task_id> & id_tasks) {
     std::unique_lock<std::mutex> lock(mutex_results);
     while (true) {
         for (size_t i = 0; i < queue_results.size(); i++) {
@@ -491,7 +489,7 @@ server_task_result_ptr server_response::recv(const std::unordered_set<int> & id_
     }
 }
 
-server_task_result_ptr server_response::recv_with_timeout(const std::unordered_set<int> & id_tasks, int timeout) {
+server_task_result_ptr server_response::recv_with_timeout(const std::unordered_set<server_task_id> & id_tasks, int timeout) {
     std::unique_lock<std::mutex> lock(mutex_results);
     while (true) {
         // Keep completed results in FIFO order, including a final result which
@@ -512,18 +510,18 @@ server_task_result_ptr server_response::recv_with_timeout(const std::unordered_s
     }
 }
 
-server_task_result_ptr server_response::recv(int id_task) {
-    std::unordered_set<int> id_tasks = {id_task};
+server_task_result_ptr server_response::recv(server_task_id id_task) {
+    std::unordered_set<server_task_id> id_tasks = {id_task};
     return recv(id_tasks);
 }
 
 void server_response::send(server_task_result_ptr && result) {
-    RES_DBG("sending result for task id = %d\n", result->id);
+    RES_DBG("sending result for task id = %" PRId64 "\n", result->id);
 
     std::unique_lock<std::mutex> lock(mutex_results);
     for (const auto & id_task : waiting_task_ids) {
         if (result->id == id_task) {
-            RES_DBG("task id = %d pushed to result queue\n", result->id);
+            RES_DBG("task id = %" PRId64 " pushed to result queue\n", result->id);
 
             queue_results.emplace_back(std::move(result));
             condition_results.notify_all();
@@ -535,7 +533,7 @@ void server_response::send(server_task_result_ptr && result) {
 void server_response::broadcast(server_task_result_ptr && result) {
     std::unique_lock<std::mutex> lock(mutex_results);
     for (const auto & id_task : waiting_task_ids) {
-        RES_DBG("task id = %d pushed to result queue\n", id_task);
+        RES_DBG("task id = %" PRId64 " pushed to result queue\n", id_task);
         server_task_result_ptr res_copy(result->clone());
         res_copy->id = id_task; // override id with target task id
         queue_results.emplace_back(std::move(res_copy));
@@ -648,7 +646,7 @@ void server_response_reader::stop() {
         std::vector<server_task> cancel_tasks;
         cancel_tasks.reserve(id_tasks.size());
         for (const auto & id_task : id_tasks) {
-            SRV_WRN("cancel task, id_task = %d\n", id_task);
+            SRV_WRN("cancel task, id_task = %" PRId64 "\n", id_task);
             server_task task(SERVER_TASK_TYPE_CANCEL);
             task.id_target = id_task;
             queue_results.remove_waiting_task_id(id_task);

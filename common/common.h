@@ -591,7 +591,6 @@ struct common_params {
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
     bool load_mtp          = false; // load MTP/NextN layers
-    bool managed_weights   = false; // allocate CUDA model weights in migratable managed memory
 
     bool single_turn       = false; // single turn chat conversation
 
@@ -665,23 +664,29 @@ struct common_params {
     bool prefill_assistant = true; // if true, any trailing assistant message will be prefilled into the response
     int sleep_idle_seconds = -1;   // if >0, server will sleep after this many seconds of idle time
 
-    // pipelined decode (M2): layer-split model run as G concurrent lanes (one in-flight
+    // pipelined decode: layer-split model run as G concurrent lanes (one in-flight
     // decode per GPU stage). REQUIRES non-unified KV (see --kv-unified); -kvu disables it.
     int32_t pipe_lanes         = -1;    // number of pipeline lanes; -1 = auto (= GPU/stage count), 1 = off
     bool    pipe_fuse          = true;  // fold prefill chunks into the same decode car (keeps decode alive during prefill)
     int32_t pipe_prefill_chunk = 768;   // prefill chunk size folded per car
-    int32_t pipe_pf_inflight   = 4;     // max prefill chunks in flight (ring path)
+    int32_t pipe_pf_inflight   = 8;     // max prefill chunks in flight
+    int32_t pipe_prefill_lanes = -1;    // prompt-only lanes; -1 = auto (= lanes + 1), 0 = off
 
     // VIP scheduling: a priority>0 task partially preempts non-VIP slots, keeping
     // max(0, pipe_lanes - active_VIP) non-VIP running; needs a borrowed slot to jump the queue.
     bool    vip_enable = false; // --vip: enable VIP partial preemption
 
-    // capacity pager / 大KV避让: on KV-full freeze the smallest non-VIP request to RAM instead
+    // capacity pager: on KV-full freeze the smallest non-VIP request to RAM instead
     // of OOM-killing it. Requires a unified pool or dynamic shared physical pool.
     bool    kv_spill = false;   // --kv-spill: enable capacity paging (requires --kv-unified or --kv-dynamic)
 
+    // system prefix cache: host RAM budget for shared system-prompt states (0 = off)
+    int32_t system_cache_mib = 0;
+
+    // stop a generation whose output ends in an exact repeated token block (see server-loop-guard.h)
+    bool    loop_guard = false;
+
     std::vector<std::string> api_keys;
-    std::vector<std::string> runtime_control_keys;
 
     std::string ssl_file_key  = "";                                                                         // NOLINT
     std::string ssl_file_cert = "";                                                                         // NOLINT
@@ -1298,7 +1303,7 @@ struct common_prompt_checkpoint {
     int64_t n_tokens;
 
     // (optional) id of the task that created the checkpoint
-    int id_task = -1;
+    int64_t id_task = -1;
 
     llama_pos pos_min;
     llama_pos pos_max;

@@ -389,9 +389,6 @@ extern "C" {
         uint64_t allocated_bytes;
     };
     GGML_API bool ggml_backend_sched_set_input_snapshots(ggml_backend_sched_t sched, bool enable);
-// Explicit pipeline opt-in; the caller must keep all consuming graph streams ordered.
-GGML_API bool ggml_backend_sched_set_input_snapshots_ex(ggml_backend_sched_t sched, bool enable, bool allow_pipeline);
-GGML_API void ggml_backend_sched_set_input_snapshots_active(ggml_backend_sched_t sched, bool active);
     GGML_API struct ggml_backend_input_snapshot_stats ggml_backend_sched_get_input_snapshot_stats(ggml_backend_sched_t sched);
 
     // Set a callback to be called when the compute buffers of a graph are being reallocated

@@ -1,4 +1,3 @@
-#include <cstdlib>
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
@@ -671,8 +670,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     if (volta_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
-        const char * canonical_vec = std::getenv("GGML_CUDA_FATTN_VOLTA_VEC");
-        if ((!canonical_vec || std::atoi(canonical_vec) != 0) && can_use_vector_kernel && Q->ne[1] <= 8) {
+        // Up to 8 query rows (MTP verification) use the vector kernel, like single-token decode.
+        if (can_use_vector_kernel && Q->ne[1] <= 8) {
             return BEST_FATTN_KERNEL_VEC;
         }
         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {

@@ -4,8 +4,6 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
-#include <cstdlib>
-
 //
 // llama_memory_hybrid
 //
@@ -94,7 +92,50 @@ llama_memory_hybrid::llama_memory_hybrid(
         filter_recr == nullptr ?
             [&](int32_t il) { return hparams.is_recr(il); }
             : filter_recr
-    )) {}
+    )) {
+    if (mem_attn->get_n_stream() > 1) {
+        mem_recr->set_cell_hint(&mem_attn->get_seq_to_stream());
+    }
+}
+
+int32_t llama_memory_hybrid::seq_swap_stream(llama_seq_id seq_id_a, llama_seq_id seq_id_b) {
+    const bool compact = mem_recr->compact_s && seq_id_a != seq_id_b;
+    bool a_had_tail = false;
+    if (compact) {
+        // Refuse unsupported shared/pending layouts before changing attention.
+        auto aligned = [&](llama_seq_id seq) {
+            if (seq < 0 || (size_t) seq >= mem_recr->cells.size() ||
+                    (size_t) seq >= mem_recr->rs_idx.size()) { return false; }
+            const int32_t tail = mem_recr->cells[seq].tail;
+            if (tail < 0) { return true; }
+            if ((uint32_t) tail >= mem_recr->size || tail != mem_attn->seq_stream(seq)) { return false; }
+            const auto & cell = mem_recr->cells[tail];
+            return cell.seq_id.size() == 1 && cell.has_seq_id(seq) &&
+                    (cell.src < 0 || cell.src == tail);
+        };
+        if (!aligned(seq_id_a) || !aligned(seq_id_b)) { return 0; }
+        a_had_tail = mem_recr->cells[seq_id_a].tail >= 0;
+    }
+    const int32_t res = mem_attn->seq_swap_stream(seq_id_a, seq_id_b);
+    if (res == 1 && seq_id_a != seq_id_b) {
+        const bool moved_a = mem_recr->seq_move_cell(seq_id_a, (uint32_t) mem_attn->seq_stream(seq_id_a), seq_id_b);
+        const bool moved_b = (!compact || moved_a) && mem_recr->seq_move_cell(seq_id_b, (uint32_t) mem_attn->seq_stream(seq_id_b), seq_id_a);
+        if (compact && (!moved_a || !moved_b)) {
+            // A refused first move made no writes. With no A tail the first move
+            // was a no-op, so a refused B move can also undo attention safely.
+            if ((!moved_a || !a_had_tail) && mem_attn->seq_swap_stream(seq_id_a, seq_id_b) == 1) {
+                return 0;
+            }
+            // Preserve the API's failure contract if atomic restoration is impossible.
+            for (const auto seq : { seq_id_a, seq_id_b }) {
+                mem_attn->seq_rm(seq, -1, -1);
+                mem_recr->seq_rm(seq, -1, -1);
+            }
+            return -1;
+        }
+    }
+    return res;
+}
 
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     do {
@@ -104,23 +145,12 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
         std::vector<llama_ubatch> ubatches;
 
         while (true) {
-            llama_ubatch ubatch{};
+            llama_ubatch ubatch;
 
-            const char * canonical_env = std::getenv("LLAMA_PIPE_CANONICAL_PREFILL");
-            const bool canonical_prefill = (canonical_env ? std::atoi(canonical_env) != 0 : pipeline_parallel) &&
-                    balloc.get_n_outputs() < balloc.get_n_tokens();
-            if (canonical_prefill && !embd_all) {
-                const char * group_env = std::getenv("LLAMA_PIPE_GROUP_SINGLE_DECODE");
-                if (!group_env || std::atoi(group_env) != 0) {
-                    ubatch = balloc.split_single_outputs(n_ubatch, mem_attn->get_n_stream() != 1);
-                }
-            }
-            if (ubatch.n_tokens == 0 && (embd_all || canonical_prefill)) {
-                // Keep each prompt's chunk boundaries independent of its batch
-                // peers. Unequal prompt lengths otherwise change the recurrent
-                // prefill trajectory when split_equal emits a short tail.
+            if (embd_all) {
+                // if all tokens are output, split by sequence
                 ubatch = balloc.split_seq(n_ubatch);
-            } else if (ubatch.n_tokens == 0) {
+            } else {
                 // Use non-sequential split when KV cache is unified (needed for hellaswag/winogrande/multiple-choice)
                 const bool unified = (mem_attn->get_n_stream() == 1);
 
@@ -129,7 +159,8 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
                 //   so that the rollback snapshots remain valid
                 const uint32_t n_rs_seq = mem_recr->n_rs_seq;
 
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0,
+                        unified ? nullptr : &mem_attn->get_seq_to_stream());
             }
 
             if (ubatch.n_tokens == 0) {
@@ -186,12 +217,6 @@ void llama_memory_hybrid::clear(bool data) {
 bool llama_memory_hybrid::trim() {
     const bool attn = mem_attn->trim();
     const bool recr = mem_recr->trim();
-    return attn && recr;
-}
-
-bool llama_memory_hybrid::release_physical() {
-    const bool attn = mem_attn->release_physical();
-    const bool recr = mem_recr->release_physical();
     return attn && recr;
 }
 

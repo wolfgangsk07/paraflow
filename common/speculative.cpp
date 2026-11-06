@@ -13,6 +13,7 @@
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
+#include <numeric>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -180,7 +181,7 @@ struct common_speculative_impl {
     uint32_t n_seq;
     std::vector<bool> enabled_seq;
 
-    // V68: when set, process() reads the target NextN rows (n_tokens x n_embd, batch order) from here instead of ctx_tgt
+    // when set, process() reads the target NextN rows (n_tokens x n_embd, batch order) from here instead of ctx_tgt
     const float * tgt_embd_override = nullptr;
     int32_t n_max; // maximum draft length after implementation-specific limits
 
@@ -215,7 +216,6 @@ struct common_speculative_impl {
         get_state(seq_id, data);
         return [this, seq_id, data]() { set_state(seq_id, data); };
     }
-
 
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
@@ -1482,20 +1482,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<bool> step_active;
     std::vector<std::vector<float>> step_h;
 
-    // V59: a launched step whose outputs have not been sampled yet
-    bool step_launched = false;
-    std::vector<llama_seq_id> step_launched_active;
-    common_speculative_draft_params_vec * step_launched_dparams = nullptr;
-    std::function<void(const std::vector<llama_seq_id> &)> step_on_finished;
-    uint64_t n_step_implicit_collects = 0;
-
-    void collect_launched_step() {
-        if (!step_launched) { return; }
-        ++n_step_implicit_collects;
-        const auto finished = draft_step_collect(*step_launched_dparams);
-        if (step_on_finished) { step_on_finished(finished); }
-    }
-
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1587,7 +1573,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
-        collect_launched_step(); // V59
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
 
@@ -1616,8 +1601,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (!batch_in.has_token() && !batch_in.has_embd()) {
             return true;
         }
-
-        collect_launched_step(); // V59: the catch-up decode reuses batch and output storage
 
         const int32_t n_tokens = batch_in.size();
 
@@ -1733,8 +1716,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
-
-        collect_launched_step(); // V59
 
         batch.clear();
 
@@ -1913,14 +1894,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // Finished IDs are returned so the generic driver can commit its ordinary
     // per-sequence bookkeeping without retiring unfinished lanes.
     std::vector<llama_seq_id> draft_step(common_speculative_draft_params_vec & dparams) {
-        if (!draft_step_launch(dparams)) { return {}; }
-        return draft_step_collect(dparams);
-    }
-
-    // V59: everything up to the draft decode; no host wait on ctx_dft
-    bool draft_step_launch(common_speculative_draft_params_vec & dparams) {
         GGML_ASSERT(supports_step() && dparams.size() == n_seq);
-        GGML_ASSERT(!step_launched);
         if (step_active.empty()) {
             step_active.assign(n_seq, false);
             step_h.resize(n_seq);
@@ -1928,7 +1902,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         batch.clear();
         bool started = false;
         std::vector<llama_seq_id> active;
-        for (llama_seq_id seq = 0; seq < (llama_seq_id) n_seq; ++seq) {
+        // in KV stream order: the draft ubatch then keeps the batch order and its outputs need no reordering
+        std::vector<llama_seq_id> order(n_seq);
+        std::iota(order.begin(), order.end(), 0);
+        if (auto * mem = llama_get_memory(params.ctx_dft)) {
+            std::stable_sort(order.begin(), order.end(), [mem](llama_seq_id a, llama_seq_id b) {
+                return llama_memory_seq_stream(mem, a) < llama_memory_seq_stream(mem, b);
+            });
+        }
+        for (const llama_seq_id seq : order) {
             auto & dp = dparams[seq];
             if (!dp.drafting) { GGML_ASSERT(!step_active[seq]); continue; }
             GGML_ASSERT(dp.result);
@@ -1950,23 +1932,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             batch.set_embd_state(i_last[seq], { step_h[seq].data(), 1, (size_t) n_embd });
             active.push_back(seq);
         }
-        if (active.empty()) { return false; }
+        if (active.empty()) { return {}; }
         if (started) { ++n_call_draft; }
         const int ret = llama_process(params.ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         if (ret != 0) { throw std::runtime_error("cooperative MTP head step failed: " + std::to_string(ret)); }
-        step_launched = true;
-        step_launched_active = std::move(active);
-        step_launched_dparams = &dparams;
-        return true;
-    }
-
-    // V59: sample a launched step (synchronizes ctx_dft)
-    std::vector<llama_seq_id> draft_step_collect(common_speculative_draft_params_vec & dparams) {
-        GGML_ASSERT(step_launched && step_launched_dparams == &dparams);
-        step_launched = false;
-        step_launched_dparams = nullptr;
-        const std::vector<llama_seq_id> active = std::move(step_launched_active);
-        step_launched_active.clear();
         std::vector<llama_seq_id> finished;
         for (const auto seq : active) {
             GGML_ASSERT(dparams[seq].drafting && step_active[seq]);
@@ -2011,7 +1980,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
         if (data.empty()) { return; }
-        collect_launched_step(); // V59
         uint32_t header[3];
         if (data.size() < sizeof(header)) { throw std::runtime_error("truncated MTP state"); }
         std::memcpy(header, data.data(), sizeof(header));
@@ -2060,7 +2028,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     std::function<void()> checkpoint(llama_seq_id seq_id) override {
         const auto restore = checkpoint_mtp(seq_id);
-        return [this, restore]() { collect_launched_step(); restore(*this); };
+        return [this, restore]() { restore(*this); };
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
@@ -3124,22 +3092,6 @@ std::function<void()> common_speculative_checkpoint(common_speculative * spec, l
     };
 }
 
-bool common_speculative_transfer_sequence(common_speculative * src, common_speculative * dst, llama_seq_id seq_id) {
-    if (src == dst) { return true; }
-    if (!src || !dst || src->impls.size() != 1 || dst->impls.size() != 1 ||
-            src->impls[0]->type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP ||
-            dst->impls[0]->type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP || seq_id < 0 ||
-            (size_t) seq_id >= src->dparams.size() || (size_t) seq_id >= dst->dparams.size()) { return false; }
-    auto & from = static_cast<common_speculative_impl_draft_mtp &>(*src->impls[0]);
-    auto & to   = static_cast<common_speculative_impl_draft_mtp &>(*dst->impls[0]);
-    if (from.n_embd != to.n_embd || from.n_mtp_layers != to.n_mtp_layers || from.n_seq != to.n_seq ||
-            from.is_mem_shared || to.is_mem_shared || src->dparams[seq_id].drafting || dst->dparams[seq_id].drafting) { return false; }
-    from.checkpoint_mtp(seq_id)(to);
-    dst->impl_last[seq_id] = src->impl_last[seq_id] ? dst->impls[0].get() : nullptr;
-    dst->dparams[seq_id] = src->dparams[seq_id];
-    return true;
-}
-
 void common_speculative_set_enabled(common_speculative * spec, llama_seq_id seq_id, bool enabled) {
     if (!spec) { return; }
     for (auto & impl : spec->impls) {
@@ -3270,59 +3222,9 @@ bool common_speculative_supports_draft_step(const common_speculative * spec) {
             static_cast<const common_speculative_impl_draft_mtp &>(*spec->impls[0]).supports_step();
 }
 
-static void common_speculative_step_finished(common_speculative * spec, common_speculative_impl_draft_mtp & impl,
-        const std::vector<llama_seq_id> & finished) {
-    for (const auto seq : finished) {
-        auto & dp = spec->dparams[seq];
-        if (!dp.result->empty()) {
-            spec->impl_last[seq] = &impl;
-            ++impl.n_gen_drafts;
-            impl.n_gen_tokens += dp.result->size();
-        }
-        dp.drafting = false;
-    }
-}
-
-bool common_speculative_draft_step_launch(common_speculative * spec) {
-    GGML_ASSERT(common_speculative_supports_draft_step(spec));
-    auto & impl = static_cast<common_speculative_impl_draft_mtp &>(*spec->impls[0]);
-    try {
-        common_time_meas timer(impl.t_draft_us, !impl.gen_perf);
-        if (!impl.step_on_finished) {
-            impl.step_on_finished = [spec, &impl](const std::vector<llama_seq_id> & f) { common_speculative_step_finished(spec, impl, f); };
-        }
-        return impl.draft_step_launch(spec->dparams);
-    } catch (...) {
-        impl.step_launched = false;
-        impl.step_launched_dparams = nullptr;
-        impl.step_launched_active.clear();
-        impl.reset_steps(spec->dparams);
-        throw;
-    }
-}
-
-void common_speculative_draft_step_collect(common_speculative * spec) {
-    GGML_ASSERT(common_speculative_supports_draft_step(spec));
-    auto & impl = static_cast<common_speculative_impl_draft_mtp &>(*spec->impls[0]);
-    if (!impl.step_launched) { return; }
-    try {
-        common_time_meas timer(impl.t_draft_us, !impl.gen_perf);
-        common_speculative_step_finished(spec, impl, impl.draft_step_collect(spec->dparams));
-    } catch (...) {
-        impl.reset_steps(spec->dparams);
-        throw;
-    }
-}
-
-bool common_speculative_draft_step_pending(const common_speculative * spec) {
-    return common_speculative_supports_draft_step(spec) &&
-            static_cast<const common_speculative_impl_draft_mtp &>(*spec->impls[0]).step_launched;
-}
-
 void common_speculative_draft_step(common_speculative * spec) {
     GGML_ASSERT(common_speculative_supports_draft_step(spec));
     auto & impl = static_cast<common_speculative_impl_draft_mtp &>(*spec->impls[0]);
-    GGML_ASSERT(!impl.step_launched);
     try {
         common_time_meas timer(impl.t_draft_us, !impl.gen_perf);
         for (const auto seq : impl.draft_step(spec->dparams)) {

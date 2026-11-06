@@ -2,6 +2,9 @@
 #include <cstdint>
 #include <utility>
 #include <vector>
+
+// Scoped to graph reservation only; never changes live recurrent states or rollback depth.
+extern thread_local uint32_t llama_recurrent_reserve_sequences;
 // Every equal-sequence shape within a small decode microbatch. Reserving each
 // legal shape covers both recurrent single-token and multi-token paths.
 inline std::vector<std::pair<uint32_t, uint32_t>> llama_pipeline_reserve_shapes(
