@@ -1,6 +1,8 @@
 # ParaFlow · 并流
 
-让多张 GPU 接力，让多路推理并行。
+**English** | [简体中文](README.zh-CN.md)
+
+Multiple GPUs working as a pipeline for concurrent inference.
 
 ParaFlow is a multi-GPU inference engine built on llama.cpp. It adds pipeline request scheduling, native MTP scheduling, dynamic KV management, and recurrent-state memory optimizations for PCIe multi-GPU systems.
 
@@ -8,7 +10,7 @@ This repository is a **private pre-release source snapshot**. Synchronizing it d
 
 ## Complete, unrestricted core
 
-The pipeline scheduler, recurrent-state implementation, and all build dependencies are included as source. Commercial tiers, GPU UUID entitlement checks, activation codes, and the binary-only core delivery boundary have been removed. Directories historically named `paraflow-private` are ordinary source modules compiled by CMake; they do not require a separate proprietary kernel.
+The pipeline scheduler, recurrent-state implementation, and supporting core modules are included as source. Commercial tiers, GPU UUID entitlement checks, activation codes, and the binary-only core delivery boundary have been removed. Directories historically named `paraflow-private` are ordinary source modules compiled by CMake; they do not require a separate proprietary kernel.
 
 Model weights and their licenses remain separate. Credentials, clinical data, private prompts, raw benchmark outputs, and machine access configuration are excluded.
 
