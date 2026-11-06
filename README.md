@@ -1,72 +1,134 @@
-# ParaFlow · 并流
+# ParaFlow
 
-**English** | [简体中文](README.zh-CN.md)
+**Multi-GPU pipeline inference for llama.cpp.**
 
-Multiple GPUs working as a pipeline for concurrent inference.
+ParaFlow turns several GPUs into a decode pipeline that stays busy: requests are split into lanes and staggered across GPUs. Upstream layer split runs one batch at a time; ParaFlow fills the idle stages with the next lane.
 
-ParaFlow is a multi-GPU inference engine built on llama.cpp. It adds pipeline request scheduling, native MTP scheduling, dynamic KV management, and recurrent-state memory optimizations for PCIe multi-GPU systems.
+PCIe is the design target, not a fallback. ParaFlow does not need NVLink; PCIe 2.0 has been tested, and ordinary PCIe 2.0/3.0 servers can keep all GPUs busy without a tensor-parallel rewrite.
 
-This repository is a **private pre-release source snapshot**. Synchronizing it does not publish a release or change repository visibility.
+- **PCIe-first**: PP plus multiple lanes scale on ordinary PCIe 2.0/3.0 servers.
+- **Small cards count**: 2×V100 16 GB at C8 reaches 225.7 t/s, above one V100 32 GB at 147.0 t/s.
+- **High-concurrency throughput**: 6×3080 Ti C60 1,454 t/s; 8×V100 C80 1,101 t/s, about 4.9× official.
+- **Source-complete**: stays llama.cpp; model format and quantization are unchanged.
 
-## Complete, unrestricted core
+> Status: pre-release source snapshot.
 
-The pipeline scheduler, recurrent-state implementation, and supporting core modules are included as source. Commercial tiers, GPU UUID entitlement checks, activation codes, and the binary-only core delivery boundary have been removed. Directories historically named `paraflow-private` are ordinary source modules compiled by CMake; they do not require a separate proprietary kernel.
+## Multi-GPU acceleration: keep every stage fed
 
-Model weights and their licenses remain separate. Credentials, clinical data, private prompts, raw benchmark outputs, and machine access configuration are excluded.
+Layer split gives you the stages. It does not automatically keep them busy.
 
-## Build
+With upstream llama.cpp, one batch moves through the GPUs at a time. While it samples, waits for KV, or moves between prompt chunks, the other stages have nothing to do. ParaFlow keeps multiple lanes in the pipeline:
 
-The validated baseline is source snapshot `89fcb8089e3f`. Current source also includes the later server-parameter documentation update. `PARAFLOW-SOURCE.json` maps every canonical source file to its repository path and SHA-256.
+![Lane scheduling](docs/lane-schedule.en.png)
 
-CPU-only build:
+The GPU count does not change. Stage 1 can process lane B while stage 0 prepares lane C, and a finished lane can be sampled without draining the whole pipeline. ParaFlow combines pipeline lanes, asynchronous decode tickets, dynamic KV, and MTP so the wait between stages is filled by the next lane.
+
+## Performance
+
+### Decode
+
+![ParaFlow scaling](docs/performance.en.png)
+
+*Total decode throughput vs concurrency. Qwen3.8-27B Q8, MTP3, 256 output tokens; official llama.cpp and ParaFlow measured at the same concurrency.*
+
+- **6× RTX 3080 Ti 12 GB**: C60 = **1,454 t/s**. The curve is still rising at C60; further concurrency was blocked by the context budget, not by a throughput plateau.
+- **8× V100 16 GB**: C80 = **1,101 t/s** vs official 225 t/s, **4.9×**. The point is the mean of repeated C80 runs.
+- **2× V100 16 GB vs 1× V100 32 GB**, C8: **225.7 vs 147.0 t/s** (+53.5%). Per-GPU work match: 225.7 vs 2×112.1 = 224.2 t/s, **≈100%**.
+- At C1 the two engines are close. The acceleration comes from concurrency, not from making a single request faster.
+
+These runs used small-memory cards. The same model and scheduler apply to large-memory cards, where more layers and context stay resident and the GPU cores can be driven harder.
+
+### Prefill
+
+TBD. Add same-model, same-GPU-count, same-input-length prefill throughput before publication.
+
+### Context
+
+- 6× RTX 3080 Ti total KV pool: **432K tokens** measured.
+- 8× V100 total KV pool: **TBD** (target ~1M; to be measured).
+
+## Quick start
+
+Tested on V100 (SM70) and RTX 3080 Ti (SM86); Linux and CUDA are required. Build for RTX 3080 Ti (SM86; use `70` for V100):
 
 ```sh
-cmake -S . -B build-cpu \
-  -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=OFF \
-  -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=ON \
-  -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF
-cmake --build build-cpu --target llama-server test-server-loop-guard -j4
-ctest --test-dir build-cpu --output-on-failure -R '^test-server-loop-guard$'
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 \
+  -DGGML_CUDA_GRAPHS=ON -DGGML_NATIVE=OFF \
+  -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_UI=OFF
+cmake --build build --target llama-server -j8
 ```
 
-V100 CUDA build (SM70):
+Launch a 4-GPU layer-split server. Adjust paths, tensor split, context, and slots for your hardware:
 
 ```sh
-cmake -S . -B build-sm70 \
-  -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON \
-  -DCMAKE_CUDA_ARCHITECTURES=70 -DGGML_CUDA_GRAPHS=ON \
-  -DGGML_NATIVE=OFF -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=ON \
-  -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF
-cmake --build build-sm70 --target llama-server test-llama-context -j4
+./build/bin/llama-server \
+  -m /models/Qwen3.8-27B.Q8_0.gguf \
+  -sm layer -ts 1,1,1,1 -ngl 99 \
+  -c 131072 -np 16 \
+  -fa on -ctk q8_0 -ctv q8_0 \
+  --no-kv-unified \
+  --pipe-lanes 4 \
+  --kv-dynamic --kv-dynamic-seq-max 8192 \
+  --spec-type draft-mtp --spec-draft-n-max 3 \
+  --host 0.0.0.0 --port 8080
 ```
 
-Use a CUDA toolkit and host compiler compatible with each other. RTX 3080 Ti uses architecture `86` instead of `70`. Choose build parallelism according to available RAM. Source validation included a clean CPU build and a full SM70 build; this synchronization does not claim a new CUDA rebuild or a new performance measurement.
+Call it:
 
-## ParaFlow options
+```sh
+curl http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "Qwen3.8-27B.Q8_0.gguf",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "temperature": 0.2,
+    "max_tokens": 256,
+    "mtp": true,
+    "speculative.n_max": 3
+  }'
+```
 
-The [server documentation](tools/server/README.md) describes the differences from upstream, including:
+## The scaling recipe
 
-- `--pipe-lanes`, `--pipe-fuse`, `--pipe-prefill-chunk`, `--pipe-prefill-lanes`, and `--pipe-pf-inflight`.
-- `--kv-dynamic`, `--kv-dynamic-seq-max`, `--kv-spill`, and `--system-cache-mib`.
-- `--vip` and request-level `priority`.
-- `--loop-guard` / `--no-loop-guard`; loop protection defaults **off**.
+For multi-GPU acceleration, these are the controls that matter:
 
-Request-level MTP is controlled independently by `mtp` and `speculative.n_max`. The model must support the selected MTP path. Shared KV capacity, per-sequence context, concurrency, and memory overhead must be budgeted together.
+- `--pipe-lanes N`: set it to the GPU count — one lane per GPU. Start there, then adjust if KV and scheduling pressure require it.
+- `-np N`: number of server slots. Raise it with concurrency; the throughput curve is measured over slots.
+- `-c N`: with dynamic KV, this is the **shared** token budget, not the per-slot context.
+- `--kv-dynamic-seq-max N`: per-sequence cap; required with dynamic KV.
+- `--no-kv-unified`: required for pipeline mode.
+- `--spec-draft-n-max N`: MTP depth. More depth can raise accepted tokens per verification step, but costs KV and verify rows.
 
-Keep CUDA graphs enabled for the tested configurations. Use NVIDIA persistence mode and a resident NVML or `nvidia-smi dmon` sampler when benchmarking. Repeatedly starting `nvidia-smi` can materially perturb MTP timing on tested V100 environments.
+Dynamic KV also requires CUDA KV offload and Flash Attention; pipeline mode requires `--no-kv-unified`.
 
-## Validation boundaries
+Start with the default ubatch. If a configuration runs out of memory, lower `-np` or add cards; tune `-ub` only after measuring.
 
-The unrestricted-core acceptance covered CPU checks, a full SM70 source build, 27 scoped full-model correctness/function cases across three trained models, and exact-output RAM paging/restoration checks. This is acceptance with documented qualifications, not a claim that every numerical test passes.
+## Other options
 
-A tiny Q4 AR/MTP equality test retains a documented near-tie split also present in the accepted reference. A Huatuo C3/MTP5 sanity point had median 172.6 tokens/s versus historical 180.8 (-4.54%); this was within the declared 5% sanity bound and does not establish statistical equivalence. Earlier numerical, output-branch, and short-window limitations remain applicable. Benchmarks are model-, configuration-, and hardware-specific.
+These do not change the multi-GPU scaling model; they are policy knobs for production serving.
 
-The current real eight-card V100 16GB scaling run is incomplete and includes thermal/memory failures. It is not advertised as a completed performance curve here.
+| Option | What it does |
+|---|---|
+| `--vip` + `priority: 1` | Pause ordinary slots in place while a VIP request runs. |
+| `--kv-spill` | Move a frozen request to host RAM when the KV pool is full. Requires unified or dynamic KV. |
+| `--system-cache-mib N` | Cache shared system-prefix states in host RAM. Requires non-unified KV. |
+| `--loop-guard` | Stop long exact-repetition loops; off by default. |
 
-Upstream workflow templates are retained under [contrib/upstream-github-workflows](contrib/upstream-github-workflows) rather than activated under `.github/workflows`. No release, scheduled publication, or package deployment workflow is enabled by this source synchronization.
+Full list and constraints: [parameter documentation](tools/server/README.md).
 
-## Upstream, license, and community
+## Limits
 
-Based on [llama.cpp](https://github.com/ggml-org/llama.cpp). The upstream MIT license, authorship, and third-party notices are retained in [LICENSE](LICENSE), [AUTHORS](AUTHORS), and [licenses](licenses/). See [README.upstream.md](README.upstream.md) for upstream documentation.
+- Linux + CUDA for the pipeline and dynamic-KV paths.
+- Native MTP requires a model with NextN/MTP heads.
+- No multi-node pipeline in this source snapshot.
+- Model weights and their licenses are separate.
 
-Community discussion: [LINUX DO](https://linux.do/).
+## License and community
+
+ParaFlow is based on [llama.cpp](https://github.com/ggml-org/llama.cpp). The upstream MIT license, authorship, and third-party notices are retained in [LICENSE](LICENSE), [AUTHORS](AUTHORS), and [licenses](licenses/). Upstream documentation is preserved in [README.upstream.md](README.upstream.md).
+
+The engine core is fully included as source and built by CMake; it does not require a separate proprietary kernel.
+
+Contact: dongyiwan1988@qq.com  
+Community: [LINUX DO](https://linux.do/).

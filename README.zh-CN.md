@@ -1,72 +1,134 @@
 # ParaFlow · 并流
 
-[English](README.md) | **简体中文**
+**基于 llama.cpp 的多 GPU 流水线推理引擎。**
 
-让多张 GPU 接力，让多路推理并行。
+ParaFlow 把多张 GPU 组织成一条持续满载的并发推理流水线：请求分成多条 lane，在不同 GPU 上错峰推进；官方 layer split 一次只跑一个批次，空出来的 stage 由下一条 lane 补上。
 
-ParaFlow 是基于 llama.cpp 开发的多 GPU 推理引擎，面向 PCIe 多卡平台，提供流水线请求调度、原生 MTP 调度、动态 KV 管理和循环状态显存优化。
+ParaFlow 是为 PCIe 多卡设计的，不是 NVLink 的降级替代。PCIe 2.0 已实测；普通 PCIe 2.0/3.0 服务器也能把多卡吃满，不需要 NVLink，也不需要把模型改成 TP。
 
-当前仓库是**私有预发布源码快照**。同步源码不代表正式发布，也不会改变仓库可见性。
+- **PCIe 优先**：PP + 多 lane，普通 PCIe 2.0/3.0 多卡机就能扩展。
+- **小卡也能加速**：2×V100 16G 在 C8 达到 225.7 t/s，高于单张 V100 32G 的 147.0 t/s。
+- **高并发吞吐**：6×3080Ti C60 1,454 t/s；8×V100 C80 1,101 t/s，约为官方 4.9×。
+- **源码完整**：基于 llama.cpp，模型格式和量化方式不变。
 
-## 完整、无商业限制的核心
+> 状态：预发布源码快照。
 
-流水线调度器、循环状态实现及相关核心模块均提供完整源码。商业分档、GPU UUID 授权绑定、启动授权码以及仅提供核心二进制的交付限制均已移除。沿用历史名称的 `paraflow-private` 目录是由 CMake 直接编译的普通源码模块，不需要另行获取闭源内核。
+## 多卡加速：让每个 stage 都有活干
 
-模型权重及其许可证独立于推理引擎。仓库不包含凭据、临床数据、私有提示词、原始测试输出或机器接入配置。
+Layer split 只是把层分到各张卡上，不会自动让这些 stage 保持忙碌。
 
-## 构建
+上游 llama.cpp 一次只推进一个批次。这个批次在采样、等待 KV、或者两段 prompt 之间时，其他 stage 是空着的。ParaFlow 让多条 lane 同时在流水线里跑：
 
-已验收的基线为源码快照 `89fcb8089e3f`。当前源码还包含后续补充的服务器参数文档。`PARAFLOW-SOURCE.json` 记录每个主源码文件对应的仓库路径和 SHA-256。
+![lane 调度](docs/lane-schedule.zh.png)
 
-仅 CPU 构建：
+卡数没有变。区别是：stage 1 处理 lane B 时，stage 0 已经在准备 lane C；某条 lane 的 logits 就绪后可以先采样，不必把整条流水线同步排空。ParaFlow 把 pipeline lane、异步 decode ticket、动态 KV 和 MTP 组合起来，让 stage 之间的等待被下一条 lane 填上。
+
+## 性能
+
+### Decode
+
+![ParaFlow 扩展曲线](docs/performance.zh.png)
+
+*总 decode 吞吐对并发数。Qwen3.8-27B Q8，MTP3，输出 256 token；官方 llama.cpp 和 ParaFlow 在同并发下测量。*
+
+- **6× RTX 3080 Ti 12 GB**：C60 = **1,454 t/s**。曲线到 C60 仍在上升；进一步加并发受上下文总量限制，没法继续测。
+- **8× V100 16 GB**：C80 = **1,101 t/s**，官方 225 t/s，**4.9×**。该点是多次 C80 运行的均值。
+- **2× V100 16 GB 对 1× V100 32 GB**，C8：**225.7 vs 147.0 t/s**（+53.5%）。每 GPU 同工作量：225.7 vs 2×112.1 = 224.2 t/s，**≈100%**。
+- C1 时两个引擎差不多。加速来自并发，不是把单条请求变快。
+
+这些测试主要在小显存卡上完成。同样的模型和调度在大显存卡上依然成立；大卡能把更多层、上下文和并发留在 GPU 上，进一步榨干多核算力。
+
+### Prefill
+
+TBD。发布前补同模型、同卡数、同输入长度的 prefill 吞吐。
+
+### 上下文
+
+- 6× RTX 3080 Ti 总 KV 池：实测 **432K tokens**。
+- 8× V100 总 KV 池：**TBD**（目标约 1M，待实测）。
+
+## 快速开始
+
+已在 V100（SM70）和 RTX 3080 Ti（SM86）上验证；要求 Linux + CUDA。RTX 3080 Ti（SM86；V100 用 `70`）构建：
 
 ```sh
-cmake -S . -B build-cpu \
-  -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=OFF \
-  -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=ON \
-  -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF
-cmake --build build-cpu --target llama-server test-server-loop-guard -j4
-ctest --test-dir build-cpu --output-on-failure -R '^test-server-loop-guard$'
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 \
+  -DGGML_CUDA_GRAPHS=ON -DGGML_NATIVE=OFF \
+  -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_UI=OFF
+cmake --build build --target llama-server -j8
 ```
 
-V100 CUDA 构建（SM70）：
+启动 4 卡 layer split 服务。路径、tensor split、上下文和 slot 数按实际硬件调整：
 
 ```sh
-cmake -S . -B build-sm70 \
-  -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON \
-  -DCMAKE_CUDA_ARCHITECTURES=70 -DGGML_CUDA_GRAPHS=ON \
-  -DGGML_NATIVE=OFF -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=ON \
-  -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF
-cmake --build build-sm70 --target llama-server test-llama-context -j4
+./build/bin/llama-server \
+  -m /models/Qwen3.8-27B.Q8_0.gguf \
+  -sm layer -ts 1,1,1,1 -ngl 99 \
+  -c 131072 -np 16 \
+  -fa on -ctk q8_0 -ctv q8_0 \
+  --no-kv-unified \
+  --pipe-lanes 4 \
+  --kv-dynamic --kv-dynamic-seq-max 8192 \
+  --spec-type draft-mtp --spec-draft-n-max 3 \
+  --host 0.0.0.0 --port 8080
 ```
 
-请使用彼此兼容的 CUDA 工具链与主机编译器。RTX 3080 Ti 对应的架构值是 `86`，应替换示例中的 `70`。构建并行度需要结合可用内存选择。源码验收已包含干净的 CPU 构建和完整的 SM70 构建；此次源码同步没有重新执行 CUDA 构建或性能测试。
+调用：
 
-## ParaFlow 参数
+```sh
+curl http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "Qwen3.8-27B.Q8_0.gguf",
+    "messages": [{"role": "user", "content": "你好"}],
+    "temperature": 0.2,
+    "max_tokens": 256,
+    "mtp": true,
+    "speculative.n_max": 3
+  }'
+```
 
-[服务器文档](tools/server/README.md) 说明了与上游不同的参数，包括：
+## 多卡加速怎么调
 
-- `--pipe-lanes`、`--pipe-fuse`、`--pipe-prefill-chunk`、`--pipe-prefill-lanes` 和 `--pipe-pf-inflight`。
-- `--kv-dynamic`、`--kv-dynamic-seq-max`、`--kv-spill` 和 `--system-cache-mib`。
-- `--vip` 与请求级 `priority`。
-- `--loop-guard` / `--no-loop-guard`；循环输出保护默认**关闭**。
+真正影响多卡加速的参数就这几个：
 
-请求级 MTP 通过 `mtp` 和 `speculative.n_max` 独立控制。模型必须支持所选的 MTP 路径。共享 KV 总池、单会话上下文、并发数以及其他显存开销需要一并规划。
+- `--pipe-lanes N`：直接设为 GPU 数，一卡一条 lane；先跑满，再根据 KV 和调度压力调整。
+- `-np N`：服务 slot 数。提高并发时一起加；吞吐曲线是按 slot 数测的。
+- `-c N`：开启动态 KV 后，这是**共享** token 预算，不是单 slot 上下文。
+- `--kv-dynamic-seq-max N`：单 sequence 上限；开启动态 KV 时必填。
+- `--no-kv-unified`：流水线模式必须。
+- `--spec-draft-n-max N`：MTP 深度。更深可以提高每次验证的产出，但更占 KV 和验证行数。
 
-已测试的配置保持 CUDA 图开启。进行性能测试时，请开启 NVIDIA 持久模式，并使用常驻 NVML 或 `nvidia-smi dmon` 采样。在已测试的 V100 环境中，反复启动新的 `nvidia-smi` 进程会明显干扰 MTP 计时。
+动态 KV 还要求 CUDA KV offload 和 Flash Attention；流水线模式要求 `--no-kv-unified`。
 
-## 验收边界
+先用默认 ubatch；如果显存不够，降低 `-np` 或加卡，`-ub` 等测量后再调。
 
-移除商业限制后的核心验收包括 CPU 检查、完整 SM70 源码构建、三个完整模型上的27项限定范围正确性／功能用例，以及输出完全一致的 RAM 换出与恢复检查。这是保留已知边界的验收，不代表所有数值测试均已通过。
+## 其他参数
 
-小型 Q4 模型的 AR／MTP 严格一致性测试仍保留一项已知分歧：候选 token 概率非常接近，已接受的参考版本也存在同样现象。华佗 C3／MTP5 单点检查的吞吐中位数为172.6 tokens/s，历史值为180.8，差异为 -4.54%；该结果处于事先设定的5%检查边界内，但不能据此认定统计等效。此前记录的数值、输出分叉和短窗口限制仍然适用。性能数据均依赖具体模型、配置和硬件。
+这些不改变多卡扩展模型，属于生产策略：
 
-当前真实八卡 V100 16GB 扩展性测试尚未完成，其中包含热降频和内存相关失败；这里不将它作为已经完成的性能曲线宣传。
+| 参数 | 作用 |
+|---|---|
+| `--vip` + `priority: 1` | VIP 请求运行时原地暂停普通 slot。 |
+| `--kv-spill` | KV 池满时把冻结请求换到主机内存。要求 unified 或 dynamic KV。 |
+| `--system-cache-mib N` | 用主机内存缓存共享 system 前缀状态。要求 non-unified KV。 |
+| `--loop-guard` | 遇到长段完全重复输出时停止；默认关闭。 |
 
-上游工作流模板保留在 [contrib/upstream-github-workflows](contrib/upstream-github-workflows)，未放在会自动生效的 `.github/workflows` 中。此次源码同步不会启用正式发布、定时发布或软件包部署工作流。
+完整参数和约束见[参数文档](tools/server/README.md)。
 
-## 上游、许可与社区
+## 边界
 
-基于 [llama.cpp](https://github.com/ggml-org/llama.cpp)。上游 MIT 许可证、作者信息和第三方许可声明均保留在 [LICENSE](LICENSE)、[AUTHORS](AUTHORS) 和 [licenses](licenses/) 中。上游文档快照见 [README.upstream.md](README.upstream.md)。
+- 流水线和动态 KV 路径依赖 Linux + CUDA。
+- 原生 MTP 要求模型带 NextN/MTP 头。
+- 这份源码没有多机流水线。
+- 模型权重及其许可证独立。
 
+## 许可与社区
+
+ParaFlow 基于 [llama.cpp](https://github.com/ggml-org/llama.cpp)。上游 MIT 许可证、作者信息和第三方声明保留在 [LICENSE](LICENSE)、[AUTHORS](AUTHORS) 和 [licenses](licenses/) 中；上游文档见 [README.upstream.md](README.upstream.md)。
+
+引擎核心以源码形式完整包含在仓库中，由 CMake 直接构建，不需要单独的闭源内核。
+
+联系方式：dongyiwan1988@qq.com  
 社区交流：[LINUX DO](https://linux.do/)。
