@@ -40,12 +40,12 @@ These runs used small-memory cards. The same model and scheduler apply to large-
 
 ### Prefill
 
-TBD. Add same-model, same-GPU-count, same-input-length prefill throughput before publication.
+- C1 / 4K input: **889 t/s** (single measured point; 16K, 32K, and C8×4K still pending; official comparison not run).
 
 ### Context
 
 - 6× RTX 3080 Ti total KV pool: **432K tokens** measured.
-- 8× V100 total KV pool: **TBD** (target ~1M; to be measured).
+- 8× V100 total KV pool: **1.088M tokens** measured (1088Ki / 34 slots, 32K per-sequence cap; first and last slot outputs matched).
 
 ## Quick start
 
