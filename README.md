@@ -1,5 +1,7 @@
 # ParaFlow
 
+**English** | [简体中文](README.zh-CN.md)
+
 **Multi-GPU pipeline inference for llama.cpp.**
 
 ParaFlow turns several GPUs into a decode pipeline that stays busy: requests are split into lanes and staggered across GPUs. Upstream layer split runs one batch at a time; ParaFlow fills the idle stages with the next lane.
