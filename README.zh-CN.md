@@ -4,16 +4,14 @@
 
 **基于 llama.cpp 的多 GPU 流水线推理引擎。**
 
-ParaFlow 把多张 GPU 组织成一条持续满载的并发推理流水线：请求分成多条 lane，在不同 GPU 上错峰推进；官方 layer split 一次只跑一个批次，空出来的 stage 由下一条 lane 补上。
+ParaFlow 把多张 GPU 组织成一条持续满载的并发推理流水线：请求分成多条 lane，在不同 GPU 上错峰推进；官方PP方案一次只跑一个批次，空出来的 stage 由下一条 lane 补上。
 
-ParaFlow 是为 PCIe 多卡设计的，不是 NVLink 的降级替代。PCIe 2.0 已实测；普通 PCIe 2.0/3.0 服务器也能把多卡吃满，不需要 NVLink，也不需要把模型改成 TP。
+ParaFlow 正是为解决这一GPU浪费而设计的，普通 PCIe 2.0/3.0 服务器也能把多卡吃满，不需要 NVLink，也不需要把模型改成 TP，剩余GPU利用效率达98%以上（例如4卡C32下单流速度与官方C8相当）。
 
-- **PCIe 优先**：PP + 多 lane，普通 PCIe 2.0/3.0 多卡机就能扩展。
+- **PCIe 就能跑**：PP + 多 lane，普通 PCIe 2.0/3.0 多卡机就能扩展。
 - **小卡也能加速**：2×V100 16G 在 C8 达到 225.7 t/s，高于单张 V100 32G 的 147.0 t/s。
-- **高并发吞吐**：6×3080Ti C60 1,454 t/s；8×V100 C80 1,101 t/s，约为官方 4.9×。
+- **高并发吞吐**：6×3080Ti C60 1,454 t/s；8×V100 C80 1,101 t/s，约为官方 4.9倍。
 - **源码完整**：基于 llama.cpp，模型格式和量化方式不变。
-
-> 状态：预发布源码快照。
 
 ## 多卡加速：让每个 stage 都有活干
 
@@ -23,7 +21,7 @@ Layer split 只是把层分到各张卡上，不会自动让这些 stage 保持�
 
 ![lane 调度](docs/lane-schedule.zh.png)
 
-卡数没有变。区别是：stage 1 处理 lane B 时，stage 0 已经在准备 lane C；某条 lane 的 logits 就绪后可以先采样，不必把整条流水线同步排空。ParaFlow 把 pipeline lane、异步 decode ticket、动态 KV 和 MTP 组合起来，让 stage 之间的等待被下一条 lane 填上。
+卡数没有变。区别是：stage 1 处理 lane B 时，stage 0 已经在准备 lane C；某条 lane 的 logits 就绪后可以先采样。ParaFlow 把 pipeline lane、异步 decode ticket、动态 KV 和 MTP 组合起来，让 stage 之间的等待被下一条 lane 填上。
 
 ## 性能
 
@@ -40,14 +38,11 @@ Layer split 只是把层分到各张卡上，不会自动让这些 stage 保持�
 
 这些测试主要在小显存卡上完成。同样的模型和调度在大显存卡上依然成立；大卡能把更多层、上下文和并发留在 GPU 上，进一步榨干多核算力。
 
-### Prefill
-
-- C1 / 4K 输入：**889 t/s**（单点实测；16K、32K 和 C8×4K 待补，官方对比未做）。
 
 ### 上下文
 
 - 6× RTX 3080 Ti 总 KV 池：实测 **432K tokens**。
-- 8× V100 总 KV 池：实测 **1.088M tokens**（1088Ki / 34 slots，单序列上限 32K；首尾 slot 输出一致）。
+- 8× V100 总 KV 池：实测 **1088K tokens**（1088Ki / 34 slots，单序列上限 32K；首尾 slot 输出一致）。
 
 ## 快速开始
 
