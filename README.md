@@ -37,7 +37,7 @@ The GPU count does not change. Stage 1 can process lane B while stage 0 prepares
 - **2× V100 16 GB vs 1× V100 32 GB**, C8: **225.7 vs 147.0 t/s** (+53.5%). Per-GPU work match: 225.7 vs 2×112.1 = 224.2 t/s, **≈100%**.
 - At C1 the two engines are close. The acceleration comes from concurrency, not from making a single request faster.
 
-These runs used small-memory cards. The same model and scheduler apply to large-memory cards, where more layers and context stay resident and the GPU cores can be driven harder.
+These tests were mainly run on small-memory cards. The same model and scheduler remain valid on large-memory cards, which can hold more context and get more out of the GPU cores.
 
 ### Context
 
