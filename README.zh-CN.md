@@ -121,6 +121,10 @@ curl http://localhost:8080/v1/chat/completions \
 - 这份源码没有多机流水线。
 - 模型权重及其许可证独立。
 
+## 友链
+
+- [LINUX DO](https://linux.do/)
+
 ## 许可与社区
 
 ParaFlow 基于 [llama.cpp](https://github.com/ggml-org/llama.cpp)。上游 MIT 许可证、作者信息和第三方声明保留在 [LICENSE](LICENSE)、[AUTHORS](AUTHORS) 和 [licenses](licenses/) 中；上游文档见 [README.upstream.md](README.upstream.md)。
