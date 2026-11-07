@@ -1,5 +1,7 @@
 # ParaFlow · 并流
 
+[English](README.md) | **简体中文**
+
 **基于 llama.cpp 的多 GPU 流水线推理引擎。**
 
 ParaFlow 把多张 GPU 组织成一条持续满载的并发推理流水线：请求分成多条 lane，在不同 GPU 上错峰推进；官方 layer split 一次只跑一个批次，空出来的 stage 由下一条 lane 补上。
