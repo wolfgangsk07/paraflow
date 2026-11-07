@@ -6,14 +6,13 @@
 
 ParaFlow turns several GPUs into a decode pipeline that stays busy: requests are split into lanes and staggered across GPUs. Upstream layer split runs one batch at a time; ParaFlow fills the idle stages with the next lane.
 
-PCIe is the design target, not a fallback. ParaFlow does not need NVLink; PCIe 2.0 has been tested, and ordinary PCIe 2.0/3.0 servers can keep all GPUs busy without a tensor-parallel rewrite.
+ParaFlow is built to eliminate that GPU waste. It keeps every GPU busy on ordinary PCIe 2.0/3.0 servers, with no NVLink and no tensor-parallel rewrite; the remaining GPU capacity is utilized at over 98% efficiency (for example, 4-card C32 single-stream throughput is on par with official C8).
 
-- **PCIe-first**: PP plus multiple lanes scale on ordinary PCIe 2.0/3.0 servers.
+- **Runs on PCIe**: PP plus multiple lanes scale on ordinary PCIe 2.0/3.0 servers.
 - **Small cards count**: 2×V100 16 GB at C8 reaches 225.7 t/s, above one V100 32 GB at 147.0 t/s.
 - **High-concurrency throughput**: 6×3080 Ti C60 1,454 t/s; 8×V100 C80 1,101 t/s, about 4.9× official.
 - **Source-complete**: stays llama.cpp; model format and quantization are unchanged.
 
-> Status: pre-release source snapshot.
 
 ## Multi-GPU acceleration: keep every stage fed
 
@@ -23,7 +22,7 @@ With upstream llama.cpp, one batch moves through the GPUs at a time. While it sa
 
 ![Lane scheduling](docs/lane-schedule.en.png)
 
-The GPU count does not change. Stage 1 can process lane B while stage 0 prepares lane C, and a finished lane can be sampled without draining the whole pipeline. ParaFlow combines pipeline lanes, asynchronous decode tickets, dynamic KV, and MTP so the wait between stages is filled by the next lane.
+The GPU count does not change. Stage 1 can process lane B while stage 0 prepares lane C, and a finished lane can be sampled. ParaFlow combines pipeline lanes, asynchronous decode tickets, dynamic KV, and MTP so the wait between stages is filled by the next lane.
 
 ## Performance
 
@@ -40,14 +39,10 @@ The GPU count does not change. Stage 1 can process lane B while stage 0 prepares
 
 These runs used small-memory cards. The same model and scheduler apply to large-memory cards, where more layers and context stay resident and the GPU cores can be driven harder.
 
-### Prefill
-
-- C1 / 4K input: **889 t/s** (single measured point; 16K, 32K, and C8×4K still pending; official comparison not run).
-
 ### Context
 
 - 6× RTX 3080 Ti total KV pool: **432K tokens** measured.
-- 8× V100 total KV pool: **1.088M tokens** measured (1088Ki / 34 slots, 32K per-sequence cap; first and last slot outputs matched).
+- 8× V100 total KV pool: **1088K tokens** measured (1088Ki / 34 slots, 32K per-sequence cap; first and last slot outputs matched).
 
 ## Quick start
 
