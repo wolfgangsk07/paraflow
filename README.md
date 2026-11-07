@@ -4,13 +4,13 @@
 
 **Multi-GPU pipeline inference for llama.cpp.**
 
-ParaFlow turns several GPUs into a decode pipeline that stays busy: requests are split into lanes and staggered across GPUs. Upstream layer split runs one batch at a time; ParaFlow fills the idle stages with the next lane.
+ParaFlow turns several GPUs into a decode pipeline that stays busy: requests are split into lanes and staggered across GPUs. Upstream llama.cpp PP runs one batch at a time; ParaFlow fills the idle stages with the next lane.
 
-ParaFlow is built to eliminate that GPU waste. It keeps every GPU busy on ordinary PCIe 2.0/3.0 servers, with no NVLink and no tensor-parallel rewrite; the remaining GPU capacity is utilized at over 98% efficiency (for example, 4-card C32 single-stream throughput is on par with official C8).
+ParaFlow is built to eliminate that GPU waste. It keeps every GPU busy on ordinary PCIe 2.0/3.0 servers, with no NVLink and no tensor-parallel rewrite; the remaining GPU capacity is utilized at over 98% efficiency (for example, 4-card C32 single-stream throughput is on par with upstream llama.cpp at C8).
 
 - **Runs on PCIe**: PP plus multiple lanes scale on ordinary PCIe 2.0/3.0 servers.
 - **Small cards count**: 2×V100 16 GB at C8 reaches 225.7 t/s, above one V100 32 GB at 147.0 t/s.
-- **High-concurrency throughput**: 6×3080 Ti C60 1,454 t/s; 8×V100 C80 1,101 t/s, about 4.9× official.
+- **High-concurrency throughput**: 6×3080 Ti C60 1,454 t/s; 8×V100 C80 1,101 t/s, about 4.9× upstream llama.cpp.
 - **Source-complete**: stays llama.cpp; model format and quantization are unchanged.
 
 
@@ -33,7 +33,7 @@ The GPU count does not change. Stage 1 can process lane B while stage 0 prepares
 *Total decode throughput vs concurrency. Qwen3.8-27B Q8, MTP3, 256 output tokens; official llama.cpp and ParaFlow measured at the same concurrency.*
 
 - **6× RTX 3080 Ti 12 GB**: C60 = **1,454 t/s**. The curve is still rising at C60; further concurrency was blocked by the context budget, not by a throughput plateau.
-- **8× V100 16 GB**: C80 = **1,101 t/s** vs official 225 t/s, **4.9×**. The point is the mean of repeated C80 runs.
+- **8× V100 16 GB**: C80 = **1,101 t/s** vs upstream llama.cpp 225 t/s, **4.9×**. The point is the mean of repeated C80 runs.
 - **2× V100 16 GB vs 1× V100 32 GB**, C8: **225.7 vs 147.0 t/s** (+53.5%). Per-GPU work match: 225.7 vs 2×112.1 = 224.2 t/s, **≈100%**.
 - At C1 the two engines are close. The acceleration comes from concurrency, not from making a single request faster.
 
