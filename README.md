@@ -121,6 +121,10 @@ Full list and constraints: [parameter documentation](tools/server/README.md).
 - No multi-node pipeline in this source snapshot.
 - Model weights and their licenses are separate.
 
+## Friend link
+
+- [LINUX DO](https://linux.do/)
+
 ## License and community
 
 ParaFlow is based on [llama.cpp](https://github.com/ggml-org/llama.cpp). The upstream MIT license, authorship, and third-party notices are retained in [LICENSE](LICENSE), [AUTHORS](AUTHORS), and [licenses](licenses/). Upstream documentation is preserved in [README.upstream.md](README.upstream.md).
