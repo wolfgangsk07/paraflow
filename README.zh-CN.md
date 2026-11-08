@@ -54,7 +54,18 @@ RPC 路径可以把模型跨机展开。局域网内每个节点可以容纳 1 �
 | C16 | 378.4 | 362.4 | 96% | 208.8 |
 | C24 | 476.0 | 443.0 | 93% | 248.4 |
 
-### 快速开始
+### 快速开始：4 卡、3 节点
+
+用一个具体拓扑：节点 A 两张卡，节点 B 一张卡，节点 C 一张卡并担任协调机。
+
+```text
+节点 A（2 GPU）──RPC──┐
+节点 B（1 GPU）──RPC──┼──> 节点 C（1 GPU，运行 llama-server）
+                      │
+客户端 ────────────────┘
+```
+
+**协调机**就是运行 `llama-server` 的那台机器：它接收客户端请求，负责 tokenize、采样和流水线调度，也可以用自己的 GPU 承担一段计算。节点 A、B 只运行 `ggml-rpc-server`，把各自的 GPU 暴露给协调机。
 
 所有节点用同一份源码构建，开启 CUDA 和 RPC：
 
@@ -64,28 +75,41 @@ cmake -S . -B build -DGGML_CUDA=ON -DGGML_RPC=ON \
 cmake --build build --target ggml-rpc-server llama-server -j8
 ```
 
-每个节点启动一个 RPC server。节点 A 有两张卡，就在同一个进程里暴露两张卡：
+节点 A（两张卡，一个 RPC server 进程）：
 
 ```sh
 CUDA_VISIBLE_DEVICES=0,1 ./build/bin/ggml-rpc-server -H 0.0.0.0 -p 50052 -c
 ```
 
-节点 B 同理；如果节点只有一张卡，就设为 `CUDA_VISIBLE_DEVICES=0`。不同机器可以使用同一个端口。
-
-在协调机上把所有 RPC 端点按顺序传给 `llama-server`：
+节点 B（一张卡）：
 
 ```sh
-CUDA_VISIBLE_DEVICES='' ./build/bin/llama-server -m Qwen3.8-27B.Q8_0.gguf \
-  -ngl 99 -sm layer -ts 1,1,1 \
+CUDA_VISIBLE_DEVICES=0 ./build/bin/ggml-rpc-server -H 0.0.0.0 -p 50052 -c
+```
+
+节点 C（协调机，一张本地卡；先启动 A、B，再启动它）：
+
+```sh
+CUDA_VISIBLE_DEVICES=0 ./build/bin/llama-server -m Qwen3.8-27B.Q8_0.gguf \
+  -ngl 99 -sm layer -ts 1,1,1,1 \
   --rpc 10.0.0.11:50052,10.0.0.12:50052 \
   -c 8192 -np 8 -fa on -ctk q8_0 -ctv q8_0 \
-  --no-kv-unified --pipe-lanes 3 --pipe-fuse \
+  --no-kv-unified --pipe-lanes 4 --pipe-fuse \
   --pipe-prefill-chunk 64 --pipe-prefill-lanes 1 \
   --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-ngl 99 \
   --host 0.0.0.0 --port 8080
 ```
 
-`--rpc` 列的是 RPC server，不是单张卡；一个 server 可以暴露多张卡。`-ts` 的个数要和所有 server 暴露的设备数（加本机 GPU）一致，`--pipe-lanes` 用总设备数。上面的例子让协调机只做调度，所以清空了 `CUDA_VISIBLE_DEVICES`；如果协调机也出卡，把它加入可见设备，并在 `-ts` 和 `--rpc` 里补上对应项。RPC 路径目前用静态 KV，不要加 `--kv-dynamic`。RPC server 没有认证，只放在可信局域网，不要暴露公网。
+这里 `--rpc` 只列两个 **RPC server**（A 和 B）；A 的一个 server 暴露两张卡，所以总设备数是 4：
+
+```text
+A 的 2 张 + B 的 1 张 + C 本地 1 张 = 4
+-ts 1,1,1,1
+--pipe-lanes 4
+```
+
+如果协调机 C 不出卡、只做调度，就把它的 `CUDA_VISIBLE_DEVICES` 清空，并把 `-ts`、`--pipe-lanes` 改成 3。RPC 路径目前用静态 KV，不要加 `--kv-dynamic`。RPC server 没有认证，只放在可信局域网，不要暴露公网。
+
 
 ## 快速开始
 
