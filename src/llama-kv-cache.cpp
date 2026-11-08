@@ -275,6 +275,7 @@ llama_kv_cache::llama_kv_cache(
         map_layer_ids[il] = layers.size();
 
         layers.push_back({ il, k, v, k_stream, v_stream, });
+        layer_buft[il] = buft;
     }
 
     if (reuse) {
@@ -296,6 +297,9 @@ llama_kv_cache::llama_kv_cache(
             GGML_ASSERT(map_layer_ids.find(il_reuse) != map_layer_ids.end());
 
             map_layer_ids[il] = map_layer_ids[il_reuse];
+            if (layer_buft.count(il_reuse)) {
+                layer_buft[il] = layer_buft.at(il_reuse);
+            }
 
             LLAMA_LOG_DEBUG("%s: - layer %3d: reuse layer %d, is_swa = %d\n", __func__, il, il_reuse, hparams.is_swa(il));
         }
@@ -442,8 +446,67 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    if (!hparams.no_alloc) {
+        init_rot_resident();
+    }
+
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+}
+
+void llama_kv_cache::init_rot_resident() {
+    const char * env = getenv("LLAMA_ATTN_ROT_RESIDENT");
+    if ((env != nullptr && atoi(env) == 0) || (n_rot_k == 0 && n_rot_v == 0)) {
+        return;
+    }
+    std::vector<ggml_backend_buffer_type_t> bufts;
+    for (const auto & [il, buft] : layer_buft) {
+        GGML_UNUSED(il);
+        if (std::find(bufts.begin(), bufts.end(), buft) == bufts.end()) {
+            bufts.push_back(buft);
+        }
+    }
+    for (auto * buft : bufts) {
+        ggml_init_params params = {
+            /* .mem_size   = */ 2*ggml_tensor_overhead(),
+            /* .mem_buffer = */ nullptr,
+            /* .no_alloc   = */ true,
+        };
+        ggml_context_ptr ctx { ggml_init(params) };
+        ggml_tensor * k = n_rot_k ? ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_rot_k, n_rot_k) : nullptr;
+        ggml_tensor * v = n_rot_v ? ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_rot_v, n_rot_v) : nullptr;
+        if (k) { ggml_format_name(k, "attn_rot_k_resident"); }
+        if (v) { ggml_format_name(v, "attn_rot_v_resident"); }
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        if (!buf) {
+            LLAMA_LOG_WARN("%s: no resident rotation buffer on %s, using per-step inputs\n", __func__, ggml_backend_buft_name(buft));
+            rot_resident.clear();
+            rot_ctxs_bufs.clear();
+            return;
+        }
+        // weights usage: the scheduler runs the rotation where the matrix lives (the layer's device)
+        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        if (k) { ggml_backend_tensor_set(k, attn_rot_hadamard.at(n_rot_k).data(), 0, ggml_nbytes(k)); }
+        if (v) { ggml_backend_tensor_set(v, attn_rot_hadamard.at(n_rot_v).data(), 0, ggml_nbytes(v)); }
+        rot_resident[buft] = { k, v };
+        rot_ctxs_bufs.emplace_back(std::move(ctx), buf);
+    }
+    LLAMA_LOG_INFO("%s: resident attention rotation on %zu device(s) (n_rot_k = %u, n_rot_v = %u)\n", __func__,
+            rot_resident.size(), n_rot_k, n_rot_v);
+}
+
+ggml_tensor * llama_kv_cache::get_k_rot_resident(int32_t il) const {
+    const auto it = layer_buft.find(il);
+    if (it == layer_buft.end()) { return nullptr; }
+    const auto jt = rot_resident.find(it->second);
+    return jt == rot_resident.end() ? nullptr : jt->second.first;
+}
+
+ggml_tensor * llama_kv_cache::get_v_rot_resident(int32_t il) const {
+    const auto it = layer_buft.find(il);
+    if (it == layer_buft.end()) { return nullptr; }
+    const auto jt = rot_resident.find(it->second);
+    return jt == rot_resident.end() ? nullptr : jt->second.second;
 }
 
 bool llama_kv_cache::configure_dynamic_pool() {
@@ -2465,6 +2528,9 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch 
 }
 
 void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
+    if (dst->buffer == nullptr) {
+        return; // no node reads the per-step input (the resident rotation is used), so it was not allocated
+    }
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
     const auto n_rot = dst->ne[0];
@@ -2474,6 +2540,9 @@ void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
 }
 
 void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
+    if (dst->buffer == nullptr) {
+        return; // no node reads the per-step input (the resident rotation is used), so it was not allocated
+    }
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
     const auto n_rot = dst->ne[0];
@@ -3619,6 +3688,14 @@ ggml_tensor * llama_kv_cache_context::build_input_v_idxs(ggml_context * ctx, con
 
 ggml_tensor * llama_kv_cache_context::build_input_k_rot(ggml_context * ctx) const {
     return kv->build_input_k_rot(ctx);
+}
+
+ggml_tensor * llama_kv_cache_context::get_k_rot_resident(int32_t il) const {
+    return kv->get_k_rot_resident(il);
+}
+
+ggml_tensor * llama_kv_cache_context::get_v_rot_resident(int32_t il) const {
+    return kv->get_v_rot_resident(il);
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_v_rot(ggml_context * ctx) const {
