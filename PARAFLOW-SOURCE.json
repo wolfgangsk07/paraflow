@@ -2,12 +2,14 @@
   "schema": 2,
   "project": "ParaFlow",
   "canonical_validated_baseline": "89fcb8089e3ff79dffa239f1d573f0d3e82a599bc2be9c35f61a8b3995badc32",
-  "synchronized_at": 1793945124.681964,
+  "synchronized_at": 1794098599.5634468,
   "canonical_changes_since_validation": [
-    "tools/server/README.md: document all16 ParaFlow-specific option spellings"
+    "tools/server/README.md: document all16 ParaFlow-specific option spellings",
+    "Claude 2026-11-06 (canonical d39abbb + d04616f): CUDA pool OOM returns GGML_STATUS_ALLOC_FAILED so the server degrades the draft/car instead of aborting (verified on 8xV100); ParaFlow MTP derives verify/draft ubatch widths (implicit -ub widened, explicit kept with a warning). Token-exact vs previous build on 8xV100 C1/C16.",
+    "Claude 2026-11-08 (canonical b8c8a08): RPC pipeline, async cross-server copy, multi-device server support and device-resident KV rotation. Real-LAN hybrid test: C8/C16/C24 252.8/362.4/443.0 t/s, 99/96/93% of local; 8 outputs token-identical; one run per point, Python relay, preview only."
   ],
   "source_files": 3839,
-  "canonical_file_index_sha256": "46d770baf36fccdf94d71ce7186f8becbc1d8a6383a20b78ed3aca6ad20b6664",
+  "canonical_file_index_sha256": "db3d2c33795242e10c8b8ef9a2c84c98defd970c860651782ee2aac7269e8b20",
   "source_files_all_present_with_identical_contents": true,
   "repository_overlays": [
     "Project README.md; upstream README preserved separately",
@@ -16,9 +18,9 @@
   ],
   "commercial_restrictions": "removed",
   "publication": {
-    "private": true,
+    "private": false,
     "release_created": false,
-    "repository_visibility_changed": false
+    "repository_visibility_changed": true
   },
   "files": {
     ".clang-format": {
@@ -778,7 +780,7 @@
     },
     "common/arg.cpp": {
       "repository_path": "common/arg.cpp",
-      "sha256": "2b1c899a3351525779ae549b6a9ed2fab63a8838d6b3997deb3357d150e9da39",
+      "sha256": "184b8284e8a89ccc8a580536f3b1378a7cf3f11bc691e23d96def691f9b37f7e",
       "executable": false
     },
     "common/arg.h": {
@@ -853,7 +855,7 @@
     },
     "common/common.h": {
       "repository_path": "common/common.h",
-      "sha256": "06cea74384ea8793d0c481261eb2d45bcb3529942a00deae81964b925dda54d4",
+      "sha256": "c3a6d48b23328362e340542db490cb8a93cafbd4aca489761875f58969de5e38",
       "executable": false
     },
     "common/console.cpp": {
@@ -1223,7 +1225,7 @@
     },
     "common/speculative.cpp": {
       "repository_path": "common/speculative.cpp",
-      "sha256": "70e5d0d71b0a50c0b736440b8f310683fbe43440d610b84112f0a0ed68857d31",
+      "sha256": "126853d18c933898cc61e287091da15ab56a2dabb1b73a9baec2eb83c9de4029",
       "executable": false
     },
     "common/speculative.h": {
@@ -3398,7 +3400,7 @@
     },
     "ggml/src/ggml-backend.cpp": {
       "repository_path": "ggml/src/ggml-backend.cpp",
-      "sha256": "3e463629bed8af932569372f6b684066e8fbc18692482b92442063c7505a6d65",
+      "sha256": "8276e681206d8bcb8e8861ad083850f92e5170a0e18e9b3981d63a9928eb5dcd",
       "executable": false
     },
     "ggml/src/ggml-blas/CMakeLists.txt": {
@@ -4158,7 +4160,7 @@
     },
     "ggml/src/ggml-cuda/ggml-cuda.cu": {
       "repository_path": "ggml/src/ggml-cuda/ggml-cuda.cu",
-      "sha256": "4827f1f7e3567b74358196ae7c3983b69c2bae77de4cfed19edec2600cb7f915",
+      "sha256": "13d5958b787c21065d96e991cbeead99bc6b6fa02f48bf1ea9a35157811197a7",
       "executable": false
     },
     "ggml/src/ggml-cuda/gla.cu": {
@@ -7918,7 +7920,7 @@
     },
     "ggml/src/ggml-rpc/ggml-rpc.cpp": {
       "repository_path": "ggml/src/ggml-rpc/ggml-rpc.cpp",
-      "sha256": "f7646b27fd5fdc285ced2b08ee059666ebebea5b93dfa6a29926a772c799c17a",
+      "sha256": "3b3d907bfea037c3aa65ac5eea03912e3ee029adefbb62fc38b9de568269dd73",
       "executable": false
     },
     "ggml/src/ggml-rpc/log.cpp": {
@@ -11758,7 +11760,7 @@
     },
     "src/llama-graph.cpp": {
       "repository_path": "src/llama-graph.cpp",
-      "sha256": "154d5d11e0c4a1a844430525e6f8bedab3c764d969369df52d981d89e3a5d047",
+      "sha256": "4464f905bf9a69550dd2ae79f93ddd1b3e9667eaa9f15b43ba56c3cd05a4d1ad",
       "executable": false
     },
     "src/llama-graph.h": {
@@ -11853,12 +11855,12 @@
     },
     "src/llama-kv-cache.cpp": {
       "repository_path": "src/llama-kv-cache.cpp",
-      "sha256": "2054f04341920cb6580041de2bc4fedf996db13eeaff271218e0f9b6f29694ac",
+      "sha256": "6b0686e525659de6cb3f74df6898c9745b8232b0c26d90e6f5f3ad1e22f27751",
       "executable": false
     },
     "src/llama-kv-cache.h": {
       "repository_path": "src/llama-kv-cache.h",
-      "sha256": "9a4cc0b4ce4655afcd8b2b6fbe522c23f8e14aa3164e86c7c8a9e785cac5648e",
+      "sha256": "ec9541f4cfa460eaf877eafe190bd8dcf81c8f47124fb9e41b7941c9b8c308b0",
       "executable": false
     },
     "src/llama-kv-cells.h": {
@@ -14203,7 +14205,7 @@
     },
     "tools/server/paraflow-private/server-runtime.cpp": {
       "repository_path": "tools/server/paraflow-private/server-runtime.cpp",
-      "sha256": "c8574406142e659827e3b7879beb90e7466ed09ef24bdc9cce56d75b255b9fb4",
+      "sha256": "7e91d9a104569bf1abed853568036177ca30d555ed992708959f1c6b2ad7b6f5",
       "executable": false
     },
     "tools/server/server-chat.cpp": {
