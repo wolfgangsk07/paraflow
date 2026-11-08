@@ -1,4 +1,4 @@
-# ParaFlow · 并流
+# ParaFlow
 
 [English](README.md) | **简体中文**
 
