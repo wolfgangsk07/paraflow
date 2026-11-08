@@ -44,6 +44,18 @@ These tests were mainly run on small-memory cards. The same model and scheduler 
 - 6× RTX 3080 Ti total KV pool: **432K tokens** measured.
 - 8× V100 total KV pool: **1088K tokens** measured (1088Ki / 34 slots, 32K per-sequence cap; first and last slot outputs matched).
 
+## Multi-node over LAN (preview)
+
+The RPC path can span machines. In a hybrid test — one process spanning two GPUs on a remote node, plus one local GPU as the last stage, over the lab LAN — Qwen3.8-27B Q8 MTP3 gave:
+
+| Concurrency | Local | LAN | LAN / local | RPC pipeline off |
+|---:|---:|---:|---:|---:|
+| C8 | 255.2 | 252.8 | 99% | 156.8 |
+| C16 | 378.4 | 362.4 | 96% | 208.8 |
+| C24 | 476.0 | 443.0 | 93% | 248.4 |
+
+All 8 outputs were token-identical. The LAN path used a Python relay, so this is a lower bound; each point was run once. This is a preview: the pure-remote topology (no GPU on the coordinator) has not been tested, and this is not yet a supported production topology.
+
 ## Quick start
 
 Tested on V100 (SM70) and RTX 3080 Ti (SM86); Linux and CUDA are required. Build for RTX 3080 Ti (SM86; use `70` for V100):
@@ -118,7 +130,7 @@ Full list and constraints: [parameter documentation](tools/server/README.md).
 
 - Linux + CUDA for the pipeline and dynamic-KV paths.
 - Native MTP requires a model with NextN/MTP heads.
-- No multi-node pipeline in this source snapshot.
+- Multi-node RPC is a preview: the tested hybrid LAN topology is experimental, not a supported production deployment.
 - Model weights and their licenses are separate.
 
 ## Friend link
