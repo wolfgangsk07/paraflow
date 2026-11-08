@@ -8,10 +8,10 @@ ParaFlow turns several GPUs into a decode pipeline that stays busy: requests are
 
 ParaFlow is built to eliminate that GPU waste. It keeps every GPU busy on ordinary PCIe 2.0/3.0 servers, with no NVLink and no tensor-parallel rewrite; the remaining GPU capacity is utilized at over 98% efficiency (for example, 4-card C32 single-stream throughput is on par with upstream llama.cpp at C8).
 
-- **Runs on PCIe**: PP plus multiple lanes scale on ordinary PCIe 2.0/3.0 servers.
+- **Runs on slow interconnects**: scale on ordinary PCIe 2.0/3.0 multi-GPU servers; even multi-machine over LAN loses less than 7% efficiency.
 - **Small cards count**: 2×V100 16 GB at C8 reaches 225.7 t/s, above one V100 32 GB at 147.0 t/s.
 - **High-concurrency throughput**: 6×3080 Ti C60 1,454 t/s; 8×V100 C80 1,101 t/s, about 4.9× upstream llama.cpp.
-- **Source-complete**: stays llama.cpp; model format and quantization are unchanged.
+- **Source-complete**: built on llama.cpp; model format and quantization are unchanged, fully compatible with the existing ecosystem.
 
 
 ## Multi-GPU acceleration: keep every stage fed
@@ -44,9 +44,9 @@ These tests were mainly run on small-memory cards. The same model and scheduler 
 - 6× RTX 3080 Ti total KV pool: **432K tokens** measured.
 - 8× V100 total KV pool: **1088K tokens** measured (1088Ki / 34 slots, 32K per-sequence cap; first and last slot outputs matched).
 
-## Multi-node over LAN (preview)
+## Multi-node over LAN
 
-The RPC path can span machines. In a hybrid test — one process spanning two GPUs on a remote node, plus one local GPU as the last stage, over the lab LAN — Qwen3.8-27B Q8 MTP3 gave:
+RPC can spread a model across machines. Each node on the LAN can hold one or more GPUs, and all GPUs take part in ParaFlow's multi-GPU acceleration. Qwen3.8-27B Q8 MTP3 results:
 
 | Concurrency | Local | LAN | LAN / local | RPC pipeline off |
 |---:|---:|---:|---:|---:|
