@@ -64,19 +64,20 @@ cmake -S . -B build -DGGML_CUDA=ON -DGGML_RPC=ON \
 cmake --build build --target ggml-rpc-server llama-server -j8
 ```
 
-每个 GPU 启动一个 RPC server（下面以节点 A 的两张卡为例；节点 B 同理，端口不要冲突）：
+每个节点启动一个 RPC server。节点 A 有两张卡，就在同一个进程里暴露两张卡：
 
 ```sh
-CUDA_VISIBLE_DEVICES=0 ./build/bin/ggml-rpc-server -H 0.0.0.0 -p 50052 -c
-CUDA_VISIBLE_DEVICES=1 ./build/bin/ggml-rpc-server -H 0.0.0.0 -p 50053 -c
+CUDA_VISIBLE_DEVICES=0,1 ./build/bin/ggml-rpc-server -H 0.0.0.0 -p 50052 -c
 ```
+
+节点 B 同理；如果节点只有一张卡，就设为 `CUDA_VISIBLE_DEVICES=0`。不同机器可以使用同一个端口。
 
 在协调机上把所有 RPC 端点按顺序传给 `llama-server`：
 
 ```sh
 CUDA_VISIBLE_DEVICES='' ./build/bin/llama-server -m Qwen3.8-27B.Q8_0.gguf \
   -ngl 99 -sm layer -ts 1,1,1 \
-  --rpc 10.0.0.11:50052,10.0.0.11:50053,10.0.0.12:50052 \
+  --rpc 10.0.0.11:50052,10.0.0.12:50052 \
   -c 8192 -np 8 -fa on -ctk q8_0 -ctv q8_0 \
   --no-kv-unified --pipe-lanes 3 --pipe-fuse \
   --pipe-prefill-chunk 64 --pipe-prefill-lanes 1 \
@@ -84,7 +85,7 @@ CUDA_VISIBLE_DEVICES='' ./build/bin/llama-server -m Qwen3.8-27B.Q8_0.gguf \
   --host 0.0.0.0 --port 8080
 ```
 
-`-ts` 的个数要和 `--rpc` 暴露的设备数（加本机 GPU）一致；`--pipe-lanes` 用总设备数。上面的例子让协调机只做调度，所以清空了 `CUDA_VISIBLE_DEVICES`；如果协调机也出卡，把它加入可见设备，并在 `-ts` 和 `--rpc` 里补上对应项。RPC 路径目前用静态 KV，不要加 `--kv-dynamic`。RPC server 没有认证，只放在可信局域网，不要暴露公网。
+`--rpc` 列的是 RPC server，不是单张卡；一个 server 可以暴露多张卡。`-ts` 的个数要和所有 server 暴露的设备数（加本机 GPU）一致，`--pipe-lanes` 用总设备数。上面的例子让协调机只做调度，所以清空了 `CUDA_VISIBLE_DEVICES`；如果协调机也出卡，把它加入可见设备，并在 `-ts` 和 `--rpc` 里补上对应项。RPC 路径目前用静态 KV，不要加 `--kv-dynamic`。RPC server 没有认证，只放在可信局域网，不要暴露公网。
 
 ## 快速开始
 
