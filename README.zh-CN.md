@@ -54,7 +54,37 @@ RPC 路径可以把模型跨机展开。局域网内每个节点可以容纳 1 �
 | C16 | 378.4 | 362.4 | 96% | 208.8 |
 | C24 | 476.0 | 443.0 | 93% | 248.4 |
 
-8 路输出逐 token 一致。局域网路径经过一个 Python 转发，所以这是下限；每个点只跑了一次。纯远端拓扑（协调机不放 GPU）尚未测试，暂不作为生产支持拓扑。
+### 快速开始
+
+所有节点用同一份源码构建，开启 CUDA 和 RPC：
+
+```sh
+cmake -S . -B build -DGGML_CUDA=ON -DGGML_RPC=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=70
+cmake --build build --target ggml-rpc-server llama-server -j8
+```
+
+每个 GPU 启动一个 RPC server（下面以节点 A 的两张卡为例；节点 B 同理，端口不要冲突）：
+
+```sh
+CUDA_VISIBLE_DEVICES=0 ./build/bin/ggml-rpc-server -H 0.0.0.0 -p 50052 -c
+CUDA_VISIBLE_DEVICES=1 ./build/bin/ggml-rpc-server -H 0.0.0.0 -p 50053 -c
+```
+
+在协调机上把所有 RPC 端点按顺序传给 `llama-server`：
+
+```sh
+CUDA_VISIBLE_DEVICES='' ./build/bin/llama-server -m Qwen3.8-27B.Q8_0.gguf \
+  -ngl 99 -sm layer -ts 1,1,1 \
+  --rpc 10.0.0.11:50052,10.0.0.11:50053,10.0.0.12:50052 \
+  -c 8192 -np 8 -fa on -ctk q8_0 -ctv q8_0 \
+  --no-kv-unified --pipe-lanes 3 --pipe-fuse \
+  --pipe-prefill-chunk 64 --pipe-prefill-lanes 1 \
+  --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-ngl 99 \
+  --host 0.0.0.0 --port 8080
+```
+
+`-ts` 的个数要和 `--rpc` 暴露的设备数（加本机 GPU）一致；`--pipe-lanes` 用总设备数。上面的例子让协调机只做调度，所以清空了 `CUDA_VISIBLE_DEVICES`；如果协调机也出卡，把它加入可见设备，并在 `-ts` 和 `--rpc` 里补上对应项。RPC 路径目前用静态 KV，不要加 `--kv-dynamic`。RPC server 没有认证，只放在可信局域网，不要暴露公网。
 
 ## 快速开始
 
