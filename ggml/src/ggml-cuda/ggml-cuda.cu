@@ -96,6 +96,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <stdexcept>
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
@@ -471,6 +472,13 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 // #define DEBUG_CUDA_MALLOC
 
 // buffer pool for cuda (legacy)
+// Thrown by the device memory pools when the device is out of memory while a graph is computed.
+// ggml_backend_cuda_graph_compute turns it into GGML_STATUS_ALLOC_FAILED, so the caller can roll back
+// and degrade (e.g. drop drafts or terminate one request) instead of aborting the process.
+struct ggml_cuda_oom_error : public std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     static const int MAX_BUFFERS = 256;
 
@@ -560,6 +568,11 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
                 GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: retry succeeded\n", device);
             }
         }
+        if (err == cudaErrorMemoryAllocation) {
+            (void)cudaGetLastError();
+            throw ggml_cuda_oom_error(std::string(GGML_CUDA_NAME " pool[") + std::to_string(device) + "]: out of memory allocating " +
+                    std::to_string(look_ahead_size >> 20) + " MiB");
+        }
         CUDA_CHECK(err);
         *actual_size = look_ahead_size;
         pool_size += look_ahead_size;
@@ -641,7 +654,12 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             prop.location.id = physical_device;
             CUmemGenericAllocationHandle handle;
-            CU_CHECK(cuMemCreate(&handle, reserve_size, &prop, 0));
+            const CUresult create_res = cuMemCreate(&handle, reserve_size, &prop, 0);
+            if (create_res == CUDA_ERROR_OUT_OF_MEMORY) {
+                throw ggml_cuda_oom_error(std::string(GGML_CUDA_NAME " vmm pool[") + std::to_string(device) + "]: out of memory growing by " +
+                        std::to_string(reserve_size >> 20) + " MiB (pool " + std::to_string(pool_size >> 20) + " MiB)");
+            }
+            CU_CHECK(create_res);
 
             // reserve virtual address space (if not already reserved)
             if (pool_addr == 0) {
@@ -5921,7 +5939,34 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
-    ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    try {
+        ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    } catch (const ggml_cuda_oom_error & e) {
+        // Kernels already queued stay valid; the caller discards this graph's results.
+        cuda_ctx->curr_stream_no = 0;
+#ifdef USE_CUDA_GRAPH
+        if (use_cuda_graph && cuda_graph_update_required) {
+            cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+            // still capturing: the failure happened before evaluate_and_capture ended the capture and released the lock
+            if (cudaStreamIsCapturing(cuda_ctx->stream(), &capture) == cudaSuccess && capture != cudaStreamCaptureStatusNone) {
+                cudaGraph_t partial = nullptr;
+                (void) cudaStreamEndCapture(cuda_ctx->stream(), &partial);
+                if (partial) { (void) cudaGraphDestroy(partial); }
+                std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+                if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
+                    ggml_cuda_lock_cv.notify_all();
+                }
+            }
+        }
+        if (graph_key) {
+            // the recorded node properties may describe a graph that never became executable: recapture next time
+            cuda_ctx->cuda_graphs.erase(graph_key);
+        }
+#endif // USE_CUDA_GRAPH
+        (void) cudaGetLastError();
+        GGML_LOG_ERROR("%s: %s; graph compute failed with GGML_STATUS_ALLOC_FAILED\n", __func__, e.what());
+        return GGML_STATUS_ALLOC_FAILED;
+    }
 
     return GGML_STATUS_SUCCESS;
 }
@@ -7241,8 +7286,33 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 
 static ggml_backend_t ggml_backend_cuda_init_background(ggml_backend_dev_t dev);
 
+// Stream-ordered wait on a host-side completion (scheduler's non-blocking remote->CUDA copy): work queued on
+// this backend's stream after this call starts only once wait_fn(token) returned. wait_fn runs on the CUDA
+// callback thread, must not call CUDA, and owns `token`.
+struct ggml_cuda_host_wait_args {
+    void (*wait_fn)(void *);
+    void * token;
+};
+static void CUDART_CB ggml_cuda_host_wait_cb(void * user) {
+    auto * a = (ggml_cuda_host_wait_args *) user;
+    a->wait_fn(a->token);
+    delete a;
+}
+static bool ggml_backend_cuda_stream_host_wait(ggml_backend_t backend, void (*wait_fn)(void *), void * token) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaLaunchHostFunc(cuda_ctx->stream(), ggml_cuda_host_wait_cb, new ggml_cuda_host_wait_args{wait_fn, token}));
+    return true;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_stream_host_wait") == 0) {
+        return (void *)ggml_backend_cuda_stream_host_wait;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }
