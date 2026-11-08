@@ -54,7 +54,37 @@ RPC can spread a model across machines. Each node on the LAN can hold one or mor
 | C16 | 378.4 | 362.4 | 96% | 208.8 |
 | C24 | 476.0 | 443.0 | 93% | 248.4 |
 
-All 8 outputs were token-identical. The LAN path used a Python relay, so this is a lower bound; each point was run once. This is a preview: the pure-remote topology (no GPU on the coordinator) has not been tested, and this is not yet a supported production topology.
+### Quick start
+
+Build every node from the same source with CUDA and RPC enabled:
+
+```sh
+cmake -S . -B build -DGGML_CUDA=ON -DGGML_RPC=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=70
+cmake --build build --target ggml-rpc-server llama-server -j8
+```
+
+Start one RPC server per GPU (node A with two GPUs shown; repeat on node B with distinct ports):
+
+```sh
+CUDA_VISIBLE_DEVICES=0 ./build/bin/ggml-rpc-server -H 0.0.0.0 -p 50052 -c
+CUDA_VISIBLE_DEVICES=1 ./build/bin/ggml-rpc-server -H 0.0.0.0 -p 50053 -c
+```
+
+On the coordinator, list all RPC endpoints in order:
+
+```sh
+CUDA_VISIBLE_DEVICES='' ./build/bin/llama-server -m Qwen3.8-27B.Q8_0.gguf \
+  -ngl 99 -sm layer -ts 1,1,1 \
+  --rpc 10.0.0.11:50052,10.0.0.11:50053,10.0.0.12:50052 \
+  -c 8192 -np 8 -fa on -ctk q8_0 -ctv q8_0 \
+  --no-kv-unified --pipe-lanes 3 --pipe-fuse \
+  --pipe-prefill-chunk 64 --pipe-prefill-lanes 1 \
+  --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-ngl 99 \
+  --host 0.0.0.0 --port 8080
+```
+
+Keep `-ts` length equal to the total device count (RPC endpoints plus local GPUs), and set `--pipe-lanes` to that same count. The example above clears `CUDA_VISIBLE_DEVICES` so the coordinator only schedules; if the coordinator also contributes a GPU, expose it and add the matching `-ts` and `--rpc` entries. The RPC path uses static KV; do not add `--kv-dynamic`. The RPC server has no authentication; keep it on a trusted LAN and never expose it publicly.
 
 ## Quick start
 
