@@ -54,7 +54,17 @@ RPC can spread a model across machines. Each node on the LAN can hold one or mor
 | C16 | 378.4 | 362.4 | 96% | 208.8 |
 | C24 | 476.0 | 443.0 | 93% | 248.4 |
 
-### Quick start
+### Quick start: 4 GPUs, 3 nodes
+
+Concrete topology: node A has two GPUs, node B has one, and node C has one GPU and acts as the coordinator.
+
+```text
+node A (2 GPUs) --RPC--node B (1 GPU)  --RPC---> node C (1 GPU, runs llama-server)
+                        |
+clients ----------------+
+```
+
+The **coordinator** is the machine running `llama-server`: it accepts client requests, handles tokenization, sampling and pipeline scheduling, and can contribute its own GPU as one pipeline stage. Nodes A and B only run `ggml-rpc-server` and expose their GPUs to the coordinator.
 
 Build every node from the same source with CUDA and RPC enabled:
 
@@ -64,28 +74,41 @@ cmake -S . -B build -DGGML_CUDA=ON -DGGML_RPC=ON \
 cmake --build build --target ggml-rpc-server llama-server -j8
 ```
 
-Start one RPC server per node. Node A has two GPUs, so expose both in one process:
+Node A (two GPUs, one RPC server process):
 
 ```sh
 CUDA_VISIBLE_DEVICES=0,1 ./build/bin/ggml-rpc-server -H 0.0.0.0 -p 50052 -c
 ```
 
-Node B works the same way; if it has one GPU, use `CUDA_VISIBLE_DEVICES=0`. Different machines can use the same port.
-
-On the coordinator, list all RPC endpoints in order:
+Node B (one GPU):
 
 ```sh
-CUDA_VISIBLE_DEVICES='' ./build/bin/llama-server -m Qwen3.8-27B.Q8_0.gguf \
-  -ngl 99 -sm layer -ts 1,1,1 \
+CUDA_VISIBLE_DEVICES=0 ./build/bin/ggml-rpc-server -H 0.0.0.0 -p 50052 -c
+```
+
+Node C (coordinator, one local GPU; start A and B first, then C):
+
+```sh
+CUDA_VISIBLE_DEVICES=0 ./build/bin/llama-server -m Qwen3.8-27B.Q8_0.gguf \
+  -ngl 99 -sm layer -ts 1,1,1,1 \
   --rpc 10.0.0.11:50052,10.0.0.12:50052 \
   -c 8192 -np 8 -fa on -ctk q8_0 -ctv q8_0 \
-  --no-kv-unified --pipe-lanes 3 --pipe-fuse \
+  --no-kv-unified --pipe-lanes 4 --pipe-fuse \
   --pipe-prefill-chunk 64 --pipe-prefill-lanes 1 \
   --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-ngl 99 \
   --host 0.0.0.0 --port 8080
 ```
 
-`--rpc` lists RPC servers, not individual GPUs; one server can expose several devices. Keep `-ts` length equal to the total device count across all servers (plus local GPUs), and set `--pipe-lanes` to that same count. The example above clears `CUDA_VISIBLE_DEVICES` so the coordinator only schedules; if the coordinator also contributes a GPU, expose it and add the matching `-ts` and `--rpc` entries. The RPC path uses static KV; do not add `--kv-dynamic`. The RPC server has no authentication; keep it on a trusted LAN and never expose it publicly.
+`--rpc` lists only the two **RPC servers** (A and B); A's one server exposes two GPUs, so the total device count is four:
+
+```text
+A's 2 + B's 1 + C's local 1 = 4
+-ts 1,1,1,1
+--pipe-lanes 4
+```
+
+If coordinator C contributes no GPU and only schedules, clear its `CUDA_VISIBLE_DEVICES` and change `-ts` and `--pipe-lanes` to 3. The RPC path uses static KV; do not add `--kv-dynamic`. The RPC server has no authentication; keep it on a trusted LAN and never expose it publicly.
+
 
 ## Quick start
 
