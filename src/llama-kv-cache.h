@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <map>
 #include <unordered_map>
 #include <vector>
 
@@ -266,6 +267,10 @@ public:
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
 
+    // device-resident rotation for model layer il, or nullptr (then use the per-step input)
+    ggml_tensor * get_k_rot_resident(int32_t il) const;
+    ggml_tensor * get_v_rot_resident(int32_t il) const;
+
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
 
@@ -360,6 +365,14 @@ private:
     stream_copy_info sc_info;
 
     std::vector<kv_layer> layers;
+
+    // Hadamard rotation matrices resident on each KV device, filled once (LLAMA_ATTN_ROT_RESIDENT=0 disables).
+    // The per-step k_rot/v_rot inputs are constants; as graph inputs they were re-uploaded every ubatch to
+    // every stage, which over RPC is a network transfer per stage and step.
+    std::unordered_map<int32_t, ggml_backend_buffer_type_t> layer_buft; // model layer -> KV buffer type
+    std::map<ggml_backend_buffer_type_t, std::pair<ggml_tensor *, ggml_tensor *>> rot_resident; // buft -> (k_rot, v_rot)
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> rot_ctxs_bufs;
+    void init_rot_resident();
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
@@ -485,6 +498,9 @@ public:
 
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
+
+    ggml_tensor * get_k_rot_resident(int32_t il) const;
+    ggml_tensor * get_v_rot_resident(int32_t il) const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
