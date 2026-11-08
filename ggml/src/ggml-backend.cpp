@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <unordered_set>
 #include <unordered_map>
 #include <vector>
 
@@ -934,6 +935,7 @@ struct ggml_backend_sched_split {
 };
 
 struct ggml_backend_sched_input_staging;
+struct ggml_backend_sched_remote_ring;
 
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
@@ -999,6 +1001,7 @@ struct ggml_backend_sched {
 
     int debug_realloc;
     ggml_backend_sched_input_staging * input_staging;
+    ggml_backend_sched_remote_ring   * remote_ring;
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -1835,6 +1838,110 @@ static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
         ggml_backend_buffer_is_host(t->buffer);
 }
 
+// Non-blocking copy from a backend that cannot be waited on by stream (e.g. RPC) into a stream backend
+// (e.g. CUDA). The blocking fallback below synchronizes the source backend on the submitting thread, which
+// for pipelined decode over RPC stalls the next lane's submission until the remote stage finished - the
+// lanes then run one after another. Instead: the source backend queues a fetch into a pinned host slot,
+// the destination stream blocks on its arrival (host function), and an async H2D upload follows on the
+// same stream. Queue order on every backend is unchanged. Opt out with GGML_SCHED_REMOTE_ASYNC=0.
+typedef bool (*ggml_backend_fetch_async_t)(ggml_backend_t backend, const struct ggml_tensor * src, void * dst, size_t size, void ** token);
+typedef void (*ggml_backend_fetch_wait_t)(void * token);
+typedef bool (*ggml_backend_stream_host_wait_t)(ggml_backend_t backend, void (*wait_fn)(void *), void * token);
+
+struct ggml_backend_sched_remote_ring {
+    static constexpr int N_SLOTS = 16;
+    struct slot {
+        ggml_backend_buffer_t buf     = nullptr;
+        void                * ptr     = nullptr;
+        size_t                cap     = 0;
+        ggml_backend_event_t  ev      = nullptr;
+        bool                  pending = false;
+    };
+    slot slots[GGML_SCHED_MAX_BACKENDS][N_SLOTS];
+    int  next[GGML_SCHED_MAX_BACKENDS] = {};
+    ~ggml_backend_sched_remote_ring() {
+        for (auto & per_backend : slots) {
+            for (auto & sl : per_backend) {
+                if (sl.ev) {
+                    if (sl.pending) { ggml_backend_event_synchronize(sl.ev); }
+                    ggml_backend_event_free(sl.ev);
+                }
+                if (sl.buf) { ggml_backend_buffer_free(sl.buf); }
+            }
+        }
+    }
+};
+
+static bool ggml_backend_sched_remote_copy_async(ggml_backend_sched_t sched, int dst_id, ggml_backend_t src_backend,
+                                                 ggml_backend_t dst_backend, struct ggml_tensor * input, struct ggml_tensor * input_cpy) {
+    static const bool enabled = [] {
+        const char * v = getenv("GGML_SCHED_REMOTE_ASYNC");
+        return v == nullptr || atoi(v) != 0;
+    }();
+    if (!enabled || src_backend == nullptr || src_backend == dst_backend || dst_backend->iface.set_tensor_async == nullptr) {
+        return false;
+    }
+    ggml_backend_dev_t src_dev = ggml_backend_get_device(src_backend);
+    ggml_backend_dev_t dst_dev = ggml_backend_get_device(dst_backend);
+    if (src_dev == nullptr || dst_dev == nullptr) {
+        return false;
+    }
+    auto fetch = (ggml_backend_fetch_async_t) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(src_dev), "ggml_backend_fetch_async");
+    auto fwait = (ggml_backend_fetch_wait_t)  ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(src_dev), "ggml_backend_fetch_wait");
+    auto hwait = (ggml_backend_stream_host_wait_t) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dst_dev), "ggml_backend_stream_host_wait");
+    if (!fetch || !fwait || !hwait) {
+        return false;
+    }
+    ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dst_dev);
+    if (host_buft == nullptr) {
+        return false;
+    }
+    const size_t size = ggml_nbytes(input);
+    if (size == 0 || size != ggml_nbytes(input_cpy)) {
+        return false;
+    }
+    if (!sched->remote_ring) {
+        sched->remote_ring = new ggml_backend_sched_remote_ring();
+    }
+    auto & ring = *sched->remote_ring;
+    auto & sl = ring.slots[dst_id][ring.next[dst_id]];
+    if (!sl.ev) {
+        sl.ev = ggml_backend_event_new(dst_dev);
+        if (!sl.ev) {
+            return false;
+        }
+    }
+    // the slot is free once the upload that last read it has completed on the destination stream
+    if (sl.pending) {
+        ggml_backend_event_synchronize(sl.ev);
+        sl.pending = false;
+    }
+    if (sl.cap < size) {
+        if (sl.buf) { ggml_backend_buffer_free(sl.buf); sl.buf = nullptr; sl.ptr = nullptr; sl.cap = 0; }
+        size_t cap = 1u << 20;
+        while (cap < size) { cap <<= 1; }
+        sl.buf = ggml_backend_buft_alloc_buffer(host_buft, cap);
+        if (!sl.buf) {
+            return false;
+        }
+        sl.ptr = ggml_backend_buffer_get_base(sl.buf);
+        sl.cap = cap;
+    }
+    void * token = nullptr;
+    if (!fetch(src_backend, input, sl.ptr, size, &token)) {
+        return false;
+    }
+    if (!hwait(dst_backend, fwait, token)) {
+        fwait(token); // not reachable for the CUDA implementation; keeps the token from leaking
+        return false;
+    }
+    ring.next[dst_id] = (ring.next[dst_id] + 1) % ggml_backend_sched_remote_ring::N_SLOTS;
+    dst_backend->iface.set_tensor_async(dst_backend, input_cpy, sl.ptr, 0, size);
+    ggml_backend_event_record(sl.ev, dst_backend);
+    sl.pending = true;
+    return true;
+}
+
 static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input, ggml_backend_sched_input_staging::call & snapshots) {
     const int split_backend_id = split->backend_id;
     ggml_backend_t split_backend = sched->backends[split_backend_id];
@@ -1869,6 +1976,9 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+        if (ggml_backend_sched_remote_copy_async(sched, split_backend_id, input_backend, split_backend, input, input_cpy)) {
+            return;
+        }
         ggml_backend_synchronize(input_backend);
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
@@ -1879,9 +1989,63 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     }
 }
 
+// Split inputs read only by nodes without GGML_TENSOR_FLAG_COMPUTE (the unselected branches of
+// ggml_build_forward_select, e.g. the token / embedding / mixed embedding inputs) are never read by
+// any backend, so copying them is wasted bandwidth. Over RPC this was two thirds of the first
+// stage's per-step upload. A copy made for one split can be read by later splits on the same
+// backend, so the set covers every split. GGML_SCHED_SKIP_UNUSED_INPUTS=0 disables.
+static bool ggml_backend_sched_skip_unused_inputs() {
+    static const bool enabled = [] {
+        const char * v = getenv("GGML_SCHED_SKIP_UNUSED_INPUTS");
+        return v == nullptr || atoi(v) != 0;
+    }();
+    return enabled;
+}
+
+static void ggml_backend_sched_collect_read_tensors(ggml_backend_sched_t sched, std::unordered_set<const ggml_tensor *> & read) {
+    for (int i = 0; i < sched->n_splits; i++) {
+        const struct ggml_cgraph & g = sched->splits[i].graph;
+        for (int n = 0; n < g.n_nodes; n++) {
+            const ggml_tensor * node = g.nodes[n];
+            if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                continue;
+            }
+            for (int j = 0; j < GGML_MAX_SRC; j++) {
+                if (node->src[j]) {
+                    read.insert(node->src[j]);
+                    if (node->src[j]->view_src) {
+                        read.insert(node->src[j]->view_src); // a computed node reading a view of the copy
+                    }
+                }
+            }
+            if (node->view_src) {
+                read.insert(node->view_src);
+            }
+        }
+    }
+}
+
+static bool ggml_backend_sched_input_is_read(ggml_backend_sched_t sched, const std::unordered_set<const ggml_tensor *> & read,
+                                             int backend_id, struct ggml_tensor * input) {
+    const size_t id = hash_id(input);
+    for (int c = 0; c < sched->n_copies; c++) {
+        const ggml_tensor * cpy = tensor_id_copy(id, backend_id, c);
+        if (cpy == nullptr || read.count(cpy)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
+
+    const bool skip_unused = ggml_backend_sched_skip_unused_inputs();
+    std::unordered_set<const ggml_tensor *> read_tensors;
+    if (skip_unused) {
+        ggml_backend_sched_collect_read_tensors(sched, read_tensors);
+    }
 
     int prev_backend_id = -1;
     ggml_backend_sched_input_staging::call snapshots(sched);
@@ -1905,6 +2069,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
+                if (skip_unused && !ggml_backend_sched_input_is_read(sched, read_tensors, split_backend_id, split->inputs[input_id])) {
+                    continue;
+                }
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id], snapshots);
             }
         }
@@ -2074,6 +2241,8 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     }
     delete sched->input_staging;
     sched->input_staging = nullptr;
+    delete sched->remote_ring;
+    sched->remote_ring = nullptr;
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
