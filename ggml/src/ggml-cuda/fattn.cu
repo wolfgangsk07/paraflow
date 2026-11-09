@@ -646,6 +646,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                     return BEST_FATTN_KERNEL_VEC;
                 }
             } else {
+                // Quantized KV with up to 8 query rows (decode, MTP verification): the vector kernel
+                // reads the quantized cache directly. MMA would first convert the K/V cache to F16.
+                if (Q->ne[1] <= 8 && ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) != nullptr) {
+                    return BEST_FATTN_KERNEL_VEC;
+                }
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
                     if (Q->ne[1] <= 2) {
                         return BEST_FATTN_KERNEL_VEC;
