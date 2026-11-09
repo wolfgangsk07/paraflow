@@ -2,14 +2,16 @@
   "schema": 2,
   "project": "ParaFlow",
   "canonical_validated_baseline": "89fcb8089e3ff79dffa239f1d573f0d3e82a599bc2be9c35f61a8b3995badc32",
-  "synchronized_at": 1794098599.5634468,
+  "synchronized_at": 1794220875.6161044,
   "canonical_changes_since_validation": [
     "tools/server/README.md: document all16 ParaFlow-specific option spellings",
     "Claude 2026-11-06 (canonical d39abbb + d04616f): CUDA pool OOM returns GGML_STATUS_ALLOC_FAILED so the server degrades the draft/car instead of aborting (verified on 8xV100); ParaFlow MTP derives verify/draft ubatch widths (implicit -ub widened, explicit kept with a warning). Token-exact vs previous build on 8xV100 C1/C16.",
-    "Claude 2026-11-08 (canonical b8c8a08): RPC pipeline, async cross-server copy, multi-device server support and device-resident KV rotation. Real-LAN hybrid test: C8/C16/C24 252.8/362.4/443.0 t/s, 99/96/93% of local; 8 outputs token-identical; one run per point, Python relay, preview only."
+    "Claude 2026-11-08 (canonical b8c8a08): RPC pipeline, async cross-server copy, multi-device server support and device-resident KV rotation. Real-LAN hybrid test: C8/C16/C24 252.8/362.4/443.0 t/s, 99/96/93% of local; 8 outputs token-identical; one run per point, Python relay, preview only.",
+    "Claude 2026-11-09 (canonical 279f102): drop the graph result when graph allocation fails, so a ring slot cannot reuse a graph whose tensors have no buffer.",
+    "Claude 2026-11-09 (canonical 76933b6): bound FA F16 K/V scratch to one sequence; vector kernel for quantized KV up to 8 rows. Used for X10 512K production; clean build checked against the repo."
   ],
   "source_files": 3839,
-  "canonical_file_index_sha256": "db3d2c33795242e10c8b8ef9a2c84c98defd970c860651782ee2aac7269e8b20",
+  "canonical_file_index_sha256": "3fdab297a178c7485ae4b028bd118eeb682218411e374b0b0a67d70e181e1a74",
   "source_files_all_present_with_identical_contents": true,
   "repository_overlays": [
     "Project README.md; upstream README preserved separately",
@@ -4075,7 +4077,7 @@
     },
     "ggml/src/ggml-cuda/fattn-common.cuh": {
       "repository_path": "ggml/src/ggml-cuda/fattn-common.cuh",
-      "sha256": "0ef1f81f98d542e5c7450b0b5647eb18f4fd98afae4399199a7585d32a26f909",
+      "sha256": "2ea8013e925077642ac48c3636edeb078d35dbf43e44239f2188ebeb0c17bb7d",
       "executable": false
     },
     "ggml/src/ggml-cuda/fattn-mma-f16.cuh": {
@@ -4100,7 +4102,7 @@
     },
     "ggml/src/ggml-cuda/fattn.cu": {
       "repository_path": "ggml/src/ggml-cuda/fattn.cu",
-      "sha256": "9c3229191b0c14f9337ec2c5c8733b1ca75aab6d08b4bcd5d85e1971bbced63e",
+      "sha256": "97bea46014f9585b0a55d38bc3e79c1bf4d1e01f42c3a9ae00440d874d934a8c",
       "executable": false
     },
     "ggml/src/ggml-cuda/fattn.cuh": {
@@ -11725,7 +11727,7 @@
     },
     "src/llama-context.cpp": {
       "repository_path": "src/llama-context.cpp",
-      "sha256": "28dd7cdf1edad1073b5448f064c92369145cc7723273b7e2f5ff26d3b88cd0bb",
+      "sha256": "8e5fc249c100126f73bccc2c57937f2e29722d184da16099b7236d1f445e29fe",
       "executable": false
     },
     "src/llama-context.h": {
@@ -13065,7 +13067,7 @@
     },
     "tests/test-backend-ops.cpp": {
       "repository_path": "tests/test-backend-ops.cpp",
-      "sha256": "5480874046153b9812598671657aef8670d35727a6aaeb45ec1811467e53d86d",
+      "sha256": "68015a211ec378c80d899946d5313c4a91aa3efe2d05fc168954268793223c03",
       "executable": false
     },
     "tests/test-backend-sampler.cpp": {
