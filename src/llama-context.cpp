@@ -1815,6 +1815,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         if (!ggml_backend_sched_alloc_graph(cur_sched(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+            // build_graph already stored this ubatch's params in res. A ring slot reuses its graph without
+            // the gf_res_prev_active check, so an identical later ubatch (e.g. a new request admitted into
+            // the freed slot) would take the reuse path and write inputs into tensors that never got a
+            // buffer: GGML_ASSERT "tensor buffer not set" in set_inputs. Drop the result so it rebuilds.
+            res->reset();
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
