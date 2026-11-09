@@ -65,10 +65,12 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
     ggml_cuda_flash_attn_ext_f16_extra_data data = {};
     data.end = (uintptr_t) dst->data + ggml_nbytes(dst);
 
+    // K/V are converted one sequence (ne[3] slice) at a time, see launch_fattn, so the
+    // scratch is bounded by a single stream instead of growing with the number of streams.
     if (need_f16_K && K->type != GGML_TYPE_F16) {
         data.end = GGML_PAD(data.end, 128);
         data.K   = data.end;
-        data.end += ggml_nelements(K)*ggml_type_size(GGML_TYPE_F16);
+        data.end += (ggml_nelements(K)/K->ne[3])*ggml_type_size(GGML_TYPE_F16);
     }
 
     if (need_f16_V && V->type != GGML_TYPE_F16) {
@@ -77,7 +79,7 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
         } else {
             data.end = GGML_PAD(data.end, 128);
             data.V   = data.end;
-            data.end += ggml_nelements(V)*ggml_type_size(GGML_TYPE_F16);
+            data.end += (ggml_nelements(V)/V->ne[3])*ggml_type_size(GGML_TYPE_F16);
         }
     }
 
@@ -978,11 +980,11 @@ static __global__ void flash_attn_combine_results(
 }
 
 template <int DV, int ncols1, int ncols2>
-void launch_fattn(
+static void launch_fattn_impl(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
-    const int warp_size = WARP_SIZE, const bool async_kv_preload = false,
-    const bool canonical_vec = false
+    const int warp_size, const bool async_kv_preload, const bool canonical_vec,
+    const ggml_cuda_flash_attn_ext_f16_extra_data & f16_extra, const bool multi_sequence
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1011,9 +1013,6 @@ void launch_fattn(
     const int id  = ggml_cuda_get_device();
     const int cc  = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
-
-    const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
-        ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
 
     ggml_cuda_pool_alloc<int>    KV_max(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
@@ -1115,7 +1114,7 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    const bool scan_mask = !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
+    const bool scan_mask = !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || multi_sequence);
     if (scan_mask) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
@@ -1320,4 +1319,64 @@ void launch_fattn(
             dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
     }
     CUDA_CHECK(cudaGetLastError());
+}
+
+// Runs the kernel once per sequence (ne[3] slice) when K/V need an F16 copy, so the copy
+// only ever holds one stream: the compute buffer reserves a fixed n_kv-sized scratch
+// instead of one that grows with the number of streams in the batch.
+template <int DV, int ncols1, int ncols2>
+void launch_fattn(
+    ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
+    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
+    const int warp_size = WARP_SIZE, const bool async_kv_preload = false,
+    const bool canonical_vec = false
+) {
+    ggml_tensor * Q     = dst->src[0];
+    ggml_tensor * K     = dst->src[1];
+    ggml_tensor * V     = dst->src[2];
+    ggml_tensor * mask  = dst->src[3];
+
+    const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
+        ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V);
+
+    const bool convert = (need_f16_K && K->type != GGML_TYPE_F16) || (need_f16_V && V->type != GGML_TYPE_F16);
+    const int64_t n_seq = Q->ne[3];
+
+    if (!convert || n_seq == 1) {
+        launch_fattn_impl<DV, ncols1, ncols2>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
+            need_f16_K, need_f16_V, stream_k, use_sparse, warp_size, async_kv_preload, canonical_vec, f16_extra, false);
+        return;
+    }
+
+    const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+
+    for (int64_t s = 0; s < n_seq; ++s) {
+        ggml_tensor Q_s   = *Q;
+        ggml_tensor K_s   = *K;
+        ggml_tensor V_s   = *V;
+        ggml_tensor dst_s = *dst;
+        ggml_tensor mask_s;
+
+        Q_s.data   = (char *) Q->data   + s*Q->nb[3];   Q_s.ne[3]   = 1;
+        K_s.data   = (char *) K->data   + s*K->nb[3];   K_s.ne[3]   = 1;
+        V_s.data   = (char *) V->data   + s*V->nb[3];   V_s.ne[3]   = 1;
+        dst_s.data = (char *) dst->data + s*dst->nb[3]; dst_s.ne[3] = 1;
+
+        // keep the V-is-a-view-of-K relation visible to the launcher
+        K_s.view_src = nullptr; K_s.view_offs = 0;
+        V_s.view_src = V_is_K_view ? &K_s : nullptr; V_s.view_offs = 0;
+
+        dst_s.src[0] = &Q_s;
+        dst_s.src[1] = &K_s;
+        dst_s.src[2] = &V_s;
+        if (mask) {
+            mask_s = *mask;
+            mask_s.data  = (char *) mask->data + (s % mask->ne[3])*mask->nb[3];
+            mask_s.ne[3] = 1;
+            dst_s.src[3] = &mask_s;
+        }
+
+        launch_fattn_impl<DV, ncols1, ncols2>(ctx, &dst_s, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
+            need_f16_K, need_f16_V, stream_k, use_sparse, warp_size, async_kv_preload, canonical_vec, f16_extra, true);
+    }
 }
