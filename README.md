@@ -94,7 +94,7 @@ CUDA_VISIBLE_DEVICES=0 ./build/bin/llama-server -m Qwen3.8-27B.Q8_0.gguf \
   --rpc 10.0.0.11:50052,10.0.0.12:50052 \
   -c 8192 -np 8 -fa on -ctk q8_0 -ctv q8_0 \
   --no-kv-unified --pipe-lanes 4 --pipe-fuse \
-  --pipe-prefill-chunk 64 --pipe-prefill-lanes 1 \
+  --pipe-prefill-chunk 512 --pipe-prefill-lanes 1 \
   --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-ngl 99 \
   --host 0.0.0.0 --port 8080
 ```
