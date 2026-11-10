@@ -337,6 +337,11 @@ int main(int argc, char ** argv) {
     //   thread is inside llama - and the models of this test are far too small to need it
     params.fit_params = false;
 
+    // env LLAMA_TEST_LOAD_MTP=1: also load the MTP/NextN layers, so the MTP head cases can build their context
+    if (const char * v = getenv("LLAMA_TEST_LOAD_MTP"); v && atoi(v) != 0) {
+        params.load_mtp = true;
+    }
+
     const std::vector<const ctx_test *> cases = select_cases(test_filter);
     if (cases.empty()) {
         fprintf(stderr, "--test '%s' selected no cases, see --list\n", test_filter.c_str());
