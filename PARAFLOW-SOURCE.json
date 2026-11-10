@@ -2,16 +2,17 @@
   "schema": 2,
   "project": "ParaFlow",
   "canonical_validated_baseline": "89fcb8089e3ff79dffa239f1d573f0d3e82a599bc2be9c35f61a8b3995badc32",
-  "synchronized_at": 1794220875.6161044,
+  "synchronized_at": 1794319090.2756615,
   "canonical_changes_since_validation": [
     "tools/server/README.md: document all16 ParaFlow-specific option spellings",
     "Claude 2026-11-06 (canonical d39abbb + d04616f): CUDA pool OOM returns GGML_STATUS_ALLOC_FAILED so the server degrades the draft/car instead of aborting (verified on 8xV100); ParaFlow MTP derives verify/draft ubatch widths (implicit -ub widened, explicit kept with a warning). Token-exact vs previous build on 8xV100 C1/C16.",
     "Claude 2026-11-08 (canonical b8c8a08): RPC pipeline, async cross-server copy, multi-device server support and device-resident KV rotation. Real-LAN hybrid test: C8/C16/C24 252.8/362.4/443.0 t/s, 99/96/93% of local; 8 outputs token-identical; one run per point, Python relay, preview only.",
     "Claude 2026-11-09 (canonical 279f102): drop the graph result when graph allocation fails, so a ring slot cannot reuse a graph whose tensors have no buffer.",
-    "Claude 2026-11-09 (canonical 76933b6): bound FA F16 K/V scratch to one sequence; vector kernel for quantized KV up to 8 rows. Used for X10 512K production; clean build checked against the repo."
+    "Claude 2026-11-09 (canonical 76933b6): bound FA F16 K/V scratch to one sequence; vector kernel for quantized KV up to 8 rows. Used for X10 512K production; clean build checked against the repo.",
+    "Claude 2026-11-10 (canonical bc75b47): do not reuse a decode graph after its sequences moved to other KV streams; added KV/MTP regression tests. 24/24 source tests passed on 3 models, MTP on/off; X10 60-minute runtime stress was still running when this source was uploaded."
   ],
   "source_files": 3839,
-  "canonical_file_index_sha256": "3fdab297a178c7485ae4b028bd118eeb682218411e374b0b0a67d70e181e1a74",
+  "canonical_file_index_sha256": "bb69f45901e48c4c4e2143632dc95b6af410bdf2f7b53d1490b3db25d73e7401",
   "source_files_all_present_with_identical_contents": true,
   "repository_overlays": [
     "Project README.md; upstream README preserved separately",
@@ -11762,7 +11763,7 @@
     },
     "src/llama-graph.cpp": {
       "repository_path": "src/llama-graph.cpp",
-      "sha256": "4464f905bf9a69550dd2ae79f93ddd1b3e9667eaa9f15b43ba56c3cd05a4d1ad",
+      "sha256": "f920bd781d4b28bc19b87af0ba70ddebbc14f81663fcc10dc8dde0c608a9f77a",
       "executable": false
     },
     "src/llama-graph.h": {
@@ -11857,12 +11858,12 @@
     },
     "src/llama-kv-cache.cpp": {
       "repository_path": "src/llama-kv-cache.cpp",
-      "sha256": "6b0686e525659de6cb3f74df6898c9745b8232b0c26d90e6f5f3ad1e22f27751",
+      "sha256": "a8f96a88f0f734fe5ebabd9e377d4ba0a9a06e514e1cfad52642bc1599adf0a7",
       "executable": false
     },
     "src/llama-kv-cache.h": {
       "repository_path": "src/llama-kv-cache.h",
-      "sha256": "ec9541f4cfa460eaf877eafe190bd8dcf81c8f47124fb9e41b7941c9b8c308b0",
+      "sha256": "35ad8cbe8f8aebbaa4bda8177fecd5554cdef39d2d057401146d35f15bed70f1",
       "executable": false
     },
     "src/llama-kv-cells.h": {
@@ -12902,7 +12903,7 @@
     },
     "tests/llama-context/cases-kv.cpp": {
       "repository_path": "tests/llama-context/cases-kv.cpp",
-      "sha256": "e672cf0135b9670b86b4bba7209d1c0ac5399251bbae039e9dab314b3fbfb968",
+      "sha256": "ea494f9525e96d8cfbc8e7a437b2cd56d6e11c89c19d69a89049d87ea294201e",
       "executable": false
     },
     "tests/llama-context/cases-rs.cpp": {
@@ -13192,7 +13193,7 @@
     },
     "tests/test-llama-context.cpp": {
       "repository_path": "tests/test-llama-context.cpp",
-      "sha256": "65717b1b7446214b0b5dc4095202aff570c19528554123499c9d2c49cfc87b32",
+      "sha256": "170254ca2b6835c97c706c96c9ecef6cb97f0a89d2efcc91c9513c5257430f3c",
       "executable": false
     },
     "tests/test-llama-grammar.cpp": {
