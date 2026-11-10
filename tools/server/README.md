@@ -65,7 +65,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 ./build/bin/llama-server \
   -np 24 -c 12288 -b 512 -ub 64 \
   -ctk q8_0 -ctv q8_0 -fa on --no-kv-unified \
   --pipe-lanes 6 --pipe-fuse \
-  --pipe-prefill-chunk 64 --pipe-prefill-lanes 1 \
+  --pipe-prefill-chunk 512 --pipe-prefill-lanes 1 \
   --kv-dynamic --kv-dynamic-seq-max 512 \
   --no-kv-spill --system-cache-mib 0 \
   --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-ngl 99 \
