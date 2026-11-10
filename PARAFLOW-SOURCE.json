@@ -2,14 +2,14 @@
   "schema": 2,
   "project": "ParaFlow",
   "canonical_validated_baseline": "89fcb8089e3ff79dffa239f1d573f0d3e82a599bc2be9c35f61a8b3995badc32",
-  "synchronized_at": 1794319090.2756615,
+  "synchronized_at": 1794321201.8680787,
   "canonical_changes_since_validation": [
     "tools/server/README.md: document all16 ParaFlow-specific option spellings",
     "Claude 2026-11-06 (canonical d39abbb + d04616f): CUDA pool OOM returns GGML_STATUS_ALLOC_FAILED so the server degrades the draft/car instead of aborting (verified on 8xV100); ParaFlow MTP derives verify/draft ubatch widths (implicit -ub widened, explicit kept with a warning). Token-exact vs previous build on 8xV100 C1/C16.",
     "Claude 2026-11-08 (canonical b8c8a08): RPC pipeline, async cross-server copy, multi-device server support and device-resident KV rotation. Real-LAN hybrid test: C8/C16/C24 252.8/362.4/443.0 t/s, 99/96/93% of local; 8 outputs token-identical; one run per point, Python relay, preview only.",
     "Claude 2026-11-09 (canonical 279f102): drop the graph result when graph allocation fails, so a ring slot cannot reuse a graph whose tensors have no buffer.",
     "Claude 2026-11-09 (canonical 76933b6): bound FA F16 K/V scratch to one sequence; vector kernel for quantized KV up to 8 rows. Used for X10 512K production; clean build checked against the repo.",
-    "Claude 2026-11-10 (canonical bc75b47): do not reuse a decode graph after its sequences moved to other KV streams; added KV/MTP regression tests. 24/24 source tests passed on 3 models, MTP on/off; X10 60-minute runtime stress was still running when this source was uploaded."
+    "Claude 2026-11-10 (canonical bc75b47): do not reuse a decode graph after its sequences moved to other KV streams; added KV/MTP regression tests. 24/24 source tests passed on 3 models, MTP on/off; X10 60-minute load test passed: 228/228 requests OK, 0 errors, 0 exceptions, 0 illegal accesses, 14 KV swaps, service inactive at end. Production switch started after the pass."
   ],
   "source_files": 3839,
   "canonical_file_index_sha256": "bb69f45901e48c4c4e2143632dc95b6af410bdf2f7b53d1490b3db25d73e7401",
