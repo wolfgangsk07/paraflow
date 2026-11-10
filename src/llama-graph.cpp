@@ -43,6 +43,11 @@ static ggml_tensor * build_attn_inp_kq_mask(
     ggml_set_input(res);
     ggml_set_name(res, "attn_inp_kq_mask");
 
+    // The K/V views of this graph start at stream s0 and span [s0, s1]. An input tensor carries no op,
+    // so its op params hold the range for can_reuse_kq_mask().
+    res->op_params[0] = (int32_t) mctx->get_s0();
+    res->op_params[1] = (int32_t) mctx->get_s1();
+
     return res;
 }
 
@@ -61,6 +66,11 @@ static bool can_reuse_kq_mask(
     res &= (kq_mask->ne[1] == n_tokens/n_stream);
     res &= (kq_mask->ne[2] == 1);
     res &= (kq_mask->ne[3] == n_stream);
+
+    // The same sequences can sit in other streams after llama_memory_seq_swap_stream(); a graph whose
+    // K/V views still point at the old streams would read memory those sequences no longer own.
+    res &= (kq_mask->op_params[0] == (int32_t) mctx->get_s0());
+    res &= (kq_mask->op_params[1] == (int32_t) mctx->get_s1());
 
     return res;
 }
