@@ -474,6 +474,10 @@ public:
 
     uint32_t get_n_kv() const;
 
+    // first and last KV stream of the current ubatch; the K/V views of a graph are built at this offset
+    uint32_t get_s0() const;
+    uint32_t get_s1() const;
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 
