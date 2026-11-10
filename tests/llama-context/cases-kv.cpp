@@ -908,6 +908,197 @@ struct case_seq_swap_stream : ctx_test {
     }
 };
 
+// A reused decode graph bakes the KV stream range of its sequences into the K/V views. When the
+// streams of those sequences move (seq_swap_stream) but the batch keeps the same sequences, shapes and
+// n_kv, the graph must not be reused: it would attend to the streams the sequences left.
+struct case_swap_stream_graph_reuse : ctx_test {
+    const char * name() const override { return "swap_strm_reuse"; }
+
+    const char * description() const override {
+        return "a decode after moving both sequences of a batch to other streams reads the new streams";
+    }
+
+    case_result run(model_run & mr) const override {
+        ctx_opts opts;
+        opts.n_ctx      = 1024;
+        opts.n_seq_max  = 4;
+        opts.kv_unified = 0;
+
+        auto ctx_ref  = mr.ctx(opts);
+        auto ctx_swap = mr.ctx(opts);
+        if (!ctx_ref || !ctx_swap) {
+            return case_result::fail();
+        }
+        auto mem = llama_get_memory(ctx_swap.get());
+        if (llama_memory_seq_stream(mem, 3) < 0) {
+            return case_result::skip("the memory keeps no per-sequence streams");
+        }
+
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+        const llama_seq_id seqs[] = { 2, 3 };
+        llama_pos n_past[4] = { 0, 0, 40, 40 };
+
+        for (const llama_seq_id s : seqs) {
+            CTX_REQUIRE(decode_gen(ctx_ref.get(),  n_vocab, s, 0, n_past[s]), "cannot decode the prefixes");
+            CTX_REQUIRE(decode_gen(ctx_swap.get(), n_vocab, s, 0, n_past[s]), "cannot decode the prefixes");
+        }
+
+        auto step = [&](logits_diff & diff) -> bool {
+            common_batch batch_ref(ctx_ref.get());
+            common_batch batch_swap(ctx_swap.get());
+            for (const llama_seq_id s : seqs) {
+                batch_ref .add(gen_token(n_vocab, s, n_past[s]), n_past[s], s, true);
+                batch_swap.add(gen_token(n_vocab, s, n_past[s]), n_past[s], s, true);
+                n_past[s]++;
+            }
+            if (llama_process(ctx_ref.get(),  LLAMA_PROCESS_TYPE_DECODE, batch_ref.get())  != 0 ||
+                llama_process(ctx_swap.get(), LLAMA_PROCESS_TYPE_DECODE, batch_swap.get()) != 0) {
+                return false;
+            }
+            for (int32_t i = 0; i < 2; ++i) {
+                diff.add(llama_get_logits_ith(ctx_swap.get(), i), llama_get_logits_ith(ctx_ref.get(), i), n_vocab);
+            }
+            return true;
+        };
+
+        // the same two-sequence batch twice: the second decode reuses the first graph
+        logits_diff warm;
+        CTX_REQUIRE(step(warm) && step(warm), "decode before the exchange failed");
+        CTX_REQUIRE(warm.n_nan == 0 && warm.nmse() <= NMSE_THRESHOLD, "logits differ before the exchange");
+
+        // move both sequences down to the empty streams 0 and 1, keeping their order
+        CTX_REQUIRE(llama_memory_seq_swap_stream(mem, 2, 0) == 1, "cannot exchange with an empty stream");
+        CTX_REQUIRE(llama_memory_seq_swap_stream(mem, 3, 1) == 1, "cannot exchange with an empty stream");
+        CTX_REQUIRE(llama_memory_seq_stream(mem, 2) == 0 && llama_memory_seq_stream(mem, 3) == 1, "unexpected stream map");
+
+        const int32_t reused_before = llama_perf_context(ctx_swap.get()).n_reused;
+        logits_diff diff;
+        for (int i = 0; i < 4; ++i) {
+            CTX_REQUIRE(step(diff), "decode after the exchange failed");
+        }
+        const int32_t reused_after = llama_perf_context(ctx_swap.get()).n_reused;
+        TLOG_INF("%s: graphs reused before the exchange %d, after %d; nmse %.3g, max diff %g\n", __func__,
+                reused_before, reused_after - reused_before, diff.nmse(), diff.diff_max);
+        CTX_REQUIRE(reused_before > 0, "the warm-up did not reuse its graph, so the case tests nothing");
+        CTX_REQUIRE(diff.n_nan == 0 && diff.nmse() <= NMSE_THRESHOLD, "logits differ after the exchange: a stale graph read the old streams");
+
+        return case_result::pass();
+    }
+};
+
+// The MTP head context keeps a plain attention cache (no recurrent input), so a decode graph over the
+// same two sequences is reused as long as the shapes hold. Its K/V views carry the stream offset of the
+// sequences when the graph was built: moving both sequences to other streams must not keep that graph.
+struct case_swap_stream_graph_reuse_mtp : ctx_test {
+    const char * name() const override { return "swap_strm_reuse_mtp"; }
+
+    const char * description() const override {
+        return "an MTP head decode after moving both sequences to other streams reads the new streams";
+    }
+
+    case_result run(model_run & mr) const override {
+        if (llama_model_n_layer_nextn(mr.model) <= 0 || !(mr.params.load_mtp ||
+                std::find(mr.params.speculative.types.begin(), mr.params.speculative.types.end(),
+                          COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != mr.params.speculative.types.end())) {
+            return case_result::skip("the MTP head is not loaded (set LLAMA_TEST_LOAD_MTP=1)");
+        }
+        auto make = [&]() {
+            auto cparams = common_context_params_to_llama(mr.params);
+            cparams.ctx_type   = LLAMA_CONTEXT_TYPE_MTP;
+            cparams.n_ctx      = 1024;
+            cparams.n_seq_max  = 4;
+            cparams.kv_unified = false;
+            cparams.n_rs_seq   = 0;
+            return init_ctx(mr.model, cparams, mr.fill);
+        };
+        auto ctx_ref  = make();
+        auto ctx_swap = make();
+        if (!ctx_ref || !ctx_swap) {
+            return case_result::fail();
+        }
+        auto mem = llama_get_memory(ctx_swap.get());
+        if (llama_memory_seq_stream(mem, 3) < 0) {
+            return case_result::skip("the memory keeps no per-sequence streams");
+        }
+
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+        const int n_embd  = llama_model_n_embd_out(mr.model);
+        const llama_seq_id seqs[] = { 2, 3 };
+        llama_pos n_past[4] = { 0, 0, 0, 0 };
+        auto state = [&](llama_seq_id s, llama_pos p) {
+            std::vector<float> h(n_embd);
+            for (int i = 0; i < n_embd; ++i) { h[i] = 0.01f*float(((s*131 + p*17 + i*7) % 97) - 48); }
+            return h;
+        };
+
+        auto feed = [&](llama_context * ctx, llama_seq_id s, llama_pos p0, llama_pos p1, bool out,
+                        std::vector<std::vector<float>> & keep) {
+            common_batch batch(ctx);
+            for (llama_pos p = p0; p < p1; ++p) {
+                keep.push_back(state(s, p));
+                const int32_t idx = batch.add(gen_token(n_vocab, s, p), p, s, out && p == p1 - 1);
+                batch.set_embd_state(idx, { keep.back().data(), 1, (size_t) n_embd });
+            }
+            return llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
+        };
+
+        std::vector<std::vector<float>> keep;
+        keep.reserve(1024);
+        for (const llama_seq_id s : seqs) {
+            for (llama_pos p = 0; p < 120; p += 40) {
+                CTX_REQUIRE(feed(ctx_ref.get(),  s, p, p + 40, false, keep), "cannot decode the prefixes");
+                CTX_REQUIRE(feed(ctx_swap.get(), s, p, p + 40, false, keep), "cannot decode the prefixes");
+            }
+            n_past[s] = 120;
+        }
+
+        auto step = [&](logits_diff & diff) -> bool {
+            common_batch batch_ref(ctx_ref.get());
+            common_batch batch_swap(ctx_swap.get());
+            for (const llama_seq_id s : seqs) {
+                keep.push_back(state(s, n_past[s]));
+                const int32_t ir = batch_ref .add(gen_token(n_vocab, s, n_past[s]), n_past[s], s, true);
+                const int32_t is = batch_swap.add(gen_token(n_vocab, s, n_past[s]), n_past[s], s, true);
+                batch_ref .set_embd_state(ir, { keep.back().data(), 1, (size_t) n_embd });
+                batch_swap.set_embd_state(is, { keep.back().data(), 1, (size_t) n_embd });
+                n_past[s]++;
+            }
+            if (llama_process(ctx_ref.get(),  LLAMA_PROCESS_TYPE_DECODE, batch_ref.get())  != 0 ||
+                llama_process(ctx_swap.get(), LLAMA_PROCESS_TYPE_DECODE, batch_swap.get()) != 0) {
+                return false;
+            }
+            for (int32_t i = 0; i < 2; ++i) {
+                diff.add(llama_get_logits_ith(ctx_swap.get(), i), llama_get_logits_ith(ctx_ref.get(), i), n_vocab);
+            }
+            return true;
+        };
+
+        logits_diff warm;
+        CTX_REQUIRE(step(warm) && step(warm), "decode before the exchange failed");
+        CTX_REQUIRE(warm.n_nan == 0 && warm.nmse() <= NMSE_THRESHOLD, "logits differ before the exchange");
+        const int32_t reused_warm = llama_perf_context(ctx_swap.get()).n_reused;
+
+        CTX_REQUIRE(llama_memory_seq_swap_stream(mem, 2, 0) == 1, "cannot exchange with an empty stream");
+        CTX_REQUIRE(llama_memory_seq_swap_stream(mem, 3, 1) == 1, "cannot exchange with an empty stream");
+        CTX_REQUIRE(llama_memory_seq_stream(mem, 2) == 0 && llama_memory_seq_stream(mem, 3) == 1, "unexpected stream map");
+
+        const int32_t reused_before = llama_perf_context(ctx_swap.get()).n_reused;
+        logits_diff first, diff;
+        CTX_REQUIRE(step(first), "decode after the exchange failed");
+        const int32_t reused_first = llama_perf_context(ctx_swap.get()).n_reused - reused_before;
+        for (int i = 0; i < 3; ++i) {
+            CTX_REQUIRE(step(diff), "decode after the exchange failed");
+        }
+        TLOG_INF("%s: reused during warm-up %d; first decode after the exchange reused %d; nmse first %.3g rest %.3g\n",
+                __func__, reused_warm, reused_first, first.nmse(), diff.nmse());
+        CTX_REQUIRE(reused_warm > 0, "the warm-up did not reuse its graph, so the case tests nothing");
+        CTX_REQUIRE(first.n_nan == 0 && first.nmse() <= NMSE_THRESHOLD, "the first decode after the exchange read the old streams");
+        CTX_REQUIRE(diff.n_nan == 0 && diff.nmse() <= NMSE_THRESHOLD, "decodes after the exchange read the old streams");
+
+        return case_result::pass();
+    }
+};
+
 std::vector<ctx_test_ptr> make_kv_cases() {
     std::vector<ctx_test_ptr> cases;
 
@@ -928,6 +1119,8 @@ std::vector<ctx_test_ptr> make_kv_cases() {
     cases.push_back(std::make_unique<case_seq_swap_stream>(0));
     cases.push_back(std::make_unique<case_seq_swap_stream>(3));
     cases.push_back(std::make_unique<case_seq_swap_stream>(1, true));
+    cases.push_back(std::make_unique<case_swap_stream_graph_reuse>());
+    cases.push_back(std::make_unique<case_swap_stream_graph_reuse_mtp>());
     cases.push_back(std::make_unique<case_seq_swap_stream>(3, true));
 
     return cases;
