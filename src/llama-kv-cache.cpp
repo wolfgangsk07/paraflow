@@ -3654,6 +3654,14 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
 }
 
+uint32_t llama_kv_cache_context::get_s0() const {
+    return sinfos.empty() ? 0 : sinfos[i_cur].s0;
+}
+
+uint32_t llama_kv_cache_context::get_s1() const {
+    return sinfos.empty() ? 0 : sinfos[i_cur].s1;
+}
+
 ggml_type llama_kv_cache_context::type_k() const {
     return kv->type_k();
 }
