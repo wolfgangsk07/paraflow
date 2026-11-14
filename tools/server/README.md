@@ -40,6 +40,9 @@ The table below lists the additions relative to upstream llama.cpp `5aeac37a`. I
 | `--vip`, `--no-vip` | Disabled | Allow a positive-priority request to preempt ordinary work. Ordinary running work is reduced toward `max(0, lanes - active_VIP)` while VIP work is active. |
 | `--system-cache-mib N` | `0`, disabled | Host-RAM budget in MiB for shared system-prompt states. Requires non-unified KV. This is separate from the GPU KV pool, the upstream prompt-cache budget, and the RAM used by suspended requests. |
 | `--loop-guard`, `--no-loop-guard` | Disabled | Optionally stop generation after at least 512 tokens when the output ends in five exact repetitions of a token block, with period at least 10. Legitimate repetitive output can trigger it, so it is opt-in. |
+| `--dash`, `--no-dash` | Disabled | Serve the built-in dashboard at `GET /paraflow/dash` and a JSON counter snapshot at `GET /paraflow/dash/snap`. The page is self-contained; polling does not block the inference loop. Also controlled by `LLAMA_ARG_DASH`. |
+
+With `--dash`, open `http://<host>:8080/paraflow/dash` after the server starts.
 
 ### Shared pool, sequence length, slots, and lanes
 

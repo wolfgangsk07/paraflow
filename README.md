@@ -177,6 +177,9 @@ These do not change the multi-GPU scaling model; they are policy knobs for produ
 | `--kv-spill` | Move a frozen request to host RAM when the KV pool is full. Requires unified or dynamic KV. |
 | `--system-cache-mib N` | Cache shared system-prefix states in host RAM. Requires non-unified KV. |
 | `--loop-guard` | Stop long exact-repetition loops; off by default. |
+| `--dash` | Serve the built-in dashboard at `/paraflow/dash`; `/paraflow/dash/snap` returns a JSON counter snapshot. Off by default. |
+
+Enable the dashboard with `--dash`, then open `http://<host>:8080/paraflow/dash`. The page is self-contained and reads counters without blocking the inference loop.
 
 Full list and constraints: [parameter documentation](tools/server/README.md).
 

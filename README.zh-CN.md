@@ -178,6 +178,9 @@ curl http://localhost:8080/v1/chat/completions \
 | `--kv-spill` | KV 池满时把冻结请求换到主机内存。要求 unified 或 dynamic KV。 |
 | `--system-cache-mib N` | 用主机内存缓存共享 system 前缀状态。要求 non-unified KV。 |
 | `--loop-guard` | 遇到长段完全重复输出时停止；默认关闭。 |
+| `--dash` | 在 `/paraflow/dash` 提供内置监控面板；`/paraflow/dash/snap` 返回 JSON 计数器快照。默认关闭。 |
+
+用 `--dash` 开启后，打开 `http://<host>:8080/paraflow/dash`。页面自带全部资源，读取计数器时不会阻塞推理主循环。
 
 完整参数和约束见[参数文档](tools/server/README.md)。
 
