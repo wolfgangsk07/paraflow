@@ -132,6 +132,8 @@ struct server_routes {
     server_http_context::handler_t get_health;
     server_http_context::handler_t get_metrics;
     server_http_context::handler_t get_slots;
+    server_http_context::handler_t get_dash;      // --dash: embedded page
+    server_http_context::handler_t get_dash_snap; // --dash: counter snapshot, never touches the task queue
     server_http_context::handler_t post_slots;
     server_http_context::handler_t get_props;
     server_http_context::handler_t post_props;

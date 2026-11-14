@@ -1841,6 +1841,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SYSTEM_CACHE_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--dash"},
+        {"--no-dash"},
+        string_format("serve the built-in dashboard at /paraflow/dash; the main loop publishes a counter snapshot "
+            "at most every 200 ms while someone polls and never waits for readers, and keeps 6 h of throughput "
+            "history in 2 s buckets (about 340 KiB) (default: %s)",
+            params.dash ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.dash = value;
+        }
+    ).set_env("LLAMA_ARG_DASH").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--loop-guard"},
         {"--no-loop-guard"},
         string_format("stop a generation after 512+ tokens once its output ends in 5 exact repeats of a token block "

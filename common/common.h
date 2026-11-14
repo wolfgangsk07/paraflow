@@ -683,6 +683,9 @@ struct common_params {
     // system prefix cache: host RAM budget for shared system-prompt states (0 = off)
     int32_t system_cache_mib = 0;
 
+    // built-in dashboard: GET /paraflow/dash (page) and /paraflow/dash/snap (counter snapshot)
+    bool    dash = false;
+
     // stop a generation whose output ends in an exact repeated token block (see server-loop-guard.h)
     bool    loop_guard = false;
 

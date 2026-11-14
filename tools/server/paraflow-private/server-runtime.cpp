@@ -1067,6 +1067,72 @@ static bool server_speculative_sampler_backup_needed(
             (removal == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft > capacity);
 }
 
+const char * paraflow_dash_html(); // server-dash-page.cpp
+
+// Built-in dashboard (--dash). The main loop copies existing counters into this plain struct at most every
+// 200 ms while someone polled in the last 10 s, and hands it over with try_lock so it never waits for a reader.
+// Readers format JSON on the HTTP thread. Throughput history is kept separately (paraflow_dash_bucket below).
+struct paraflow_dash_slot {
+    int16_t id, state, lane, stream;
+    int32_t n_tokens, n_cells;
+    uint8_t vip, mtp, paused, pad;
+};
+struct paraflow_dash_susp { // a request whose KV was paged out to host RAM
+    int16_t  id;            // slot it came from (a VIP may now be using that slot)
+    uint8_t  vip, capacity; // capacity = paged out for KV pool space, else to free a slot for a VIP
+    int32_t  n_tokens;
+    uint64_t bytes;         // host copy of target + draft sequence state
+};
+struct paraflow_dash_dev {
+    char     name[32];
+    uint64_t model, context, compute, total;
+};
+struct paraflow_dash_snap {
+    uint64_t seq = 0;
+    int64_t  t_us = 0, t_start_us = 0, mem_t_us = 0;
+    // cumulative token counters
+    uint64_t prompt = 0, predict = 0, cached = 0, decodes = 0;
+    uint64_t draft_tokens = 0, draft_accepted = 0, draft_steps = 0;
+    uint64_t accepted_pos[8] = {};
+    int32_t  n_accepted_pos = 0;
+    // pipeline scheduler
+    uint64_t settled = 0, cars_prefill = 0, cars_decode = 0, cars_mixed = 0, payload_prompt = 0, payload_decode = 0;
+    int64_t  issue_us = 0, wait_us = 0, process_us = 0, drain_us = 0;
+    uint64_t admission_us = 0, admission_skipped = 0, vip_pause_skipped = 0, compact_moves = 0, ckpt_holds = 0, deferrals = 0;
+    uint64_t oom_isolations = 0, oom_terminated = 0, draft_degrade = 0, draft_failures = 0;
+    uint64_t dft_joins = 0, dft_join_waits = 0;
+    int64_t  dft_join_wait_us = 0;
+    // system prefix cache
+    uint64_t sc_hits = 0, sc_hit_tokens = 0, sc_misses = 0, sc_evictions = 0, sc_failures = 0, sc_bytes = 0;
+    // live state
+    int32_t  n_slots = 0, n_processing = 0, n_prompt = 0, n_gen = 0, n_paused = 0, n_suspended = 0, n_vip = 0, n_deferred = 0;
+    uint64_t kv_used = 0, kv_cap = 0, kv_max = 0;
+    int32_t  n_rows = 0;
+    paraflow_dash_slot rows[256];
+    int32_t  n_susp = 0;
+    uint64_t susp_bytes = 0;
+    paraflow_dash_susp susp[64];
+    // cumulative completions per context-length bucket (64 buckets, 1k each: 0-1k, 1-2k, ..., 63-64k, >=64k)
+    uint64_t ctx_hist[64] = {};
+    int32_t  n_dev = 0;
+    paraflow_dash_dev  dev[16];
+};
+
+// --dash throughput history: 6 h of 2 s wall-clock buckets kept by the server, so the page shows the same
+// curve after a reload or a long background tab. Single writer (main loop, plain relaxed stores); HTTP readers
+// copy a bucket seqlock-style and skip one that is being recycled. 10800 x 32 B = 338 KiB, allocated with --dash.
+static constexpr int64_t PARAFLOW_DASH_BUCKET_MS = 2000;
+static constexpr int64_t PARAFLOW_DASH_BUCKETS   = 6 * 3600 * 1000 / PARAFLOW_DASH_BUCKET_MS;
+struct paraflow_dash_bucket {
+    std::atomic<uint32_t> id{0};                  // absolute bucket (wall ms / 2000); UINT32_MAX while recycled
+    std::atomic<uint32_t> dp{0}, dd{0}, dd_pure{0}; // prefill tokens, decode tokens, decode tokens in pure-decode spans
+    std::atomic<uint32_t> ng_ms{0}, np_ms{0};       // integral of generating / prefilling requests (paused excluded) over time
+    std::atomic<uint32_t> pure_ms{0}, mix_ms{0};    // time with decode output and no prefill / with both
+};
+static int64_t paraflow_wall_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
 struct server_context_impl {
     friend struct server_context;
 
@@ -1111,7 +1177,66 @@ public:
         metrics.reset_bucket();
     }
 
+    // HTTP thread: copy the last published dashboard snapshot and mark the dashboard as watched. The loop publishes
+    // only while it runs; when it went idle right after a publish (or nothing was published yet) ask for exactly one
+    // more pass so the slot table shows the idle state. Once idle is published no further wakeups are requested.
+    bool dash_read(paraflow_dash_snap & out, std::string & config) {
+        const int64_t now = ggml_time_us();
+        dash_last_read_us.store(now, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(dash_mutex);
+            out    = dash_pub;
+            config = dash_config;
+        }
+        const bool stale = out.seq == 0 || (out.n_processing > 0 && now - out.t_us > 500 * 1000);
+        if (stale && !queue_tasks.is_sleeping()) {
+            queue_tasks.request_update();
+        }
+        return out.seq > 0;
+    }
+
+    // HTTP thread: append ,"hist":{...} with complete buckets [from, now). Empty (idle) buckets are written as 0;
+    // buckets before this process started are not written, so the page sees them as a gap.
+    void dash_hist_json(int64_t from, std::string & o) const {
+        if (!dash_hist) { return; }
+        const int64_t now_ms = paraflow_wall_ms(), cur = now_ms / PARAFLOW_DASH_BUCKET_MS;
+        const int64_t lo  = std::max({ from, dash_hist_start, cur - PARAFLOW_DASH_BUCKETS + 1 });
+        char b[192];
+        snprintf(b, sizeof(b), ",\"hist\":{\"bucket_ms\":%" PRId64 ",\"now_ms\":%" PRId64 ",\"start\":%" PRId64 ",\"cur\":%" PRId64 ",\"from\":%" PRId64 ",\"rows\":[",
+                 PARAFLOW_DASH_BUCKET_MS, now_ms, dash_hist_start, cur, lo);
+        o += b;
+        for (int64_t k = lo; k < cur; ++k) {
+            const auto & e = dash_hist[k % PARAFLOW_DASH_BUCKETS];
+            const uint32_t id1 = e.id.load(std::memory_order_acquire);
+            const uint32_t v[7] = { e.dp.load(std::memory_order_relaxed), e.dd.load(std::memory_order_relaxed),
+                                    e.dd_pure.load(std::memory_order_relaxed), e.ng_ms.load(std::memory_order_relaxed),
+                                    e.np_ms.load(std::memory_order_relaxed), e.pure_ms.load(std::memory_order_relaxed),
+                                    e.mix_ms.load(std::memory_order_relaxed) };
+            std::atomic_thread_fence(std::memory_order_acquire);
+            const uint32_t id2 = e.id.load(std::memory_order_relaxed);
+            if (k > lo) { o += ','; }
+            if (id1 != (uint32_t) k || id2 != (uint32_t) k || !(v[0] | v[1] | v[3] | v[4])) { o += '0'; continue; }
+            snprintf(b, sizeof(b), "[%u,%u,%u,%u,%u,%u,%u]", v[0], v[1], v[2], v[3], v[4], v[5], v[6]);
+            o += b;
+        }
+        o += "]}";
+    }
+
 private:
+    std::mutex             dash_mutex;
+    paraflow_dash_snap     dash_pub;                 // guarded by dash_mutex
+    std::string            dash_config;              // guarded by dash_mutex, written once
+    paraflow_dash_snap     dash_work;                // main thread only
+    std::atomic<int64_t>   dash_last_read_us{-1000000000};
+    int64_t                dash_last_pub_us = 0;
+    uint64_t               dash_ctx_hist[64] = {};   // histogram accumulator (main thread only)
+    uint64_t               dash_kv_max = 0;           // KV high-water mark (main thread only)
+    std::unique_ptr<paraflow_dash_bucket[]> dash_hist; // throughput history ring (--dash only)
+    int64_t                dash_hist_start = 0;       // first bucket of this process (written before serving)
+    int64_t                dash_hist_prev_ms = 0;     // main thread only from here on
+    bool                   dash_hist_prev_busy = false;
+    uint64_t               dash_hist_prompt = 0, dash_hist_predict = 0;
+
     // note: accessing these fields outside of this class is not thread-safe
     // use server_context methods instead
 
@@ -3729,6 +3854,13 @@ private:
                 if (slot.stats.n_gen > 0) {
                     metrics_on_prediction(slot);
                 }
+                // context-length histogram: count completions by (prompt + generated) token total
+                // 64 buckets: 0-1k, 1-2k, ..., 63-64k, >=64k
+                const int32_t total_ctx = (int32_t)(slot.prompt.n_tokens() + slot.stats.n_gen);
+                if (total_ctx > 0) {
+                    const int bk = (total_ctx < 65536) ? (total_ctx / 1024) : 63;
+                    dash_ctx_hist[bk]++;
+                }
             };
 
             slot.reset();
@@ -3908,13 +4040,25 @@ private:
             return process_single_task(std::move(task), is_yielding);
         });
         queue_tasks.on_update_slots([this]() {
+            const int64_t t_enter = dash_hist ? paraflow_wall_ms() : 0;
             update_slots();
+            if (dash_hist) { dash_hist_record(t_enter); }
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
         });
 
         metrics.init();
+
+        if (params_base.dash) {
+            const std::string cfg = dash_make_config();
+            std::lock_guard<std::mutex> lock(dash_mutex);
+            dash_config = cfg;
+            dash_hist.reset(new paraflow_dash_bucket[PARAFLOW_DASH_BUCKETS]);
+            dash_hist_start = paraflow_wall_ms() / PARAFLOW_DASH_BUCKET_MS;
+            dash_hist_prompt = metrics.n_prompt_observed; dash_hist_predict = metrics.n_predict_observed;
+            SRV_INF("%s", "dashboard enabled at /paraflow/dash\n");
+        }
 
         if (params_base.cache_idle_slots) {
             if (params_base.cache_ram_mib == 0) {
@@ -5994,7 +6138,228 @@ private:
     };
 #endif
 
+    // Main thread. Copies existing counters only; skipped entirely unless a reader polled in the last 10 s.
+    void dash_publish() {
+        const int64_t now = ggml_time_us();
+        if (now - dash_last_read_us.load(std::memory_order_relaxed) > 10 * 1000 * 1000) { return; }
+        if (now - dash_last_pub_us < 200 * 1000) { return; }
+        dash_last_pub_us = now;
+
+        auto & d = dash_work;
+        d.seq++;
+        d.t_us = now;
+        d.t_start_us = metrics.t_start;
+
+        d.prompt  = metrics.n_prompt_observed;
+        d.predict = metrics.n_predict_observed;
+        d.cached  = metrics.n_prompt_cached;
+        d.decodes = metrics.n_decode;
+        // released requests are folded into metrics; running ones still hold their own draft counts
+        d.draft_tokens = metrics.n_draft_tokens; d.draft_accepted = metrics.n_draft_accepted; d.draft_steps = metrics.n_draft_verif_steps;
+        d.n_accepted_pos = (int32_t) std::min<size_t>(8, metrics.n_accepted_per_pos.size());
+        for (int i = 0; i < 8; ++i) { d.accepted_pos[i] = i < (int) metrics.n_accepted_per_pos.size() ? metrics.n_accepted_per_pos[i] : 0; }
+        const auto add_live = [&](const server_slot & slot) {
+            d.draft_tokens += slot.stats.n_draft_tokens; d.draft_accepted += slot.stats.n_draft_accepted; d.draft_steps += slot.stats.n_draft_verif_steps;
+            for (size_t i = 0; i < slot.n_accepted_per_pos.size() && i < 8; ++i) {
+                d.accepted_pos[i] += slot.n_accepted_per_pos[i];
+                d.n_accepted_pos = std::max<int32_t>(d.n_accepted_pos, (int32_t) i + 1);
+            }
+        };
+
+        d.settled = pipeline_profile_count;
+        d.cars_prefill = pipeline_prefill_cars; d.cars_decode = pipeline_decode_cars; d.cars_mixed = pipeline_mixed_cars;
+        d.payload_prompt = pipeline_prompt_payload; d.payload_decode = pipeline_decode_payload;
+        d.issue_us = pipeline_profile_issue_us; d.wait_us = pipeline_profile_wait_us;
+        d.process_us = pipeline_profile_process_us; d.drain_us = pipeline_drain_us;
+        d.admission_us = pipeline_admission_drain_us; d.admission_skipped = pipeline_admission_skipped;
+        d.vip_pause_skipped = pipeline_vip_pause_skipped; d.compact_moves = pipeline_compact_moves;
+        d.ckpt_holds = pipeline_checkpoint_holds; d.deferrals = pipeline_work_deferrals;
+        d.oom_isolations = pipeline_oom_isolations; d.oom_terminated = pipeline_oom_terminated;
+        d.draft_degrade = pipeline_draft_degrade_events; d.draft_failures = pipeline_draft_step_failures;
+        if (dft_exec) {
+            // join counters are written by this thread only
+            d.dft_joins = dft_exec->n_joins; d.dft_join_waits = dft_exec->n_join_waits; d.dft_join_wait_us = dft_exec->join_wait_us;
+        }
+
+        d.sc_hits = system_cache_hits; d.sc_hit_tokens = system_cache_hit_tokens; d.sc_misses = system_cache_misses;
+        d.sc_evictions = system_cache_evictions; d.sc_failures = system_cache_restore_failures; d.sc_bytes = system_cache_bytes;
+
+        d.n_slots = (int32_t) slots.size();
+        d.n_processing = d.n_prompt = d.n_gen = d.n_paused = d.n_vip = 0;
+        d.n_rows = 0;
+        llama_memory_t mem = llama_get_memory(ctx_tgt);
+        for (const auto & slot : slots) {
+            const bool busy = slot.is_processing();
+            const int32_t cells = (int32_t) llama_memory_seq_n_cells(mem, slot.id);
+            if (busy) {
+                d.n_processing++;
+                d.n_gen    += (slot.state == SLOT_STATE_GENERATING) && !slot.resident_paused;
+                d.n_prompt += (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) && !slot.resident_paused;
+                d.n_paused += slot.resident_paused;
+                d.n_vip    += slot.task && slot.task->params.priority > 0;
+                add_live(slot);
+            }
+            if (d.n_rows < (int32_t) (sizeof(d.rows) / sizeof(d.rows[0]))) {
+                auto & r = d.rows[d.n_rows++];
+                r.id = (int16_t) slot.id; r.state = (int16_t) slot.state;
+                r.lane = (int16_t) pipeline_lane_of(slot.id);
+                r.stream = (int16_t) llama_memory_seq_stream(mem, slot.id);
+                r.n_tokens = busy ? (int32_t) slot.prompt.n_tokens() : 0;
+                r.n_cells = cells;
+                r.vip = busy && slot.task && slot.task->params.priority > 0;
+                r.mtp = busy && slot.can_speculate();
+                r.paused = slot.resident_paused; r.pad = 0;
+            }
+        }
+        d.n_susp = 0; d.susp_bytes = 0;
+        for (const auto & saved : suspended_requests) {
+            add_live(*saved.slot);
+            const uint64_t bytes = saved.target.size() + saved.draft.size();
+            d.susp_bytes += bytes;
+            if (d.n_susp < (int32_t) (sizeof(d.susp) / sizeof(d.susp[0]))) {
+                auto & r = d.susp[d.n_susp++];
+                r.id = (int16_t) saved.slot->id;
+                r.vip = saved.slot->task && saved.slot->task->params.priority > 0;
+                r.capacity = saved.capacity_page;
+                r.n_tokens = (int32_t) saved.slot->prompt.n_tokens();
+                r.bytes = bytes;
+            }
+        }
+        d.n_suspended = (int32_t) suspended_requests.size();
+        d.n_deferred  = (int32_t) queue_tasks.queue_tasks_deferred_size();
+        d.kv_used = resident_tokens();
+        if (d.kv_used > dash_kv_max) dash_kv_max = d.kv_used;
+        d.kv_max  = dash_kv_max;
+        d.kv_cap  = (uint64_t) n_ctx;
+        for (int i = 0; i < 64; ++i) { d.ctx_hist[i] = dash_ctx_hist[i]; }
+
+        // allocator sizes every 2 s; the draft context only while its worker is provably idle
+        if (now - d.mem_t_us > 2 * 1000 * 1000) {
+            std::unique_lock<std::mutex> dft_lock;
+            bool dft_idle = !dft_exec;
+            if (dft_exec) {
+                dft_lock = std::unique_lock<std::mutex>(dft_exec->mutex, std::try_to_lock);
+                dft_idle = dft_lock.owns_lock() && dft_exec->queue.empty() && !dft_exec->busy;
+            }
+            if (dft_idle) {
+                std::map<std::string, paraflow_dash_dev> devs;
+                const auto add = [&](ggml_backend_buffer_type_t buft, size_t model_b, size_t ctx_b, size_t comp_b) {
+                    if (!buft || ggml_backend_buft_is_host(buft)) { return; }
+                    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                    const std::string name = dev ? ggml_backend_dev_name(dev) : ggml_backend_buft_name(buft);
+                    auto & e = devs[name];
+                    e.model += model_b; e.context += ctx_b; e.compute += comp_b;
+                };
+                for (const auto & [buft, mb] : llama_get_memory_breakdown(ctx_tgt)) { add(buft, mb.model, mb.context, mb.compute); }
+                for (const auto & [buft, sz] : llama_get_pipeline_aux_memory_breakdown(ctx_tgt)) { add(buft, 0, 0, sz); }
+                if (ctx_dft) {
+                    const bool shared = llama_get_model(ctx_dft) == llama_get_model(ctx_tgt);
+                    for (const auto & [buft, mb] : llama_get_memory_breakdown(ctx_dft)) { add(buft, shared ? 0 : mb.model, mb.context, mb.compute); }
+                    for (const auto & [buft, sz] : llama_get_pipeline_aux_memory_breakdown(ctx_dft)) { add(buft, 0, 0, sz); }
+                }
+                d.n_dev = 0;
+                for (auto & [name, e] : devs) {
+                    if (d.n_dev >= 16) { break; }
+                    auto & o = d.dev[d.n_dev++];
+                    snprintf(o.name, sizeof(o.name), "%s", name.c_str());
+                    o.model = e.model; o.context = e.context; o.compute = e.compute;
+                    const auto it = dash_dev_total.find(name);
+                    o.total = it != dash_dev_total.end() ? it->second : 0;
+                }
+                d.mem_t_us = now;
+            }
+        }
+
+        if (dash_mutex.try_lock()) { // a reader holds it only for one struct copy; skip this round otherwise
+            dash_pub = d;
+            dash_mutex.unlock();
+        }
+    }
+
+    std::map<std::string, uint64_t> dash_dev_total;
+
+    paraflow_dash_bucket & dash_hist_bucket(int64_t k) {
+        auto & b = dash_hist[k % PARAFLOW_DASH_BUCKETS];
+        if (b.id.load(std::memory_order_relaxed) != (uint32_t) k) { // recycle a bucket last written 6 h ago (or never)
+            b.id.store(UINT32_MAX, std::memory_order_relaxed);
+            std::atomic_thread_fence(std::memory_order_release);
+            for (auto * f : { &b.dp, &b.dd, &b.dd_pure, &b.ng_ms, &b.np_ms, &b.pure_ms, &b.mix_ms }) { f->store(0, std::memory_order_relaxed); }
+            b.id.store((uint32_t) k, std::memory_order_release);
+        }
+        return b;
+    }
+
+    // Main thread, after every update_slots() pass. Tokens counted since the previous pass are spread over the
+    // time they took: from the end of the previous pass if work was in flight then, else from the start of this
+    // pass (an idle loop does not run, so idle time stays empty). Request counts use the state after the pass.
+    void dash_hist_record(int64_t t_enter) {
+        const int64_t z = paraflow_wall_ms();
+        const uint64_t dp = metrics.n_prompt_observed - dash_hist_prompt, dd = metrics.n_predict_observed - dash_hist_predict;
+        dash_hist_prompt = metrics.n_prompt_observed; dash_hist_predict = metrics.n_predict_observed;
+        uint64_t ng = 0, np = 0;
+        bool busy = !suspended_requests.empty();
+        for (const auto & slot : slots) {
+            if (!slot.is_processing()) { continue; }
+            busy = true;
+            if (slot.resident_paused) { continue; }
+            ng += slot.state == SLOT_STATE_GENERATING;
+            np += slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT;
+        }
+        int64_t a = dash_hist_prev_busy ? dash_hist_prev_ms : t_enter;
+        dash_hist_prev_busy = busy; dash_hist_prev_ms = z;
+        if (!dp && !dd && !ng && !np) { return; }
+        a = std::max(std::min(a, z), z - PARAFLOW_DASH_BUCKETS * PARAFLOW_DASH_BUCKET_MS);
+        const int64_t span = z - a;
+        const bool pure = dd > 0 && dp == 0, mixed = dd > 0 && dp > 0;
+        const auto add = [](std::atomic<uint32_t> & f, uint64_t v) { f.store(f.load(std::memory_order_relaxed) + (uint32_t) v, std::memory_order_relaxed); };
+        uint64_t left_p = dp, left_d = dd;
+        for (int64_t k = a / PARAFLOW_DASH_BUCKET_MS; ; ++k) {
+            const int64_t bs = k * PARAFLOW_DASH_BUCKET_MS, be = bs + PARAFLOW_DASH_BUCKET_MS;
+            const bool last = span == 0 || be >= z;
+            const uint64_t ov = span == 0 ? 0 : (uint64_t) (std::min(z, be) - std::max(a, bs));
+            const uint64_t sp = last ? left_p : dp * ov / (uint64_t) span, sd = last ? left_d : dd * ov / (uint64_t) span;
+            left_p -= sp; left_d -= sd;
+            auto & b = dash_hist_bucket(k);
+            add(b.dp, sp); add(b.dd, sd); add(b.ng_ms, ng * ov); add(b.np_ms, np * ov);
+            if (pure) { add(b.dd_pure, sd); add(b.pure_ms, ov); } else if (mixed) { add(b.mix_ms, ov); }
+            if (last) { break; }
+        }
+    }
+
+    // once at startup, before the serving loop: fixed run configuration and device totals
+    std::string dash_make_config() {
+        const llama_model * model = llama_get_model(ctx_tgt);
+        json devices = json::array();
+        for (int i = 0; i < llama_model_n_devices(model); ++i) {
+            ggml_backend_dev_t dev = llama_model_get_device(model, i);
+            if (!dev) { continue; }
+            size_t free_b = 0, total_b = 0;
+            ggml_backend_dev_memory(dev, &free_b, &total_b);
+            dash_dev_total[ggml_backend_dev_name(dev)] = total_b;
+            devices.push_back({{"name", ggml_backend_dev_name(dev)}, {"desc", ggml_backend_dev_description(dev)}, {"total", total_b}});
+        }
+        std::string path = params_base.model.path;
+        const auto slash = path.find_last_of('/');
+        if (slash != std::string::npos) { path = path.substr(slash + 1); }
+        const auto & spec = params_base.speculative;
+        const bool mtp = std::find(spec.types.begin(), spec.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != spec.types.end();
+        return safe_json_to_str({
+            {"build", llama_build_info()}, {"model", path},
+            {"n_parallel", params_base.n_parallel}, {"n_ctx", n_ctx}, {"n_ctx_slot", slots.empty() ? 0 : slots[0].n_ctx},
+            {"n_batch", params_base.n_batch}, {"n_ubatch", params_base.n_ubatch},
+            {"pipe_lanes", pipeline_count}, {"prefill_lanes", pipeline_prefill_lanes},
+            {"prefill_chunk", params_base.pipe_prefill_chunk}, {"pf_inflight", params_base.pipe_pf_inflight},
+            {"system_cache_mib", params_base.system_cache_mib},
+            {"kv_dynamic", params_base.kv_dynamic}, {"kv_unified", params_base.kv_unified}, {"kv_spill", params_base.kv_spill},
+            {"vip", params_base.vip_enable},
+            {"cache_type_k", ggml_type_name(params_base.cache_type_k)}, {"cache_type_v", ggml_type_name(params_base.cache_type_v)},
+            {"mtp", mtp}, {"draft_n_max", spec.draft.n_max},
+            {"devices", devices},
+        });
+    }
+
     void update_slots() {
+        if (params_base.dash) { dash_publish(); }
         if (!ckpt_async_items.empty()) { ckpt_async_poll(-1, false); }
         resume_paused();
         ensure_generation_capacity();
@@ -8285,6 +8650,84 @@ void server_routes::init_routes() {
             res->data = res_task->to_metrics();
         }
 
+        return res;
+    };
+
+    // --dash. Neither handler posts a task: the page is a constant, the snapshot is a struct copy under a mutex
+    // the main loop only ever try_locks. No create_response(): that would wait for a sleeping server to wake.
+    this->get_dash = [](const server_http_req &) {
+        auto res = std::make_unique<server_http_res>();
+        res->content_type = "text/html; charset=utf-8";
+        res->headers["Cache-Control"] = "no-store";
+        res->data = paraflow_dash_html();
+        return res;
+    };
+    this->get_dash_snap = [this](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        res->headers["Cache-Control"] = "no-store";
+        paraflow_dash_snap d;
+        std::string config;
+        const bool have = ctx_server.dash_read(d, config);
+        const int64_t now = ggml_time_us();
+        std::string o;
+        o.reserve(8192);
+        char b[512];
+        snprintf(b, sizeof(b), "{\"ok\":%s,\"seq\":%" PRIu64 ",\"now_us\":%" PRId64 ",\"t_us\":%" PRId64 ",\"t_start_us\":%" PRId64 ",\"mem_t_us\":%" PRId64,
+                 have ? "true" : "false", d.seq, now, d.t_us, d.t_start_us, d.mem_t_us);
+        o += b;
+        o += ",\"config\":"; o += config.empty() ? "null" : config;
+        const auto u64 = [&](const char * k, uint64_t v) { snprintf(b, sizeof(b), ",\"%s\":%" PRIu64, k, v); o += b; };
+        const auto i64 = [&](const char * k, int64_t v)  { snprintf(b, sizeof(b), ",\"%s\":%" PRId64, k, v); o += b; };
+        u64("prompt", d.prompt); u64("predict", d.predict); u64("cached", d.cached); u64("decodes", d.decodes);
+        u64("draft_tokens", d.draft_tokens); u64("draft_accepted", d.draft_accepted); u64("draft_steps", d.draft_steps);
+        o += ",\"accepted_pos\":[";
+        for (int i = 0; i < d.n_accepted_pos; ++i) { snprintf(b, sizeof(b), "%s%" PRIu64, i ? "," : "", d.accepted_pos[i]); o += b; }
+        o += "]";
+        u64("settled", d.settled); u64("cars_prefill", d.cars_prefill); u64("cars_decode", d.cars_decode); u64("cars_mixed", d.cars_mixed);
+        u64("payload_prompt", d.payload_prompt); u64("payload_decode", d.payload_decode);
+        i64("issue_us", d.issue_us); i64("wait_us", d.wait_us); i64("process_us", d.process_us); i64("drain_us", d.drain_us);
+        u64("admission_us", d.admission_us); u64("admission_skipped", d.admission_skipped); u64("vip_pause_skipped", d.vip_pause_skipped);
+        u64("compact_moves", d.compact_moves); u64("ckpt_holds", d.ckpt_holds); u64("deferrals", d.deferrals);
+        u64("oom_isolations", d.oom_isolations); u64("oom_terminated", d.oom_terminated);
+        u64("draft_degrade", d.draft_degrade); u64("draft_failures", d.draft_failures);
+        u64("dft_joins", d.dft_joins); u64("dft_join_waits", d.dft_join_waits); i64("dft_join_wait_us", d.dft_join_wait_us);
+        u64("sc_hits", d.sc_hits); u64("sc_hit_tokens", d.sc_hit_tokens); u64("sc_misses", d.sc_misses);
+        u64("sc_evictions", d.sc_evictions); u64("sc_failures", d.sc_failures); u64("sc_bytes", d.sc_bytes);
+        i64("n_slots", d.n_slots); i64("n_processing", d.n_processing); i64("n_prompt", d.n_prompt); i64("n_gen", d.n_gen);
+        i64("n_paused", d.n_paused); i64("n_suspended", d.n_suspended); i64("n_vip", d.n_vip); i64("n_deferred", d.n_deferred);
+        u64("kv_used", d.kv_used); u64("kv_cap", d.kv_cap); u64("kv_max", d.kv_max);
+        // slots: [id, state, lane, stream, tokens, cells, vip, mtp, paused]
+        o += ",\"slots\":[";
+        for (int i = 0; i < d.n_rows; ++i) {
+            const auto & r = d.rows[i];
+            snprintf(b, sizeof(b), "%s[%d,%d,%d,%d,%d,%d,%d,%d,%d]", i ? "," : "", r.id, r.state, r.lane, r.stream, r.n_tokens, r.n_cells, r.vip, r.mtp, r.paused);
+            o += b;
+        }
+        o += "],\"susp_bytes\":" + std::to_string(d.susp_bytes);
+        // susp: [slot, tokens, vip, capacity, bytes]
+        o += ",\"susp\":[";
+        for (int i = 0; i < d.n_susp; ++i) {
+            const auto & r = d.susp[i];
+            snprintf(b, sizeof(b), "%s[%d,%d,%d,%d,%" PRIu64 "]", i ? "," : "", r.id, r.n_tokens, r.vip, r.capacity, r.bytes);
+            o += b;
+        }
+        o += "]";
+        // context-length histogram: cumulative completions per bucket
+        o += ",\"ctx_hist\":[";
+        for (int i = 0; i < 64; ++i) { o += (i ? "," : "") + std::to_string(d.ctx_hist[i]); }
+        o += "],\"devices\":[";
+        for (int i = 0; i < d.n_dev; ++i) {
+            const auto & e = d.dev[i];
+            snprintf(b, sizeof(b), "%s{\"name\":\"%s\",\"model\":%" PRIu64 ",\"context\":%" PRIu64 ",\"compute\":%" PRIu64 ",\"total\":%" PRIu64 "}",
+                     i ? "," : "", e.name, e.model, e.context, e.compute, e.total);
+            o += b;
+        }
+        o += "]";
+        // ?h=<first bucket wanted>: throughput history; the page asks again for its last few buckets each poll
+        const std::string h = req.get_param("h");
+        if (!h.empty()) { ctx_server.dash_hist_json(std::strtoll(h.c_str(), nullptr, 10), o); }
+        o += "}";
+        res->data = std::move(o);
         return res;
     };
 

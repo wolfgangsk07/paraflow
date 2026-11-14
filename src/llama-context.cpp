@@ -5473,6 +5473,10 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
     return ctx->memory_breakdown();
 }
 
+std::map<ggml_backend_buffer_type_t, size_t> llama_get_pipeline_aux_memory_breakdown(const struct llama_context * ctx) {
+    return ctx->pipeline_auxiliary_memory_breakdown();
+}
+
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
 }

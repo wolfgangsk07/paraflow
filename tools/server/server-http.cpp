@@ -252,6 +252,7 @@ bool server_http_context::init_listener(const common_params & params) {
         std::unordered_set<std::string> endpoints {
             "/health",
             "/v1/health",
+            "/paraflow/dash", // the page itself carries no data; its snapshot fetch sends the API key
         };
         endpoints.insert(frontend_paths.begin(), frontend_paths.end());
         return endpoints;

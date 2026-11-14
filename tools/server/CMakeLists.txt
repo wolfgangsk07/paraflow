@@ -16,6 +16,7 @@ add_library(${TARGET} STATIC
     server-decision.cpp
     server-decision.h
     paraflow-private/server-runtime.cpp
+    paraflow-private/server-dash-page.cpp
     server-context.h
     server-stream.cpp
     server-stream.h
