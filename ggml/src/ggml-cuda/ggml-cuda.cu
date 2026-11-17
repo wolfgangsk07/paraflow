@@ -1521,10 +1521,18 @@ bool ggml_backend_cuda_sparse_kv_ensure(
             const size_t last = (offsets[range] + accessible_sizes[range] - 1) /
                     ctx->vmm_granularity;
             const size_t resident_end = offsets[range] + resident_sizes[range];
+            const bool can_premap_frontier = !ctx->sparse_elastic_pool && resident_sizes[range] != 0;
+            const size_t max_premap_distance = 2 * ctx->vmm_granularity;
             for (size_t page = first; page <= last; ++page) {
                 access_requested[page] = 1;
+                if (!can_premap_frontier) {
+                    continue;
+                }
                 const size_t page_start = page * ctx->vmm_granularity;
                 const size_t distance = page_start > resident_end ? page_start - resident_end : 0;
+                if (distance >= max_premap_distance) {
+                    continue;
+                }
                 const auto it = padding_distance.find(page);
                 if (it == padding_distance.end() || distance < it->second) {
                     padding_distance[page] = distance;
@@ -1558,6 +1566,9 @@ bool ggml_backend_cuda_sparse_kv_ensure(
         }
     }
 
+    if (ctx->sparse_elastic_pool && data_needed > ctx->sparse_free_handles.size()) {
+        (void) ggml_cuda_sparse_grow_elastic_pool(ctx, data_needed);
+    }
     if (data_needed > ctx->sparse_free_handles.size()) {
         const auto recyclable = ggml_cuda_sparse_unused_pages(ctx, &data_requested);
         g_sparse_recycled += recyclable.size();
@@ -1598,10 +1609,10 @@ bool ggml_backend_cuda_sparse_kv_ensure(
         created_physical.push_back(page);
     }
 
-    // The pool is already physically allocated, so use otherwise-free handles
-    // to pre-map the padding nearest each live prefix. Those pages can become
-    // real KV later without an unmap/remap synchronization. Farther padding
-    // falls back to the shared read-only zero alias.
+    // Pre-map only bounded frontier padding immediately ahead of live prefixes,
+    // while keeping a free-handle reserve so concurrent lanes never hit a
+    // device-synchronizing unmap/recycle stall. Farther or empty-stream padding
+    // uses the shared read-only zero alias.
     std::vector<std::pair<size_t, size_t>> padding_priority;
     padding_priority.reserve(padding_distance.size());
     for (const auto & [page, distance] : padding_distance) {
@@ -1611,8 +1622,9 @@ bool ggml_backend_cuda_sparse_kv_ensure(
         }
     }
     std::sort(padding_priority.begin(), padding_priority.end());
+    const size_t free_reserve = std::max<size_t>(32, (size_t) ctx->sparse_n_owners * 4);
     for (const auto & [_, page] : padding_priority) {
-        if (ctx->sparse_free_handles.empty()) {
+        if (ctx->sparse_free_handles.size() <= free_reserve) {
             break;
         }
         if (!ggml_cuda_sparse_map_page(ctx, page)) {
