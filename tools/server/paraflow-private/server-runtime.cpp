@@ -1166,6 +1166,7 @@ struct server_mtmd_pool {
     std::deque<job>             jobs;
     std::vector<result>         results;
     std::vector<std::tuple<int, server_task_id, size_t>> running;
+    std::deque<server_task_id>  evicted_tasks;
     std::function<void()>       on_ready;
     size_t n_embd = 0;
     bool   stop   = false;
@@ -1205,22 +1206,37 @@ struct server_mtmd_pool {
             }
             LOG_INF("mtmd pool: worker %zu | slot %d | task %lld | idx %zu | n_tokens %zu | res %d | t = %.1f ms\n",
                     w, j.slot, (long long) j.task, j.idx, n_tokens, r.res, (ggml_time_us() - t0) / 1e3);
+            bool dropped = false;
             {
                 std::lock_guard<std::mutex> lock(mtx);
                 running.erase(std::find(running.begin(), running.end(), std::make_tuple(j.slot, j.task, j.idx)));
-                results.push_back(std::move(r));
+                if (std::find(evicted_tasks.begin(), evicted_tasks.end(), j.task) != evicted_tasks.end()) {
+                    dropped = true;
+                } else {
+                    results.push_back(std::move(r));
+                }
             }
             cv_done.notify_all();
-            if (on_ready) { on_ready(); }
+            if (!dropped && on_ready) { on_ready(); }
         }
     }
 
-    // caller holds mtx
-    void purge(int slot, server_task_id task) {
+    // Drop queued/completed media chunks belonging to a finished or cancelled task (does not touch other tasks on VIP-borrowed slots)
+    void evict_task(server_task_id task) {
+        if (task < 0) { return; }
+        std::lock_guard<std::mutex> lock(mtx);
         jobs.erase(std::remove_if(jobs.begin(), jobs.end(),
-                [&](const job & j) { return j.slot == slot && j.task != task; }), jobs.end());
+                [&](const job & j) { return j.task == task; }), jobs.end());
         results.erase(std::remove_if(results.begin(), results.end(),
-                [&](const result & r) { return r.slot == slot && r.task != task; }), results.end());
+                [&](const result & r) { return r.task == task; }), results.end());
+        if (std::find(evicted_tasks.begin(), evicted_tasks.end(), task) == evicted_tasks.end()) {
+            if (evicted_tasks.size() >= 512) { evicted_tasks.pop_front(); }
+            evicted_tasks.push_back(task);
+        }
+    }
+
+    // caller holds mtx: keep VIP-borrowed suspended tasks intact; evict_task() handles finished/cancelled tasks
+    void purge(int /*slot*/, server_task_id /*task*/) {
     }
 
     void submit(int slot, server_task_id task, size_t idx, const mtmd_input_chunk * chunk) {
@@ -1288,15 +1304,20 @@ public:
         return false;
     }
 
-    // queue the async encoding of every media chunk of the slot's prompt from token index `from` on
+    // queue the async encoding of media chunks of the slot's prompt from token index `from` on (bounded lookahead)
     void mtmd_prefetch(const server_slot & slot, size_t from) const {
         if (!mtmd_pool || !slot.task || !slot.task->tokens.has_mtmd) { return; }
+        if (use_mixed_batch() && !slot.can_split()) { return; }
+        const size_t max_ahead = std::max<size_t>(2, mtmd_pool->ctxs.size() * 2);
+        size_t queued = 0;
         const auto & tokens = slot.task->tokens;
         if (from < tokens.size() && tokens[from] == LLAMA_TOKEN_NULL) {
             mtmd_pool->submit(slot.id, slot.task->id, from, tokens.find_chunk(from).get());
+            ++queued;
         }
-        for (auto [c, i] = tokens.find_next_media_chunk(from); c; std::tie(c, i) = tokens.find_next_media_chunk(i)) {
+        for (auto [c, i] = tokens.find_next_media_chunk(from); c && queued < max_ahead; std::tie(c, i) = tokens.find_next_media_chunk(i)) {
             mtmd_pool->submit(slot.id, slot.task->id, i, c->get());
+            ++queued;
         }
     }
 
@@ -1777,6 +1798,26 @@ private:
         return std::min(remaining, quantum);
     }
 
+    uint64_t prefill_kv_needed(const server_slot & slot) const {
+        const int cq = canonical_prefill_tokens(slot);
+        if (cq > 0) { return (uint64_t) cq; }
+        if (!slot.task) { return 1; }
+        const int cur_idx = slot.prompt.n_tokens();
+        if (cur_idx >= slot.task->n_tokens()) { return 1; }
+        if (slot.task->tokens.has_media() && slot.task->tokens[cur_idx] == LLAMA_TOKEN_NULL) {
+            const auto & chunk = slot.task->tokens.find_chunk(cur_idx);
+            if (chunk) {
+                return (uint64_t) std::min<size_t>((size_t) n_ctx, std::max<size_t>(1, mtmd_input_chunk_get_n_tokens(chunk.get())));
+            }
+        }
+        int span = 0;
+        while (cur_idx + span < slot.task->n_tokens() && slot.task->tokens[cur_idx + span] != LLAMA_TOKEN_NULL) {
+            ++span;
+        }
+        const int cap = std::max(1, std::min(int(llama_n_ubatch(ctx_tgt)), n_ctx));
+        return (uint64_t) std::max(1, std::min(span, cap));
+    }
+
     uint64_t generation_reserve() const {
         uint64_t needed = 0;
         uint64_t prefill = 0;
@@ -1785,7 +1826,7 @@ private:
             if (slot.state == SLOT_STATE_GENERATING) {
                 needed += 1 + std::max(0, slot.get_n_draft_max());
             } else if (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT) {
-                prefill = std::max<uint64_t>(prefill, std::max(1, canonical_prefill_tokens(slot)));
+                prefill = std::max<uint64_t>(prefill, prefill_kv_needed(slot));
             }
         }
         return needed + prefill;
@@ -3914,7 +3955,7 @@ private:
             SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
 
             const char * pool_env = getenv("LLAMA_MTMD_POOL");
-            if (mparams.use_gpu && mtmd_support_vision(mctx) && (!pool_env || atoi(pool_env) != 0)) {
+            if (!use_mixed_batch() && mparams.use_gpu && mtmd_support_vision(mctx) && (!pool_env || atoi(pool_env) != 0)) {
                 auto pool = std::make_unique<server_mtmd_pool>();
                 pool->ctxs.push_back(mctx); // one encoder; its layers may be split over the GPUs
                 pool->n_embd = llama_model_n_embd_inp(model_tgt);
@@ -4071,6 +4112,9 @@ private:
             };
 
             slot.callback_on_reset = [this](const server_slot & slot) {
+                if (mtmd_pool && slot.task) {
+                    mtmd_pool->evict_task(slot.task->id);
+                }
                 // flush the generated token stats before reset()
                 if (slot.stats.n_gen > 0) {
                     metrics_on_prediction(slot);
@@ -7293,6 +7337,12 @@ private:
                                 }
 
                                 if (pos_min >= pos_min_thold) {
+                                    auto ckpt_ends_on_media = [&](const common_prompt_checkpoint & ck) -> bool {
+                                        return ck.n_tokens > 0 &&
+                                               (size_t) ck.n_tokens <= slot.prompt.tokens.size() &&
+                                               slot.prompt.tokens[ck.n_tokens - 1] == LLAMA_TOKEN_NULL;
+                                    };
+
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
@@ -7300,6 +7350,19 @@ private:
                                         [&](const auto & cur) {
                                             // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
                                             SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
+                                            if (cur.n_tokens < 0 || (size_t) cur.n_tokens > slot.prompt.tokens.size()) {
+                                                return false;
+                                            }
+                                            if (ckpt_ends_on_media(cur)) {
+                                                // M-RoPE media chunks share temporal KV pos = pos_0 across all image tokens while advancing
+                                                // logical server_tokens::pos_next() by n_pos. Require the entire media prefix to match and at
+                                                // least one subsequent token so [TAG_PROMPT_LOGITS] never steps into a media chunk.
+                                                const llama_pos media_pos_end = slot.prompt.tokens.pos_next(cur.n_tokens);
+                                                if (cur.n_tokens > n_past || media_pos_end > pos_eval) {
+                                                    return false;
+                                                }
+                                                return cur.pos_min < pos_min_thold || cur.pos_min == 0;
+                                            }
                                             // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
                                             if (cur.pos_max > pos_next) {
                                                 return false;
@@ -7327,8 +7390,13 @@ private:
                                         // restore the draft's speculative state
                                         common_speculative_set_state(slot.spec, slot.id, it->data_spec);
 
-                                        pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
-                                        n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                        if (ckpt_ends_on_media(*it)) {
+                                            pos_next = slot.prompt.tokens.pos_next(it->n_tokens);
+                                            n_past   = (int) it->n_tokens;
+                                        } else {
+                                            pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                                            n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                        }
                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
                                     }
 
@@ -7342,10 +7410,14 @@ private:
                             }
 
                             {
-                                // erase any checkpoints with pos_max > pos_next
+                                // erase any checkpoints invalidated past pos_next / n_past
                                 for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
                                     const auto & cur = *it;
-                                    if (cur.pos_max > pos_next) {
+                                    const bool invalid_media = cur.n_tokens < 0 ||
+                                        (size_t) cur.n_tokens > slot.prompt.tokens.size() ||
+                                        (cur.n_tokens > 0 && slot.prompt.tokens[cur.n_tokens - 1] == LLAMA_TOKEN_NULL &&
+                                         (cur.n_tokens > n_past || slot.prompt.tokens.pos_next(cur.n_tokens) > pos_next));
+                                    if (cur.pos_max > pos_next || invalid_media) {
                                         SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
                                         ckpt_async_settle(&*it);
                                         ckpt_recycle_push(it->data_tgt);
@@ -7477,8 +7549,11 @@ private:
                         size_t n_tokens_out = 0;
                         int32_t res = 0;
                         server_mtmd_pool::result encoded;
-                        // only prefill-only lanes: they carry no generation rows, so the car stays pure embedding
-                        const bool in_car = mtmd_pool && mtmd_batched && pipeline_filter >= 0 &&
+                        const auto & media_chunk = input_tokens.find_chunk(cur_token_idx);
+                        const bool chunk_non_causal = mctx && media_chunk && mtmd_decode_use_non_causal(mctx, media_chunk.get());
+                        // only prefill-only lanes: they carry no generation rows, so the car stays pure embedding;
+                        // chunks requiring non-causal attention must decode standalone so non-causal attention is applied
+                        const bool in_car = mtmd_pool && mtmd_batched && !chunk_non_causal && pipeline_filter >= 0 &&
                                 pipeline_prefill_lanes > 0 && pipeline_filter >= pipeline_count;
                         if (mtmd_pool) {
                             mtmd_prefetch(slot, cur_token_idx);

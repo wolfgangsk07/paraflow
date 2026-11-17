@@ -2334,7 +2334,9 @@ struct clip_model_loader {
             }
             const bool input = name.find("patch") != std::string::npos || name.find("position") != std::string::npos ||
                                name.find("pos_embd") != std::string::npos || name.find("class_embd") != std::string::npos ||
-                               name.find("pre_ln") != std::string::npos || name.find("ln_pre") != std::string::npos;
+                               name.find("pre_ln") != std::string::npos || name.find("ln_pre") != std::string::npos ||
+                               name.find("conv_in") != std::string::npos || name.find("conv1") != std::string::npos ||
+                               name.find("tile_") != std::string::npos;
             return input ? 0 : n_split - 1;
         };
         std::map<std::string, int> tensor_split;
@@ -3878,15 +3880,25 @@ struct clip_model_loader {
                 total_data_size += ggml_nbytes(t);
             }
 
-            // alloc memory and offload data
+            // alloc memory and offload data (guard empty split 0 and OOM NULL returns on all splits)
             ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.backend);
-            ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
-            ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            const bool has_split0 = ggml_get_first_tensor(ctx_clip.ctx_data.get()) != nullptr;
+            ctx_clip.buf.reset(has_split0 ? ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft) : nullptr);
+            if (has_split0 && !ctx_clip.buf) {
+                throw std::runtime_error(string_format("%s: failed to allocate weight buffer on %s\n", __func__, ggml_backend_name(ctx_clip.backend)));
+            }
+            if (ctx_clip.buf) {
+                ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            }
             ctx_clip.buf_extra.clear();
             for (int k = 1; k < n_split; ++k) {
                 auto * kbuft = ggml_backend_get_default_buffer_type(ctx_clip.split_backends[k]);
                 // a split without tensors needs no buffer
-                ggml_backend_buffer_t kb = ggml_get_first_tensor(ctx_of(k)) ? ggml_backend_alloc_ctx_tensors_from_buft(ctx_of(k), kbuft) : nullptr;
+                const bool has_tensors = ggml_get_first_tensor(ctx_of(k)) != nullptr;
+                ggml_backend_buffer_t kb = has_tensors ? ggml_backend_alloc_ctx_tensors_from_buft(ctx_of(k), kbuft) : nullptr;
+                if (has_tensors && !kb) {
+                    throw std::runtime_error(string_format("%s: failed to allocate weight buffer on %s\n", __func__, ggml_backend_name(ctx_clip.split_backends[k])));
+                }
                 if (kb) { ggml_backend_buffer_set_usage(kb, GGML_BACKEND_BUFFER_USAGE_WEIGHTS); }
                 ctx_clip.buf_extra.emplace_back(kb);
             }
@@ -4087,11 +4099,27 @@ struct clip_model_loader {
             /*.ops      = */ {},
         };
 
-        // check op support
+        // check op support against the split backend actually assigned to each node
         for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
             ggml_tensor * node = ggml_graph_node(gf, i);
             res.ops.push_back({node, true});
-            if (!ggml_backend_supports_op(ctx_clip.backend, node)) {
+            bool supported = false;
+            if (!ctx_clip.split_backends.empty()) {
+                ggml_backend_t node_backend = ggml_backend_sched_get_tensor_backend(ctx_clip.sched.get(), node);
+                if (node_backend && node_backend != ctx_clip.backend_cpu) {
+                    supported = ggml_backend_supports_op(node_backend, node);
+                } else {
+                    for (ggml_backend_t sb : ctx_clip.split_backends) {
+                        if (sb && sb != ctx_clip.backend_cpu && ggml_backend_supports_op(sb, node)) {
+                            supported = true;
+                            break;
+                        }
+                    }
+                }
+            } else {
+                supported = ggml_backend_supports_op(ctx_clip.backend, node);
+            }
+            if (!supported) {
                 res.ops.back().is_accel = false;
                 if (node->op == GGML_OP_FLASH_ATTN_EXT) {
                     res.fattn    = false;
