@@ -2048,7 +2048,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     }
 
     int prev_backend_id = -1;
-    ggml_backend_sched_input_staging::call snapshots(sched);
+    ggml_backend_sched_input_staging::call snapshots(sched, skip_unused ? &read_tensors : nullptr);
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
@@ -2220,13 +2220,13 @@ bool ggml_backend_sched_set_input_snapshots(ggml_backend_sched_t sched, bool ena
         sched->input_staging = nullptr;
         return true;
     }
-    if (sched->n_copies != 1) return false;
+    if (sched->n_copies < 1) return false;
     int gpus = 0;
     for (int b = 0; b < sched->n_backends; ++b) {
         auto dev = ggml_backend_get_device(sched->backends[b]);
         gpus += dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU;
     }
-    if (gpus != 1) return false;
+    if (gpus < 1) return false;
     if (!sched->input_staging) sched->input_staging = new ggml_backend_sched_input_staging(sched);
     return true;
 }

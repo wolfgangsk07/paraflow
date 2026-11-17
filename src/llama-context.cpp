@@ -47,6 +47,8 @@ struct llama_ckpt_capture_state {
     std::vector<uint64_t>     id;          // ticket id described by this ring entry
     std::vector<int32_t>      n_seqs;      // distinct sequences in that ticket's batch
     std::vector<llama_seq_id> seq0;        // the sequence when n_seqs == 1
+    std::vector<uint64_t>     seq_mask;    // bitmask of sequences < 64 in that ticket's batch
+    std::vector<uint8_t>      seq_mask_ok; // 1 when every sequence id in that batch was in [0, 64)
     std::vector<uint8_t>      all_stages;  // completion events cover every GPU stage
     bool     soft = true;                  // GPU work not covered by recorded ticket events
     bool     hard = false;                 // memory-module update work since the last sync
@@ -1134,14 +1136,21 @@ void llama_context::set_input_snapshots(bool enable) {
 
 ggml_backend_input_snapshot_stats llama_context::get_input_snapshot_stats() const {
     auto total = ggml_backend_sched_get_input_snapshot_stats(sched.get());
-    const auto * helper = pf_generation.get();
-    if (helper) {
-        const auto next = ggml_backend_sched_get_input_snapshot_stats(helper->scheduler.get());
+    auto accumulate = [&](ggml_backend_sched_t s) {
+        if (!s) return;
+        const auto next = ggml_backend_sched_get_input_snapshot_stats(s);
         total.enabled = total.enabled || next.enabled;
         total.tensors += next.tensors; total.bytes += next.bytes; total.fences += next.fences;
         total.fence_wait_ns += next.fence_wait_ns; total.fallbacks += next.fallbacks;
         total.allocated_bytes += next.allocated_bytes;
+    };
+    if (const auto * helper = pf_generation.get()) {
+        accumulate(helper->scheduler.get());
     }
+    for (const auto & ps : pipe_scheds) {
+        accumulate(ps.get());
+    }
+    accumulate(prefill_sched.get());
     return total;
 }
 
@@ -2749,8 +2758,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         f.pending = !f.events.empty();
     }
 
-    // A car without logits still owns KV and recurrent-state writes on all stages.
-    if (tk && !tk->fallback && n_outputs_all == 0) {
+    // Record completion events on every GPU stage so drain-free/async checkpoint capture
+    // can query completion of both prefill and decode tickets without full device drains.
+    if (tk && !tk->fallback) {
         for (int i = 0; i < ggml_backend_sched_get_n_backends(cur_sched()); ++i) {
             auto * backend = ggml_backend_sched_get_backend(cur_sched(), i);
             const auto type = ggml_backend_dev_type(ggml_backend_get_device(backend));
@@ -2778,23 +2788,29 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         auto & ck = ckpt_state;
         const size_t n = (size_t) n_decode_tickets;
         if (ck.id.size() != n) {
-            ck.id.assign(n, 0); ck.n_seqs.assign(n, -1); ck.seq0.assign(n, -1); ck.all_stages.assign(n, 0);
+            ck.id.assign(n, 0); ck.n_seqs.assign(n, -1); ck.seq0.assign(n, -1);
+            ck.seq_mask.assign(n, 0); ck.seq_mask_ok.assign(n, 0); ck.all_stages.assign(n, 0);
         }
         if (ck.pfset.size() != n) { ck.pfset.assign(n, nullptr); }
         const size_t i = tk->id % n;
         int32_t distinct = 0;
         llama_seq_id first = -1;
+        uint64_t smask = 0;
+        bool smask_ok = true;
         for (const auto & tok : batch_inp.tokens) {
             for (const auto sid : tok.seq_ids) {
                 if (distinct == 0) { first = sid; distinct = 1; }
-                else if (sid != first) { distinct = 2; break; }
+                else if (sid != first) { distinct = 2; }
+                if (sid >= 0 && sid < 64) { smask |= (1ull << sid); }
+                else { smask_ok = false; }
             }
-            if (distinct > 1) { break; }
         }
         ck.id[i] = tk->id;
         ck.n_seqs[i] = distinct;
         ck.seq0[i] = first;
-        ck.all_stages[i] = n_outputs_all == 0;
+        ck.seq_mask[i] = smask;
+        ck.seq_mask_ok[i] = smask_ok ? 1 : 0;
+        ck.all_stages[i] = 1;
         ck.pfset[i] = (pf_cur && pf_cur_backends == &prefill_backend_ptrs) ? (const void *) &prefill_backend_ptrs : nullptr;
         // the work issued by this call is covered by the ticket's events
         ck.soft = ckpt_prior_soft && ck.sync_count == ckpt_entry_syncs;
@@ -5549,7 +5565,11 @@ int32_t llama_context::state_seq_prepare_capture(llama_seq_id seq_id) {
         const auto & tk = tickets[i];
         if (tk.id == 0 || tk.id <= ck.last_full_sync_ticket) { continue; }
         const bool known = ck.id[i] == tk.id;
-        if (known && ck.n_seqs[i] == 1 && ck.seq0[i] != seq_id) { continue; } // provably disjoint
+        if (known && ((ck.n_seqs[i] == 1 && ck.seq0[i] != seq_id) ||
+                      (ck.seq_mask_ok.size() == ck.id.size() && ck.seq_mask_ok[i] && seq_id >= 0 && seq_id < 64 &&
+                       (ck.seq_mask[i] & (1ull << seq_id)) == 0))) {
+            continue; // provably disjoint
+        }
         bool done = known && ck.all_stages[i] && !tk.fallback && tk.event_recorded;
         for (const auto & c : tk.completions) {
             if (!done) { break; }
@@ -5633,7 +5653,11 @@ int64_t llama_context::state_seq_get_data_async(llama_seq_id seq_id, uint8_t * d
         const auto & tk = tickets[i];
         if (tk.id == 0 || tk.id <= ck.last_full_sync_ticket) { continue; }
         const bool known = ck.id[i] == tk.id;
-        if (known && ck.n_seqs[i] == 1 && ck.seq0[i] != seq_id) { continue; }
+        if (known && ((ck.n_seqs[i] == 1 && ck.seq0[i] != seq_id) ||
+                      (ck.seq_mask_ok.size() == ck.id.size() && ck.seq_mask_ok[i] && seq_id >= 0 && seq_id < 64 &&
+                       (ck.seq_mask[i] & (1ull << seq_id)) == 0))) {
+            continue;
+        }
         bool done = known && ck.all_stages[i] && !tk.fallback && tk.event_recorded;
         for (const auto & c : tk.completions) {
             if (!done) { break; }

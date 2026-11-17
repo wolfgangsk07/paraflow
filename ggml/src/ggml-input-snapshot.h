@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // Private implementation, included after the scheduler definition. Snapshots own
@@ -65,7 +66,7 @@ struct ggml_backend_sched_input_staging {
         std::unordered_map<ggml_tensor *, upload> uploads;
         std::vector<bool> usable, queued;
         int copy_slot;
-        explicit call(ggml_backend_sched_t sched)
+        explicit call(ggml_backend_sched_t sched, const std::unordered_set<const ggml_tensor *> * read_tensors = nullptr)
             : state(sched->input_staging), copy_slot(sched->cur_copy) {
             if (!state) return;
             usable.assign(sched->n_backends, false);
@@ -95,6 +96,15 @@ struct ggml_backend_sched_input_staging {
                     auto buffer = source->view_src ? source->view_src->buffer : source->buffer;
                     if (!(source->flags & GGML_TENSOR_FLAG_INPUT) || !buffer ||
                         !ggml_backend_buffer_is_host(buffer) || !ggml_is_contiguous(source)) continue;
+                    if (read_tensors) {
+                        bool is_read = false;
+                        const size_t sid = hash_id(source);
+                        for (int c = 0; c < sched->n_copies; ++c) {
+                            const ggml_tensor * cpy = tensor_id_copy(sid, b, c);
+                            if (cpy == nullptr || read_tensors->count(cpy)) { is_read = true; break; }
+                        }
+                        if (!is_read) continue;
+                    }
                     auto * destination = tensor_copy(source, b, sched->cur_copy);
                     if (!destination || !ggml_is_contiguous(destination) || uploads.count(destination)) continue;
                     const size_t size = ggml_nbytes(source);
@@ -145,7 +155,11 @@ struct ggml_backend_sched_input_staging {
             const auto & u = it->second;
             const auto & a = state->get(u.backend, copy_slot);
             const auto * base = static_cast<const char *>(ggml_backend_buffer_get_base(a.buffer));
-            // FIFO ordering also protects destinations reused by later graph splits.
+            // Fence prior split completion on the destination stream before overwriting multi-copy inputs,
+            // and rely on FIFO stream ordering for single-copy per-lane schedulers.
+            if (!queued[u.backend] && state->owner->events[u.backend][copy_slot] != nullptr) {
+                ggml_backend_event_wait(state->owner->backends[u.backend], state->owner->events[u.backend][copy_slot]);
+            }
             ggml_backend_tensor_set_async(state->owner->backends[u.backend], destination, base + u.offset, 0, u.bytes);
             queued[u.backend] = true;
             state->tensors.fetch_add(1, std::memory_order_relaxed);

@@ -2272,10 +2272,21 @@ private:
                     }
                 }
             }
-            dft_bbuf[idx].tokens = view.tokens;
+            auto & btokens = dft_bbuf[idx].tokens;
+            btokens.clear();
+            btokens.reserve(n);
             auto & h = dft_hbuf[idx];
-            h.resize((size_t) n * dft_n_embd);
-            std::memcpy(h.data(), base, h.size() * sizeof(float));
+            h.clear();
+            h.reserve((size_t) n * dft_n_embd);
+            for (int k = 0; k < n; ++k) {
+                const auto & tk_row = view.tokens[k];
+                if (tk_row.seq_id < 0 || (size_t) tk_row.seq_id >= mask.size() || !mask[tk_row.seq_id].second) {
+                    continue;
+                }
+                btokens.push_back(tk_row);
+                const float * src_row = base + (size_t) k * dft_n_embd;
+                h.insert(h.end(), src_row, src_row + dft_n_embd);
+            }
             if (!ckpt_dft_fixups.empty() && dft_n_embd > 0) {
                 for (int k = 0; k < n; ++k) {
                     const auto & tk_row = view.tokens[k];
@@ -2296,7 +2307,7 @@ private:
                     }
                 }
             }
-            dft_copy_rows += n;
+            dft_copy_rows += btokens.size();
             dft_copy_us += ggml_time_us() - t0;
             ++dft_catchups;
         }
@@ -2984,8 +2995,18 @@ private:
             batch.render(0, batch.size());
             if (pipeline_prefill_slot >= 0 && std::all_of(batch.tokens.begin(), batch.tokens.end(),
                     [](const server_batch::token & token) { return token.output; })) {
-                // A one-token prompt tail uses the decode streams. Fence its earlier prompt cars first.
-                llama_synchronize(ctx_tgt);
+                // A one-token prompt tail uses the decode streams. Only fence if this prefill slot
+                // still has an earlier prompt car in flight on prefill_sched (100% prefix hits have none).
+                bool pf_inflight = false;
+                for (const int lid : pipeline_fifo) {
+                    for (const auto & tk_in : pipeline_lanes[lid].batch.tokens) {
+                        if (tk_in.id_slot == pipeline_prefill_slot) { pf_inflight = true; break; }
+                    }
+                    if (pf_inflight) { break; }
+                }
+                if (pf_inflight) {
+                    llama_synchronize(ctx_tgt);
+                }
             }
             llama_set_decode_pipelane(ctx_tgt, lane_id);
             metrics_pre_decode();
@@ -6122,6 +6143,7 @@ private:
                                 upload.fences += next.fences; upload.fence_wait_ns += next.fence_wait_ns;
                                 upload.fallbacks += next.fallbacks; upload.allocated_bytes += next.allocated_bytes;
                             };
+                            add_upload(llama_get_input_snapshot_stats(ctx_tgt));
                             // The executor thread owns the draft context while it runs.
                             if (ctx_dft && !dft_exec) {
                                 add_upload(llama_get_input_snapshot_stats(ctx_dft));

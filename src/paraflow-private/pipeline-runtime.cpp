@@ -95,6 +95,7 @@ void llama_context::set_decode_pipelined(bool enable) {
             if (!pipe_scheds[i]) {
                 pipe_scheds[i].reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(),
                         backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+                ggml_backend_sched_set_input_snapshots(pipe_scheds[i].get(), true);
                 pipe_gf_res[i].reset(new llm_graph_result(max_nodes));
 
                 // Reserve the normal lane's generation shapes up front. The last
@@ -190,6 +191,7 @@ void llama_context::set_decode_pipelined(bool enable) {
 
             prefill_sched.reset(ggml_backend_sched_new(prefill_backend_ptrs.data(), backend_buft.data(),
                     prefill_backend_ptrs.size(), max_nodes_pp, /*parallel =*/ true, cparams.op_offload));
+            ggml_backend_sched_set_input_snapshots(prefill_sched.get(), true);
             prefill_gf_res.reset(new llm_graph_result(max_nodes_pp));
 
             sched_cur       = prefill_sched.get();
