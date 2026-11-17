@@ -159,6 +159,11 @@ struct clip_ctx {
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_buffer_ptr buf;
 
+    // layer split: split_backends[0] == backend; weights of split k live in ctx_data (k = 0) or ctx_data_extra[k - 1]
+    std::vector<ggml_backend_t>          split_backends;
+    std::vector<ggml_context_ptr>        ctx_data_extra;
+    std::vector<ggml_backend_buffer_ptr> buf_extra;
+
 
     int max_nodes = 8192;
     ggml_backend_sched_ptr sched;
@@ -185,7 +190,18 @@ struct clip_ctx {
         if (!backend_cpu) {
             throw std::runtime_error("failed to initialize CPU backend");
         }
-        if (ctx_params.use_gpu) {
+        if (ctx_params.use_gpu && ctx_params.devices != nullptr && ctx_params.n_devices > 1) {
+            for (int i = 0; i < ctx_params.n_devices; ++i) {
+                ggml_backend_t b = ggml_backend_dev_init(ctx_params.devices[i], nullptr);
+                if (!b) {
+                    for (auto * prev : split_backends) { ggml_backend_free(prev); }
+                    throw std::runtime_error(string_format("%s: failed to initialize \"%s\" backend\n",
+                                                           __func__, ggml_backend_dev_name(ctx_params.devices[i])));
+                }
+                split_backends.push_back(b);
+            }
+            backend = split_backends[0];
+        } else if (ctx_params.use_gpu) {
             if (ctx_params.device != nullptr) {
                 backend = ggml_backend_dev_init(ctx_params.device, nullptr);
                 if (!backend) {
@@ -198,7 +214,13 @@ struct clip_ctx {
             }
         }
 
-        if (backend) {
+        if (split_backends.size() > 1) {
+            for (auto * b : split_backends) {
+                LOG_INF("%s: CLIP layer split, using %s backend\n", __func__, ggml_backend_name(b));
+                backend_ptrs.push_back(b);
+                backend_buft.push_back(ggml_backend_get_default_buffer_type(b));
+            }
+        } else if (backend) {
             LOG_INF("%s: CLIP using %s backend\n", __func__, ggml_backend_name(backend));
             backend_ptrs.push_back(backend);
             backend_buft.push_back(ggml_backend_get_default_buffer_type(backend));
@@ -229,6 +251,9 @@ struct clip_ctx {
     }
 
     ~clip_ctx() {
+        buf_extra.clear();
+        buf.reset();
+        for (size_t i = 1; i < split_backends.size(); ++i) { ggml_backend_free(split_backends[i]); }
         ggml_backend_free(backend);
         if (backend != backend_cpu) {
             ggml_backend_free(backend_cpu);
@@ -2290,6 +2315,31 @@ struct clip_model_loader {
         if (!ctx_clip.ctx_data) {
             throw std::runtime_error(string_format("%s: failed to init ggml context\n", __func__));
         }
+        const int n_split = std::max<int>(1, (int) ctx_clip.split_backends.size());
+        ctx_clip.ctx_data_extra.clear();
+        for (int k = 1; k < n_split; ++k) {
+            ctx_clip.ctx_data_extra.emplace_back(ggml_init(params));
+            if (!ctx_clip.ctx_data_extra.back()) {
+                throw std::runtime_error(string_format("%s: failed to init ggml context\n", __func__));
+            }
+        }
+        // layer split: blocks (and their deepstack mergers) go to split floor(il * n / n_layer), the input
+        // embeddings to the first split, everything after the blocks (post norm, projector) to the last one
+        const int n_layer_split = std::max(1, (int) hparams.n_layer);
+        auto split_of = [&](const std::string & name) -> int {
+            if (n_split == 1) { return 0; }
+            int il = -1;
+            if (sscanf(name.c_str(), "%*[a-z].blk.%d.", &il) == 1 || sscanf(name.c_str(), "v.deepstack.%d.", &il) == 1) {
+                return std::min(n_split - 1, std::max(0, il) * n_split / n_layer_split);
+            }
+            const bool input = name.find("patch") != std::string::npos || name.find("position") != std::string::npos ||
+                               name.find("pos_embd") != std::string::npos || name.find("class_embd") != std::string::npos ||
+                               name.find("pre_ln") != std::string::npos || name.find("ln_pre") != std::string::npos;
+            return input ? 0 : n_split - 1;
+        };
+        std::map<std::string, int> tensor_split;
+        auto ctx_of = [&](int k) { return k == 0 ? ctx_clip.ctx_data.get() : ctx_clip.ctx_data_extra[k - 1].get(); };
+        auto backend_of = [&](int k) { return n_split == 1 ? ctx_clip.backend : ctx_clip.split_backends[k]; };
 
         // helper function
         std::unordered_set<std::string> loaded_tensor_names;
@@ -2304,12 +2354,14 @@ struct clip_model_loader {
             }
             if (cur) {
                 tensors_to_load.push_back(cur);
-                ggml_tensor * data_tensor = ggml_dup_tensor(ctx_clip.ctx_data.get(), cur);
+                const int k = split_of(name);
+                tensor_split[name] = k;
+                ggml_tensor * data_tensor = ggml_dup_tensor(ctx_of(k), cur);
                 ggml_set_name(data_tensor, cur->name);
                 loaded_tensor_names.insert(name);
                 cur = data_tensor;
                 // add to weight memory counter
-                ctx_clip.mem_usage[ggml_backend_get_device(ctx_clip.backend)] += ggml_nbytes(cur);
+                ctx_clip.mem_usage[ggml_backend_get_device(backend_of(k))] += ggml_nbytes(cur);
             }
             return cur;
         };
@@ -3830,11 +3882,28 @@ struct clip_model_loader {
             ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.backend);
             ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
             ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            ctx_clip.buf_extra.clear();
+            for (int k = 1; k < n_split; ++k) {
+                auto * kbuft = ggml_backend_get_default_buffer_type(ctx_clip.split_backends[k]);
+                // a split without tensors needs no buffer
+                ggml_backend_buffer_t kb = ggml_get_first_tensor(ctx_of(k)) ? ggml_backend_alloc_ctx_tensors_from_buft(ctx_of(k), kbuft) : nullptr;
+                if (kb) { ggml_backend_buffer_set_usage(kb, GGML_BACKEND_BUFFER_USAGE_WEIGHTS); }
+                ctx_clip.buf_extra.emplace_back(kb);
+            }
+            if (n_split > 1) {
+                for (int k = 0; k < n_split; ++k) {
+                    size_t bytes = 0; int n = 0;
+                    for (const auto & [nm, kk] : tensor_split) { if (kk == k) { bytes += ggml_nbytes(ggml_get_tensor(ctx_of(k), nm.c_str())); ++n; } }
+                    LOG_INF("%s: layer split %d on %s: %d tensors, %.1f MiB\n", __func__, k, ggml_backend_name(ctx_clip.split_backends[k]), n, bytes / 1048576.0);
+                }
+            }
             // read the weight from file
             if (!ctx_clip.no_alloc) {
                 size_t data_loaded = 0;
                 for (auto & t : tensors_to_load) {
-                    ggml_tensor * cur = ggml_get_tensor(ctx_clip.ctx_data.get(), t->name);
+                    // the split is found by name in each context: some tensors are fetched under another key
+                    ggml_tensor * cur = nullptr;
+                    for (int k = 0; k < n_split && !cur; ++k) { cur = ggml_get_tensor(ctx_of(k), t->name); }
                     GGML_ASSERT(cur && "tensor not found in ctx_data");
                     auto it_off = tensor_offset.find(t->name);
                     GGML_ASSERT(it_off != tensor_offset.end() && "no offset for tensor");
@@ -3844,7 +3913,7 @@ struct clip_model_loader {
                         throw std::runtime_error(string_format("%s: failed to seek for tensor %s\n", __func__, t->name));
                     }
                     size_t num_bytes = ggml_nbytes(cur);
-                    if (ggml_backend_buft_is_host(buft)) {
+                    if (ggml_backend_buffer_is_host(cur->buffer)) {
                         // for the CPU and Metal backend, we can read directly into the tensor
                         fin.read(reinterpret_cast<char *>(cur->data), num_bytes);
                     } else {

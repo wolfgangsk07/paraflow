@@ -43,9 +43,9 @@ table{border-collapse:collapse;width:100%}td,th{padding:2px 6px;text-align:left}
  <section class="card w12"><div class="tiles" id="tiles"></div></section>
  <section class="card w12"><h2><span data-en="Throughput">吞吐</span>
   <span class="seg" id="win"><button data-s="60" data-en="1m">1分</button><button data-s="600" class="on" data-en="10m">10分</button><button data-s="3600" data-en="1h">1时</button><button data-s="21600" data-en="6h">6时</button></span></h2>
-  <div class="legend"><b>decode</b><span><i class="sw" style="background:var(--dec);opacity:.45"></i><span data-en="output t/s (fill, left axis)">输出 t/s（填充，左轴）</span></span><span><i class="sw" style="height:0;border-radius:0;border-top:2px solid var(--ink);vertical-align:3px"></i><span data-en="requests generating (line, right axis; paused excluded)">正在生成的请求数（实线，右轴；不含暂停）</span></span><span><i class="sw" style="background:var(--aq)"></i><span data-en="bottom bar: pure-decode periods">底部条：纯 decode 时段</span></span></div>
+  <div class="legend"><b>decode</b><span><i class="sw" style="background:var(--dec);opacity:.45"></i><span data-en="output t/s (fill, left axis)">输出 t/s（填充，左轴）</span></span><span><i class="sw" style="height:0;border-radius:0;border-top:2px solid var(--ink);vertical-align:3px"></i><span data-en="avg generating slots (line, right axis; time-weighted, paused excluded)">平均生成槽位数（实线，右轴；时间加权，不含暂停）</span></span><span><i class="sw" style="background:var(--aq)"></i><span data-en="bottom bar: pure-decode periods">底部条：纯 decode 时段</span></span></div>
   <canvas id="tpd" data-h="190"></canvas>
-  <div class="legend" style="margin-top:10px"><b>prefill</b><span><i class="sw" style="background:var(--pf);opacity:.45"></i><span data-en="compute t/s (fill, left axis)">计算 t/s（填充，左轴）</span></span><span><i class="sw" style="height:0;border-radius:0;border-top:2px solid var(--ink);vertical-align:3px"></i><span data-en="requests in prefill (line, right axis; paused excluded)">正在 prefill 的请求数（实线，右轴；不含暂停）</span></span></div>
+  <div class="legend" style="margin-top:10px"><b>prefill</b><span><i class="sw" style="background:var(--pf);opacity:.45"></i><span data-en="compute t/s (fill, left axis)">计算 t/s（填充，左轴）</span></span><span><i class="sw" style="height:0;border-radius:0;border-top:2px solid var(--ink);vertical-align:3px"></i><span data-en="avg prefilling slots (line, right axis; time-weighted, paused excluded)">平均 prefill 槽位数（实线，右轴；时间加权，不含暂停）</span></span></div>
   <canvas id="tpp" data-h="170"></canvas>
   <div class="legend" style="margin-top:4px"><span id="winstat"></span></div>
  </section>
@@ -158,7 +158,9 @@ function render(d){
   </div>`;
   // lanes
   const by=new Map();for(const s of d.slots||[]){const[id,st,lane,stream,tok,cells,vip,mtp,paused]=s;if(!by.has(lane))by.set(lane,[]);by.get(lane).push(s)}
-  $('lanes').innerHTML=[...by.keys()].sort((a,b)=>a-b).map(l=>`<div class="lane"><span class="lab">lane ${l}</span>${by.get(l).map(([id,st,lane,stream,tok,cells,vip,mtp,paused])=>{
+  const nLane=cfg&&cfg.pipe_lanes?cfg.pipe_lanes:0;
+  const laneIds=[...by.keys()];for(let i=0;i<nLane;i++)if(!by.has(i))laneIds.push(i);
+  $('lanes').innerHTML=laneIds.sort((a,b)=>a-b).map(l=>`<div class="lane"><span class="lab">lane ${l}</span>${(by.get(l)||[]).map(([id,st,lane,stream,tok,cells,vip,mtp,paused])=>{
      const cls=paused?'pause':st===5?'gen':st>=2?'pf':'idle';
      return `<div class="s ${cls}${vip?' vip':''}" title="slot ${id} · stream ${stream} · ${tok} tok · KV ${cells}">${cells?(cells>=1000?(cells/1000).toFixed(cells>=10000?0:1)+'k':cells):id}${mtp?'<i class="m"></i>':''}</div>`}).join('')}</div>`).join('');
   // paged-out requests
@@ -191,16 +193,19 @@ function draw(){
   const rawD=bins.map(b=>ok(b)?b.dd/b.dt:NaN),rawP=bins.map(b=>ok(b)?b.dp/b.dt:NaN);
   const smooth=raw=>raw.map((v,i)=>{if(isNaN(v))return NaN;let s=0,n=0;for(let j=Math.max(0,i-1);j<=Math.min(raw.length-1,i+1);j++){if(!isNaN(raw[j])&&!bins[j].gap){s+=raw[j];n++}}return n?s/n:v});
   const smD=smooth(rawD),smP=smooth(rawP);
-  // per-bin request counts: time-weighted mean of generating / prefilling requests (paused excluded), from the server
+  // per-bin request counts: time-weighted mean of generating / prefilling slots (paused excluded)
+  // ng and npv are sums of ng_ms/np_ms (slot·ms integrals); wt is total ms in the display bin
   const cntNG=bins.map(b=>(b.wt>0&&!b.gap)?b.ng/b.wt:NaN),cntNP=bins.map(b=>(b.wt>0&&!b.gap)?b.npv/b.wt:NaN);
   const runs=(arr,X)=>{const out=[];let cur=null;for(let i=0;i<nb-1;i++){const bs=origin+i*bw,be=origin+(i+1)*bw;if(be<=t0||bs>=now||isNaN(arr[i])||bins[i].gap){cur=null;continue}if(!cur){cur=[];out.push(cur)}cur.push([X(i),arr[i]])}return out};
-  // one chart: rate as a filled area on the left axis, request count as an integer staircase line on the right axis
+  // one chart: rate as a filled area on the left axis, avg slot count as a smooth line on the right axis
   const panel=(cv,o)=>{
     const dpr=devicePixelRatio||1,W=cv.clientWidth,Hh=+cv.dataset.h;cv.width=W*dpr;cv.height=Hh*dpr;cv.style.height=Hh+'px';
     const g=cv.getContext('2d');g.setTransform(dpr,0,0,dpr,0,0);g.clearRect(0,0,W,Hh);
     const L=72,R=50,T=8,B=o.pure?30:22,pw=W-L-R,ph=Hh-T-B,ink=css('--ink');
     let ym=10;for(const v of o.rate)if(!isNaN(v))ym=Math.max(ym,v);const sR=niceStep(ym/4);ym=Math.ceil(ym/sR)*sR;
-    let cm=o.cmax||4;if(!o.cmax)for(const v of o.cnt)if(!isNaN(v))cm=Math.max(cm,Math.round(v));const sN=niceStep(Math.max(1,cm/4));cm=Math.ceil(cm/sN)*sN;
+    // fixed axis (decode, cmax=-np) shows headroom; an auto axis (prefill) follows the window max, because a
+    // prefill chunk is short and the average is a fraction of a request that a 0..-np scale flattens to nothing
+    let cm=o.cmax||0;if(!o.cmax)for(const v of o.cnt)if(!isNaN(v))cm=Math.max(cm,v);if(cm<1)cm=1;const sN=niceStep(cm/4);cm=Math.ceil(cm/sN)*sN;
     const X=i=>L+(origin+(i+.5)*bw-t0)/(win*1000)*pw,Y=v=>T+ph-v/ym*ph,YN=v=>T+ph-v/cm*ph;
     g.font='11px system-ui,sans-serif';g.strokeStyle=css('--grid');g.lineWidth=1;
     for(let v=0;v<=ym+1e-9;v+=sR){const y=Math.round(Y(v))+.5;g.beginPath();g.moveTo(L,y);g.lineTo(L+pw,y);g.stroke();g.fillStyle=o.col;g.textAlign='right';g.fillText(f0(v),L-6,y+4)}
@@ -210,16 +215,16 @@ function draw(){
     g.save();g.translate(W-8,T+ph/2);g.rotate(Math.PI/2);g.fillStyle=ink;g.fillText(o.cl,0,0);g.restore();
     for(const r of runs(o.rate,X)){g.beginPath();g.moveTo(r[0][0],Y(0));for(const[x,v]of r)g.lineTo(x,Y(v));g.lineTo(r[r.length-1][0],Y(0));g.closePath();g.fillStyle=o.col;g.globalAlpha=.45;g.fill();g.globalAlpha=1}
     const bwpx=bw/(win*1000)*pw;g.strokeStyle=ink;g.lineWidth=1.5;g.lineJoin='miter';
-    for(const r of runs(o.cnt,X)){g.beginPath();r.forEach(([x,v],k)=>{const y=Math.round(YN(Math.round(v)))+.5;if(k)g.lineTo(x-bwpx*.5,y);else g.moveTo(x-bwpx*.5,y);g.lineTo(x+bwpx*.5,y)});g.stroke()}
+    for(const r of runs(o.cnt,X)){g.beginPath();r.forEach(([x,v],k)=>{const y=Math.round(YN(v))+.5;if(k)g.lineTo(x-bwpx*.5,y);else g.moveTo(x-bwpx*.5,y);g.lineTo(x+bwpx*.5,y)});g.stroke()}
     for(let i=0;i<nb;i++){const bs=origin+i*bw,be=origin+(i+1)*bw;if(be<=t0||bs>=now)continue;
       const x0=L+Math.max(0,(bs-t0)/(win*1000))*pw,x1=L+Math.min(1,(be-t0)/(win*1000))*pw,b=bins[i];
       if(o.pure&&b.dt>0&&b.pure>0){g.fillStyle=css('--aq');g.globalAlpha=Math.min(1,.25+.75*b.pure/b.dt);g.fillRect(x0,T+ph+3,Math.max(1,x1-x0),4);g.globalAlpha=1}
       if(b.mark){g.strokeStyle=css('--crit');g.lineWidth=1.5;g.beginPath();g.moveTo(x0,T);g.lineTo(x0,T+ph);g.stroke()}}
     cv._bins={bins,nb,L,pw,t0,bw,origin,rate:o.rate,cnt:o.cnt,name:o.name,cl:o.cl,pure:o.pure};
   };
-  // decode count axis = -np (shows how close to full); prefill count axis = observed max (usually a few)
-  panel($('tpd'),{name:'decode',rate:smD,cnt:cntNG,col:css('--dec'),cl:tr('生成中请求数','requests generating'),cmax:cfg?Math.max(1,cfg.n_parallel):0,pure:true});
-  panel($('tpp'),{name:'prefill',rate:smP,cnt:cntNP,col:css('--pf'),cl:tr('prefill 中请求数','requests in prefill'),cmax:0,pure:false});
+  // decode count axis = -np (shows headroom); prefill count axis = -np (same scale, self-consistent: D̄ + P̄ ≤ n_parallel)
+  panel($('tpd'),{name:'decode',rate:smD,cnt:cntNG,col:css('--dec'),cl:tr('平均生成槽位数（时间加权）','avg generating slots (time-weighted)'),cmax:cfg?Math.max(1,cfg.n_parallel):0,pure:true});
+  panel($('tpp'),{name:'prefill',rate:smP,cnt:cntNP,col:css('--pf'),cl:tr('平均 prefill 槽位数（时间加权）','avg prefilling slots (time-weighted)'),cmax:cfg?Math.max(1,cfg.n_parallel):0,pure:false});
   $('winstat').innerHTML=allT?`${tr('窗口平均','Window avg')} decode <b>${f0(allD/allT)}</b> · prefill <b>${f0(allP/allT)}</b> t/s ｜ ${tr('纯 decode ','pure decode ')}${f0(pureT)}${tr(' 秒',' s')} decode <b>${f0(pureT?pureD/pureT:null)}</b> ｜ ${tr('混合 ','mixed ')}${f0(mixT)}${tr(' 秒',' s')} decode <b>${f0(mixT?mixD/mixT:null)}</b> t/s ｜ ${tr('每点 ','per point ')}${bw>=60000?f1(bw/60000)+tr(' 分',' min'):f0(bw/1000)+tr(' 秒',' s')}`:tr('窗口内暂无数据','No data in window');
 }
 function drawCtxHist(d){
@@ -284,7 +289,7 @@ function niceStep(x){const p=Math.pow(10,Math.floor(Math.log10(x||1))),m=x/p;ret
 for(const cv of [$('tpd'),$('tpp')]){cv.addEventListener('mousemove',e=>{const c=cv._bins,tip=$('tip');if(!c)return;const x=e.clientX-cv.getBoundingClientRect().left;
   const i=Math.floor((c.t0+(x-c.L)/c.pw*(win*1000)-c.origin)/c.bw);
   if(i<0||i>=c.nb){tip.style.display='none';return}const b=c.bins[i];
-  tip.innerHTML=`${new Date(c.origin+i*c.bw).toTimeString().slice(0,8)}<br>${c.name} <b>${!isNaN(c.rate[i])?f0(c.rate[i]):'–'}</b> t/s<br>${c.cl} <b>${!isNaN(c.cnt[i])?Math.round(c.cnt[i]):'–'}</b>${c.pure&&b.dt&&b.pure?`<br>${tr('纯 decode ','pure decode ')}${pct(b.pure/b.dt)}`:''}`;
+  tip.innerHTML=`${new Date(c.origin+i*c.bw).toTimeString().slice(0,8)}<br>${c.name} <b>${!isNaN(c.rate[i])?f0(c.rate[i]):'–'}</b> t/s<br>${c.cl} <b>${!isNaN(c.cnt[i])?f1(c.cnt[i]):'–'}</b>${c.pure&&b.dt&&b.pure?`<br>${tr('纯 decode ','pure decode ')}${pct(b.pure/b.dt)}`:''}`;
   tip.style.display='block';tip.style.left=(e.clientX+12)+'px';tip.style.top=(e.clientY+12)+'px'});
   cv.addEventListener('mouseleave',()=>$('tip').style.display='none')}
 // histogram slider

@@ -512,6 +512,8 @@ mtmd_context_params mtmd_context_params_default() {
         /* batch_max_tokens  */ 1024,
         /* progress_callback */ nullptr,
         /* progress_callback_user_data */ nullptr,
+        /* devices           */ nullptr,
+        /* n_devices         */ 0,
     };
     return params;
 }
@@ -622,6 +624,8 @@ struct mtmd_context {
             /* no_alloc          */ no_alloc,
             /* progress_callback */ ctx_params.progress_callback,
             /* progress_callback_user_data */ ctx_params.progress_callback_user_data,
+            /* devices           */ ctx_params.devices,
+            /* n_devices         */ ctx_params.n_devices,
         };
 
         auto res = clip_init(mmproj_fname, ctx_clip_params);

@@ -313,6 +313,9 @@ struct server_slot {
     // multimodal
     mtmd_context * mctx = nullptr;
     mtmd::batch_ptr mbatch = nullptr;
+    // set by an image car: the next text pass of this slot makes no context checkpoint, like the pass that
+    // carried the image on the standalone path
+    bool mtmd_ckpt_skip = false;
 
     // speculative decoding
     common_speculative * spec = nullptr;
@@ -334,6 +337,7 @@ struct server_slot {
 
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
+    bool dash_prompt_mark = false; // processed prompt tokens in the current update_slots() pass (dash only)
 
     // generation props
     int32_t n_ctx   = 0;  // context size per slot
@@ -496,6 +500,7 @@ struct server_slot {
 
         // clear multimodal state
         mbatch.reset();
+        mtmd_ckpt_skip = false;
     }
 
     void init_sampler() const {
@@ -938,13 +943,64 @@ static int encode_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch,
     // TODO @ngxson : move this log line to debug when it become more stable
     SLT_TRC(slot, "encoding mtmd batch from idx = %zu, n_chunks = %d\n", idx, n_added);
 
+    const int64_t t_enc0 = ggml_time_us();
     res = mtmd_batch_encode(mbatch.get());
     if (res != 0) {
         SLT_ERR(slot, "failed to encode mtmd batch for chunk idx = %zu, res = %d\n", idx, res);
         return -1;
     }
+    SLT_INF(slot, "mtmd encode: idx = %zu, n_chunks = %d, n_tokens = %zu, t = %.1f ms\n", idx, n_added,
+            mtmd_input_chunk_get_n_tokens(chunk.get()), (ggml_time_us() - t_enc0) / 1e3);
 
     return 0;
+}
+
+// decode an encoded media chunk (embd = encoder output) into the slot's sequence
+static int decode_mtmd_embd(const server_slot & slot, const mtmd_input_chunk * chunk, float * embd, size_t idx, size_t & n_tokens_out) {
+    GGML_ASSERT(slot.mctx);
+    const auto & mctx = slot.mctx;
+    int32_t res = 0;
+    struct cb_data_t {
+        common_speculative * spec;
+        llama_context * ctx;
+    } cb_data = { slot.spec, slot.ctx_tgt };
+
+    static auto cb = [](const mtmd_helper_embd_batch * b, void * user_data) {
+        const auto * data = static_cast<cb_data_t *>(user_data);
+
+        common_batch batch(data->ctx);
+        for (int32_t i = 0; i < b->n_tokens; ++i) {
+            llama_pos pos[GGML_MROPE_SECTIONS] = { 0, 0, 0, 0 };
+            for (int32_t j = 0; j < b->n_pos; ++j) {
+                pos[j] = b->pos[j * b->n_tokens + i];
+            }
+            batch.add_embd({ b->embd + (size_t) i * b->n_embd, 1, (size_t) b->n_embd }, pos, b->seq_id, false);
+        }
+
+        return common_speculative_process(data->spec, batch) ? 0 : 1;
+    };
+
+    llama_pos new_n_past; // unused for now
+    const int64_t t_dec0 = ggml_time_us();
+    res = mtmd_helper_decode_image_chunk(
+        mctx,
+        slot.ctx_tgt,
+        chunk,
+        embd,
+        slot.prompt.tokens.pos_next(),
+        slot.id,
+        llama_n_batch(slot.ctx_tgt),
+        &new_n_past,
+        cb,
+        &cb_data
+    );
+    if (res != 0) {
+        SLT_ERR(slot, "failed to decode mtmd chunk, idx = %zu, res = %d\n", idx, res);
+        return -1;
+    }
+    n_tokens_out = mtmd_input_chunk_get_n_tokens(chunk);
+    SLT_INF(slot, "mtmd decode: idx = %zu, n_tokens = %zu, t = %.1f ms\n", idx, n_tokens_out, (ggml_time_us() - t_dec0) / 1e3);
+    return 0; // success
 }
 
 // returns 0 on success
@@ -963,45 +1019,7 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
         if (mbatch) {
             float * embd = mtmd_batch_get_output_embd(mbatch.get(), chunk.get());
             if (embd) {
-                struct cb_data_t {
-                    common_speculative * spec;
-                    llama_context * ctx;
-                } cb_data = { slot.spec, slot.ctx_tgt };
-
-                static auto cb = [](const mtmd_helper_embd_batch * b, void * user_data) {
-                    const auto * data = static_cast<cb_data_t *>(user_data);
-
-                    common_batch batch(data->ctx);
-                    for (int32_t i = 0; i < b->n_tokens; ++i) {
-                        llama_pos pos[GGML_MROPE_SECTIONS] = { 0, 0, 0, 0 };
-                        for (int32_t j = 0; j < b->n_pos; ++j) {
-                            pos[j] = b->pos[j * b->n_tokens + i];
-                        }
-                        batch.add_embd({ b->embd + (size_t) i * b->n_embd, 1, (size_t) b->n_embd }, pos, b->seq_id, false);
-                    }
-
-                    return common_speculative_process(data->spec, batch) ? 0 : 1;
-                };
-
-                llama_pos new_n_past; // unused for now
-                res = mtmd_helper_decode_image_chunk(
-                    mctx,
-                    slot.ctx_tgt,
-                    chunk.get(),
-                    embd,
-                    slot.prompt.tokens.pos_next(),
-                    slot.id,
-                    llama_n_batch(slot.ctx_tgt),
-                    &new_n_past,
-                    cb,
-                    &cb_data
-                );
-                if (res != 0) {
-                    SLT_ERR(slot, "failed to decode mtmd chunk, idx = %zu, res = %d\n", idx, res);
-                    return -1;
-                }
-                n_tokens_out = mtmd_input_chunk_get_n_tokens(chunk.get());
-                return 0; // success
+                return decode_mtmd_embd(slot, chunk.get(), embd, idx, n_tokens_out);
             }
         }
         return 1; // (non-error) need to create & encode batch
@@ -1133,6 +1151,121 @@ static int64_t paraflow_wall_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
+// Encodes media chunks on one mtmd context per GPU, each in its own worker thread, so the main loop keeps
+// decoding the other slots while an image is encoded. ctxs[0] is the server's main mtmd context (borrowed),
+// the others are owned replicas on the remaining GPUs. Results are keyed by (slot, task, chunk index); a
+// result of an older task of the same slot is dropped on the next submit/take of that slot.
+struct server_mtmd_pool {
+    struct job    { int slot; server_task_id task; size_t idx; mtmd::input_chunk_ptr chunk; };
+    struct result { int slot = -1; server_task_id task = -1; size_t idx = 0; int32_t res = 0; std::vector<float> embd; };
+
+    std::vector<mtmd_context *> ctxs;
+    std::vector<std::thread>    workers;
+    std::mutex                  mtx;
+    std::condition_variable     cv_job, cv_done;
+    std::deque<job>             jobs;
+    std::vector<result>         results;
+    std::vector<std::tuple<int, server_task_id, size_t>> running;
+    std::function<void()>       on_ready;
+    size_t n_embd = 0;
+    bool   stop   = false;
+
+    ~server_mtmd_pool() {
+        { std::lock_guard<std::mutex> lock(mtx); stop = true; }
+        cv_job.notify_all();
+        for (auto & w : workers) { w.join(); }
+        for (size_t i = 1; i < ctxs.size(); ++i) { mtmd_free(ctxs[i]); }
+    }
+
+    void start() {
+        for (size_t i = 0; i < ctxs.size(); ++i) { workers.emplace_back([this, i] { run(i); }); }
+    }
+
+    void run(size_t w) {
+        while (true) {
+            job j;
+            {
+                std::unique_lock<std::mutex> lock(mtx);
+                cv_job.wait(lock, [&] { return stop || !jobs.empty(); });
+                if (stop) { return; }
+                j = std::move(jobs.front());
+                jobs.pop_front();
+                running.emplace_back(j.slot, j.task, j.idx);
+            }
+            result r;
+            r.slot = j.slot; r.task = j.task; r.idx = j.idx;
+            const size_t n_tokens = mtmd_input_chunk_get_n_tokens(j.chunk.get());
+            const int64_t t0 = ggml_time_us();
+            mtmd::batch_ptr b(mtmd_batch_init(ctxs[w]));
+            r.res = mtmd_batch_add_chunk(b.get(), j.chunk.get());
+            if (r.res == 0) { r.res = mtmd_batch_encode(b.get()); }
+            if (r.res == 0) {
+                const float * e = mtmd_batch_get_output_embd(b.get(), j.chunk.get());
+                if (e) { r.embd.assign(e, e + n_tokens * n_embd); } else { r.res = -1; }
+            }
+            LOG_INF("mtmd pool: worker %zu | slot %d | task %lld | idx %zu | n_tokens %zu | res %d | t = %.1f ms\n",
+                    w, j.slot, (long long) j.task, j.idx, n_tokens, r.res, (ggml_time_us() - t0) / 1e3);
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                running.erase(std::find(running.begin(), running.end(), std::make_tuple(j.slot, j.task, j.idx)));
+                results.push_back(std::move(r));
+            }
+            cv_done.notify_all();
+            if (on_ready) { on_ready(); }
+        }
+    }
+
+    // caller holds mtx
+    void purge(int slot, server_task_id task) {
+        jobs.erase(std::remove_if(jobs.begin(), jobs.end(),
+                [&](const job & j) { return j.slot == slot && j.task != task; }), jobs.end());
+        results.erase(std::remove_if(results.begin(), results.end(),
+                [&](const result & r) { return r.slot == slot && r.task != task; }), results.end());
+    }
+
+    void submit(int slot, server_task_id task, size_t idx, const mtmd_input_chunk * chunk) {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            purge(slot, task);
+            const auto key = std::make_tuple(slot, task, idx);
+            if (std::find(running.begin(), running.end(), key) != running.end()) { return; }
+            for (const auto & j : jobs)    { if (j.slot == slot && j.task == task && j.idx == idx) { return; } }
+            for (const auto & r : results) { if (r.slot == slot && r.task == task && r.idx == idx) { return; } }
+            jobs.push_back({ slot, task, idx, mtmd::input_chunk_ptr(mtmd_input_chunk_copy(chunk)) });
+        }
+        cv_job.notify_one();
+    }
+
+    bool take(int slot, server_task_id task, size_t idx, result & out) {
+        std::lock_guard<std::mutex> lock(mtx);
+        purge(slot, task);
+        for (auto it = results.begin(); it != results.end(); ++it) {
+            if (it->slot == slot && it->task == task && it->idx == idx) {
+                out = std::move(*it);
+                results.erase(it);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool ready(int slot, server_task_id task, size_t idx) {
+        std::lock_guard<std::mutex> lock(mtx);
+        for (const auto & r : results) { if (r.slot == slot && r.task == task && r.idx == idx) { return true; } }
+        return false;
+    }
+
+    bool busy() {
+        std::lock_guard<std::mutex> lock(mtx);
+        return !jobs.empty() || !running.empty();
+    }
+
+    void wait(int ms) {
+        std::unique_lock<std::mutex> lock(mtx);
+        cv_done.wait_for(lock, std::chrono::milliseconds(ms));
+    }
+};
+
 struct server_context_impl {
     friend struct server_context;
 
@@ -1141,6 +1274,47 @@ public:
     //  - when not in sleeping state
     //  - and, with thread-safe APIs (e.g., tokenizer calls)
     llama_model * model_tgt = nullptr;
+
+    // per-GPU asynchronous media encoders (nullptr = encode inline on the main thread)
+    std::unique_ptr<server_mtmd_pool> mtmd_pool;
+    std::vector<ggml_backend_dev_t>   mtmd_split_devs; // GPUs the vision encoder layers are split over
+    // encoded images enter the decode batch as embedding rows (and so ride the pipeline cars) instead of a
+    // standalone decode on the main thread; needs the async encoder pool. LLAMA_MTMD_BATCHED=0 disables it
+    bool mtmd_batched = false;
+    bool mtmd_ckpt_after = false; // LLAMA_MTMD_CKPT_AFTER=1: allow checkpoints after an image car (A/B only)
+
+    static bool view_has_embd_rows(const common_batch & view) {
+        for (const auto & t : view.tokens) { if (t.embd.data) { return true; } }
+        return false;
+    }
+
+    // queue the async encoding of every media chunk of the slot's prompt from token index `from` on
+    void mtmd_prefetch(const server_slot & slot, size_t from) const {
+        if (!mtmd_pool || !slot.task || !slot.task->tokens.has_mtmd) { return; }
+        const auto & tokens = slot.task->tokens;
+        if (from < tokens.size() && tokens[from] == LLAMA_TOKEN_NULL) {
+            mtmd_pool->submit(slot.id, slot.task->id, from, tokens.find_chunk(from).get());
+        }
+        for (auto [c, i] = tokens.find_next_media_chunk(from); c; std::tie(c, i) = tokens.find_next_media_chunk(i)) {
+            mtmd_pool->submit(slot.id, slot.task->id, i, c->get());
+        }
+    }
+
+    void mtmd_prefetch(const server_slot & slot) const {
+        // only after prompt setup: n_tokens() then excludes the reused cache, so cached images are not re-encoded
+        if (slot.resident_paused || !slot.task || slot.state != SLOT_STATE_PROCESSING_PROMPT) { return; }
+        mtmd_prefetch(slot, slot.prompt.n_tokens());
+    }
+
+    // true if the slot's prompt stands at a media chunk whose async encoding has not finished yet
+    bool mtmd_pending(const server_slot & slot) const {
+        if (!mtmd_pool || !slot.task || slot.state != SLOT_STATE_PROCESSING_PROMPT || !slot.task->tokens.has_mtmd) { return false; }
+        const auto & tokens = slot.task->tokens;
+        const size_t idx = slot.prompt.n_tokens();
+        if (idx >= tokens.size() || tokens[idx] != LLAMA_TOKEN_NULL) { return false; }
+        mtmd_prefetch(slot, idx);
+        return !mtmd_pool->ready(slot.id, slot.task->id, idx);
+    }
 
     mtmd_context * mctx = nullptr;
     // note: video_params.ffmpeg_bin_dir points into params_base, which outlives this struct
@@ -1236,6 +1410,8 @@ private:
     int64_t                dash_hist_prev_ms = 0;     // main thread only from here on
     bool                   dash_hist_prev_busy = false;
     uint64_t               dash_hist_prompt = 0, dash_hist_predict = 0;
+    void dash_hist_mark_prompt() { // main thread, before a pass; kept as a named entry point in case it's needed later
+    }
 
     // note: accessing these fields outside of this class is not thread-safe
     // use server_context methods instead
@@ -1775,6 +1951,9 @@ private:
     int64_t pipeline_draft_batch_us = 0;
     std::map<size_t, uint64_t> pipeline_draft_batch_histogram;
     int64_t pipeline_profile_issue_us = 0;
+    // issue time split by car kind: 0 = text prompt, 1 = image rows, 2 = decode only
+    int64_t pipeline_issue_kind_us[3] = {0, 0, 0};
+    uint64_t pipeline_issue_kind_n[3] = {0, 0, 0};
     int64_t pipeline_profile_wait_us = 0;
     int64_t pipeline_profile_process_us = 0;
     uint64_t pipeline_profile_count = 0;
@@ -2015,7 +2194,7 @@ private:
         const bool fail = pipeline_test_fail_catchup > 0 && ++pipeline_catchup_calls == pipeline_test_fail_catchup;
         int idx = -1;
         if (any && !fail) {
-            if (view.has_embd()) {
+            if (view_has_embd_rows(view)) {
                 // embedding entries carry non-owning views; keep them on the scheduler
                 ++dft_direct_catchups;
                 dft_join(__LINE__);
@@ -2588,7 +2767,8 @@ private:
             if (!slot.is_processing() || slot.resident_paused) { continue; }
             if ((slot.can_speculate() && !pipeline_async_drafts) ||
                     slot.task->is_parent() || slot.task->is_child() ||
-                    slot.task->tokens.has_media() || !slot.task->need_sampling() || !slot.lora.empty()) { return false; }
+                    (slot.task->tokens.has_media() && !(mtmd_batched && pipeline_prefill_lanes > 0)) ||
+                    !slot.task->need_sampling() || !slot.lora.empty()) { return false; }
             active = true;
         }
         return active;
@@ -2623,7 +2803,7 @@ private:
             const size_t index = (pipeline_prefill_next + i) % slots.size();
             const auto & slot = slots[index];
             if (!slot.resident_paused && slot.task &&
-                    (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT)) {
+                    (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT) && !mtmd_pending(slot)) {
                 if (pass == 0 && pipeline_hold_for_checkpoint(slot)) { ++pipeline_checkpoint_holds; continue; }
                 pipeline_prefill_next = (index + 1) % slots.size();
                 return slot.id;
@@ -2639,7 +2819,7 @@ private:
         if (in_flight >= std::max(1, params_base.pipe_pf_inflight)) { return false; }
         return std::any_of(slots.begin(), slots.end(), [this](const server_slot & slot) {
             return !slot.resident_paused && slot.task &&
-                (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT);
+                (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT) && !mtmd_pending(slot);
         });
     }
 
@@ -2749,6 +2929,11 @@ private:
             const int ret = pipeline_test_fail_issue > 0 && pipeline_nonempty_issues == pipeline_test_fail_issue
                     ? -2 : llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             pipeline_profile_issue_us += ggml_time_us() - issue_start;
+            {
+                const int kind = batch.has_embd() ? 1 : pe_nprompt > 0 ? 0 : 2;
+                pipeline_issue_kind_us[kind] += ggml_time_us() - issue_start;
+                ++pipeline_issue_kind_n[kind];
+            }
             pe(PE_ISSUE_E, lane_id, batch.size(), pe_nprompt, pe_nseq, ret == 0 ? llama_decode_ticket_last(ctx_tgt) : 0, pe_slots);
             if (ret != 0) {
                 pipeline_filter = -1;
@@ -3269,6 +3454,7 @@ private:
             }
             if (slot.ckpt_barrier) { slot.ckpt_barrier(slot.id); }
             slot.prompt = entry->prompt.clone();
+            slot.prompt.tokens.has_mtmd = (mctx != nullptr); // system cache entries are text-only; restore capability flag
             if (!slot.task->params.mtp) {
                 slot.prompt.mtp_ready = false;
                 slot.prompt.speculative_state.clear();
@@ -3418,6 +3604,7 @@ private:
         ctx_tgt = nullptr;
         model_tgt = nullptr;
 
+        mtmd_pool.reset(); // joins the encoders before their contexts go away
         mtmd_free(mctx);
         mctx = nullptr;
     }
@@ -3543,6 +3730,21 @@ private:
             mparams.image_max_tokens = params_base.image_max_tokens;
             mparams.batch_max_tokens = params_base.mtmd_batch_max_tokens;
             mparams.media_marker     = get_media_marker();
+            // split the encoder layers over every GPU of the model (LLAMA_MTMD_SPLIT=0 keeps it on one device)
+            const char * split_env = getenv("LLAMA_MTMD_SPLIT");
+            if (mparams.use_gpu && mparams.device == nullptr && (!split_env || atoi(split_env) != 0)) {
+                mtmd_split_devs = params_base.devices;
+                if (mtmd_split_devs.empty()) {
+                    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) { mtmd_split_devs.push_back(dev); }
+                    }
+                }
+                if (mtmd_split_devs.size() > 1) {
+                    mparams.devices   = mtmd_split_devs.data();
+                    mparams.n_devices = (int) mtmd_split_devs.size();
+                }
+            }
             // progress callback
             mparams.progress_callback           = load_progress_callback;
             mparams.progress_callback_user_data = &load_progress_mmproj;
@@ -3555,6 +3757,9 @@ private:
             int64_t t_start = ggml_time_us();
             mmproj_usage = mtmd_get_memory_usage(mmproj_path.c_str(), mparams);
             mmproj_usage_t_us = ggml_time_us() - t_start;
+            for (const auto & [dev, size] : mmproj_usage.backend_mem_usage) {
+                SRV_INF("[mtmd] encoder memory on %s: %.1f MiB (split over %d device(s))\n", ggml_backend_dev_name(dev), size / 1048576.0, std::max(1, mparams.n_devices));
+            }
         }
 
         // optionally fit mmproj memory usage
@@ -3707,6 +3912,22 @@ private:
                 return false;
             }
             SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
+
+            const char * pool_env = getenv("LLAMA_MTMD_POOL");
+            if (mparams.use_gpu && mtmd_support_vision(mctx) && (!pool_env || atoi(pool_env) != 0)) {
+                auto pool = std::make_unique<server_mtmd_pool>();
+                pool->ctxs.push_back(mctx); // one encoder; its layers may be split over the GPUs
+                pool->n_embd = llama_model_n_embd_inp(model_tgt);
+                pool->on_ready = [this]() { queue_tasks.request_update(); };
+                pool->start();
+                SRV_INF("multimodal encoder pool: %zu worker(s)\n", pool->ctxs.size());
+                mtmd_pool = std::move(pool);
+                const char * batched_env = getenv("LLAMA_MTMD_BATCHED");
+                mtmd_batched = !batched_env || atoi(batched_env) != 0;
+                const char * after_env = getenv("LLAMA_MTMD_CKPT_AFTER");
+                mtmd_ckpt_after = after_env && atoi(after_env) != 0;
+                SRV_INF("multimodal images %s\n", mtmd_batched ? "batched as embedding rows" : "decoded standalone");
+            }
 
             init_opt.video_params.fps_target = params_base.video_fps;
             init_opt.video_params.timestamp_interval_ms = params_base.video_timestamp_interval_ms;
@@ -4041,6 +4262,7 @@ private:
         });
         queue_tasks.on_update_slots([this]() {
             const int64_t t_enter = dash_hist ? paraflow_wall_ms() : 0;
+            if (dash_hist) { dash_hist_mark_prompt(); }
             update_slots();
             if (dash_hist) { dash_hist_record(t_enter); }
         });
@@ -5719,6 +5941,9 @@ private:
                                 {"drain_nonempty", pipeline_drain_nonempty},
                                 {"admission_calls", pipeline_admission_calls}, {"admission_drain_us", pipeline_admission_drain_us}, {"admission_skipped", pipeline_admission_skipped}, {"admission_mtp_skipped", pipeline_admission_mtp_skipped}, {"vip_pause_skipped", pipeline_vip_pause_skipped}, {"checkpoint_pinned_captures", checkpoint_pinned_captures}, {"checkpoint_mtp_seq_captures", checkpoint_mtp_seq_captures}, {"checkpoint_holds", pipeline_checkpoint_holds}, {"admission_late_drains", pipeline_admission_late_drains},
                                 {"prefill_cars", pipeline_prefill_cars}, {"decode_cars", pipeline_decode_cars},
+                                {"issue_text_us", pipeline_issue_kind_us[0]}, {"issue_text_n", pipeline_issue_kind_n[0]},
+                                {"issue_image_us", pipeline_issue_kind_us[1]}, {"issue_image_n", pipeline_issue_kind_n[1]},
+                                {"issue_decode_us", pipeline_issue_kind_us[2]}, {"issue_decode_n", pipeline_issue_kind_n[2]},
                                 {"mixed_cars", pipeline_mixed_cars},
                                 {"prompt_payload", pipeline_prompt_payload}, {"decode_payload", pipeline_decode_payload},
                             };
@@ -6291,19 +6516,24 @@ private:
 
     // Main thread, after every update_slots() pass. Tokens counted since the previous pass are spread over the
     // time they took: from the end of the previous pass if work was in flight then, else from the start of this
-    // pass (an idle loop does not run, so idle time stays empty). Request counts use the state after the pass.
+    // pass (an idle loop does not run, so idle time stays empty). Request counts use the work done in the pass.
     void dash_hist_record(int64_t t_enter) {
         const int64_t z = paraflow_wall_ms();
         const uint64_t dp = metrics.n_prompt_observed - dash_hist_prompt, dd = metrics.n_predict_observed - dash_hist_predict;
         dash_hist_prompt = metrics.n_prompt_observed; dash_hist_predict = metrics.n_predict_observed;
         uint64_t ng = 0, np = 0;
         bool busy = !suspended_requests.empty();
-        for (const auto & slot : slots) {
-            if (!slot.is_processing()) { continue; }
+        // Classify each slot by the work it did in this pass, not by its state after the pass: the pass that
+        // eats the last prompt chunk already leaves the slot GENERATING, so a one-chunk prefill would never be
+        // seen. A slot is prefill (prompt tokens this pass) or decode (generating, no prompt tokens), never both,
+        // so the two time-weighted averages add up to the busy, non-paused slots.
+        for (auto & slot : slots) {
+            const bool pf = slot.dash_prompt_mark;
+            slot.dash_prompt_mark = false;
+            if (!slot.is_processing() && !pf) { continue; }
             busy = true;
             if (slot.resident_paused) { continue; }
-            ng += slot.state == SLOT_STATE_GENERATING;
-            np += slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT;
+            if (pf) { ++np; } else { ng += slot.state == SLOT_STATE_GENERATING; }
         }
         int64_t a = dash_hist_prev_busy ? dash_hist_prev_ms : t_enter;
         dash_hist_prev_busy = busy; dash_hist_prev_ms = z;
@@ -6362,6 +6592,7 @@ private:
         if (params_base.dash) { dash_publish(); }
         if (!ckpt_async_items.empty()) { ckpt_async_poll(-1, false); }
         resume_paused();
+        if (mtmd_pool) { for (const auto & slot : slots) { mtmd_prefetch(slot); } }
         ensure_generation_capacity();
         pipeline_rebalance();
         pipeline_refresh_work_rounds();
@@ -6400,6 +6631,15 @@ private:
             } else {
                 queue_tasks.request_update();
             }
+        }
+
+        // every busy slot waits for an image encoder and nothing is in flight: sleep instead of spinning
+        if (mtmd_pool && pipeline_fifo.empty() && mtmd_pool->busy()) {
+            bool other_work = false;
+            for (auto & slot : slots) {
+                if (slot.is_processing() && !slot.resident_paused && !mtmd_pending(slot)) { other_work = true; break; }
+            }
+            if (!other_work) { mtmd_pool->wait(50); return; }
         }
 
         try {
@@ -6759,6 +6999,8 @@ private:
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
+        // an image goes into a pipeline car as a whole; only the physical batch and the KV budget bound it
+        int32_t n_batch_media = n_batch;
         if (pipeline_filter >= 0 && pipeline_prefill_slot >= 0) {
             n_batch = std::min(n_batch, batch.size() + std::max(1, params_base.pipe_prefill_chunk));
         }
@@ -6776,6 +7018,7 @@ private:
             const uint64_t used = resident_tokens() + generated_cells;
             const int available = used < (uint64_t) n_ctx ? (int) ((uint64_t) n_ctx - used) : 0;
             n_batch = std::min(n_batch, batch.size() + available);
+            n_batch_media = std::min(n_batch_media, batch.size() + available);
         }
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
@@ -7219,6 +7462,7 @@ private:
                     }
 
                     bool has_mtmd = false;
+                    bool media_in_car = false; // this car carries an image of the slot, no text joins it
 
                     // check if we should process the mtmd chunk
                     while (true) {
@@ -7230,17 +7474,57 @@ private:
                             break;
                         }
 
+                        size_t n_tokens_out = 0;
+                        int32_t res = 0;
+                        server_mtmd_pool::result encoded;
+                        // only prefill-only lanes: they carry no generation rows, so the car stays pure embedding
+                        const bool in_car = mtmd_pool && mtmd_batched && pipeline_filter >= 0 &&
+                                pipeline_prefill_lanes > 0 && pipeline_filter >= pipeline_count;
+                        if (mtmd_pool) {
+                            mtmd_prefetch(slot, cur_token_idx);
+                            // an image car holds only embedding rows: the MTP draft context cannot mix rows
+                            if (in_car && (batch.size() > 0 || batch.size() +
+                                    (int32_t) mtmd_input_chunk_get_n_tokens(input_tokens.find_chunk(cur_token_idx).get()) > n_batch_media)) {
+                                return; // wait for an empty car with room for the whole image
+                            }
+                            if (!mtmd_pool->take(slot.id, slot.task->id, cur_token_idx, encoded)) {
+                                return; // still encoding on a GPU worker; the slot resumes here on a later pass
+                            }
+                        }
+
+                        if (in_car) {
+                            // the image rows decode with the car on the pipeline lanes, overlapping the other lanes
+                            const auto & chunk = input_tokens.find_chunk(cur_token_idx);
+                            if (encoded.res != 0 || !add_mtmd_chunk(slot, chunk.get(), encoded.embd.data(), batch)) {
+                                SLT_ERR(slot, "failed to add mtmd chunk to the car, res = %d\n", encoded.res);
+                                batch.truncate(n_tokens_prev);
+                                send_error(slot, "failed to process mtmd chunk", ERROR_TYPE_SERVER);
+                                slot.release();
+                                return;
+                            }
+                            SLT_INF(slot, "mtmd car: idx = %zu, n_tokens = %zu, lane = %d\n", cur_token_idx,
+                                    mtmd_input_chunk_get_n_tokens(chunk.get()), pipeline_filter);
+                            slot.prompt.tokens.push_back_placeholder(chunk.get());
+                            has_mtmd = true;
+                            media_in_car = true;
+                            slot.mtmd_ckpt_skip = !mtmd_ckpt_after;
+                            break;
+                        }
+
                         // process the mtmd chunk
                         // note: it submits its own decode, potentially be async
                         //       so the timing is queued and flushed on the next sync
                         metrics_pre_decode();
 
-                        // encode on the worker thread, so we can still handle metrics tasks
-                        size_t n_tokens_out = 0;
-                        int32_t res = 0;
-                        queue_tasks.yield_to_queue([&]() {
-                            res = process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out);
-                        });
+                        if (mtmd_pool) {
+                            res = encoded.res != 0 ? -1 : decode_mtmd_embd(slot, input_tokens.find_chunk(cur_token_idx).get(),
+                                    encoded.embd.data(), cur_token_idx, n_tokens_out);
+                        } else {
+                            // encode on the worker thread, so we can still handle metrics tasks
+                            queue_tasks.yield_to_queue([&]() {
+                                res = process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out);
+                            });
+                        }
 
                         if (res != 0) {
                             SLT_ERR(slot, "failed to process mtmd chunk, res = %d\n", res);
@@ -7251,6 +7535,7 @@ private:
 
                         metrics_queue_prompt(n_tokens_out);
                         slot.stats.n_prompt_processed += n_tokens_out;
+                        slot.dash_prompt_mark = true;
                         slot.stats.update_prompt_last();
 
                         // add the mtmd chunk to cache
@@ -7278,7 +7563,7 @@ private:
                     }
                     const int prompt_chunk_start = slot.prompt.n_tokens();
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch &&
+                    while (!media_in_car && slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch &&
                             (prompt_quantum == 0 || slot.prompt.n_tokens() - prompt_chunk_start < prompt_quantum)) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
@@ -7400,7 +7685,10 @@ private:
                     }
 
                     // do not checkpoint after mtmd chunks
-                    do_checkpoint = do_checkpoint && !has_mtmd;
+                    do_checkpoint = do_checkpoint && !has_mtmd && !slot.mtmd_ckpt_skip;
+                    // the standalone path skipped only the pass that held the image; the image car took that pass,
+                    // so the first text pass after it is skipped too, then checkpoints resume (tail snapshot)
+                    if (!has_mtmd) { slot.mtmd_ckpt_skip = false; }
 
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
@@ -8008,6 +8296,7 @@ private:
             n_prompt_tokens++;
 
             auto & slot = slots[t.id_slot];
+            slot.dash_prompt_mark = true;
             if (slot.stats.is_set()) {
                 slot.stats.n_prompt_processed++;
             }
