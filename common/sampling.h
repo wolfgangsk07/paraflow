@@ -61,6 +61,9 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
 // get the underlying llama_sampler_chain
 struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 
+// return positive K when only the top-K logits can ever affect this sampler chain, else 0
+int32_t common_sampler_direct_topk(const struct common_sampler * gsmpl);
+
 // extended sampling implementation:
 //
 // - set logits

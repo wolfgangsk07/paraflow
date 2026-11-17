@@ -191,6 +191,7 @@ struct llama_context {
     bool     decode_ticket_release(uint64_t ticket);
     int32_t  decode_ticket_retained_count() const;
     bool     decode_ticket_selected() const { return selected_ticket != 0; }
+    void     set_seq_direct_topk(llama_seq_id seq_id, int32_t k);
 
     //
     // state save/load
@@ -508,7 +509,12 @@ private:
         size_t  size = 0;                 // capacity in floats
         float * hidden = nullptr;        // dense, original batch token order
         size_t hidden_rows = 0;
+        int32_t topk = 0;                 // > 0: GPU top-k values/ids stored in slab instead of full logits
+        llama_token * topk_ids = nullptr; // [n_outputs * topk] inside buf
     };
+
+    std::vector<int32_t> seq_direct_topk;
+    int32_t              cur_logits_topk = 0;
 
     // Retained lane outputs cannot be recycled while faster lanes submit again.
     // Unretained prompt/legacy tickets keep the existing rotating-slab policy.

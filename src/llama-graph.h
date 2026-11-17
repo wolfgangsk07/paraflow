@@ -830,6 +830,7 @@ struct llm_graph_params {
     }
 
     uint32_t n_outputs;
+    int32_t  logits_topk = 0;
 
     llm_graph_cb cb;
 
@@ -871,7 +872,7 @@ struct llm_graph_params {
             return false;
         }
 
-        if (n_outputs != other.n_outputs) {
+        if (n_outputs != other.n_outputs || logits_topk != other.logits_topk) {
             return false;
         }
 
@@ -961,12 +962,14 @@ public:
     void set_params(const llm_graph_params & params);
 
     // important graph nodes
-    ggml_tensor * t_inp_tokens  = nullptr;
-    ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
-    ggml_tensor * t_logits      = nullptr;
-    ggml_tensor * t_embd        = nullptr;
-    ggml_tensor * t_embd_pooled = nullptr;
-    ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_inp_tokens       = nullptr;
+    ggml_tensor * t_inp_embd         = nullptr; // [n_embd_inp, n_tokens]
+    ggml_tensor * t_logits           = nullptr;
+    ggml_tensor * t_logits_topk_ids  = nullptr; // [k, n_outputs] I32
+    ggml_tensor * t_logits_topk_vals = nullptr; // [k, n_outputs] F32
+    ggml_tensor * t_embd             = nullptr;
+    ggml_tensor * t_embd_pooled      = nullptr;
+    ggml_tensor * t_h_nextn          = nullptr; // [n_embd, n_outputs] hidden state before final output norm
 
     std::vector<ggml_tensor *> t_layer_inp;
 
@@ -1046,6 +1049,7 @@ struct llm_graph_context {
 
     const int64_t n_tokens;
     const int64_t n_outputs;
+    const int32_t logits_topk;
     const int32_t n_ctx_orig; // yarn
 
     const enum llama_pooling_type pooling_type;

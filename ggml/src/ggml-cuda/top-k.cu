@@ -1,3 +1,4 @@
+#include "argmax.cuh"
 #include "argsort.cuh"
 #include "top-k.cuh"
 
@@ -209,6 +210,109 @@ static __global__ void top_k_radix_gather(
     }
 }
 
+template<int BLOCK_SIZE>
+static __global__ void top_k_radix_gather_sorted_128(
+        const float * __restrict__ src,
+        int * __restrict__ dst,
+        const top_k_radix_state * __restrict__ states,
+        int ncols,
+        int k) {
+    constexpr int MAX_K = 128;
+    constexpr int NWARPS = BLOCK_SIZE / WARP_SIZE;
+
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int lane = tid % WARP_SIZE;
+    const int warp = tid / WARP_SIZE;
+
+    const float * row_src = src + (size_t) row * ncols;
+    int * row_dst = dst + (size_t) row * k;
+    const top_k_radix_state state = states[row];
+
+    __shared__ float s_vals[MAX_K];
+    __shared__ int   s_idxs[MAX_K];
+    __shared__ int   s_gt_cnt;
+    __shared__ int   s_eq_cnt;
+    __shared__ uint32_t s_eq_mask[NWARPS];
+
+    if (tid == 0) {
+        s_gt_cnt = 0;
+        s_eq_cnt = 0;
+    }
+    if (tid < k) {
+        s_vals[tid] = -INFINITY;
+        s_idxs[tid] = tid;
+    }
+    __syncthreads();
+
+    for (int64_t col_base = 0; col_base < ncols; col_base += BLOCK_SIZE) {
+        const int64_t col = col_base + tid;
+        bool is_eq = false;
+        if (col < ncols) {
+            const float v = row_src[col];
+            const uint32_t key = top_k_float_to_ordered(v);
+            if (key > state.prefix) {
+                const int pos = atomicAdd(&s_gt_cnt, 1);
+                if (pos < k) {
+                    s_vals[pos] = v;
+                    s_idxs[pos] = (int) col;
+                }
+            } else if (key == state.prefix) {
+                is_eq = true;
+            }
+        }
+        if (__syncthreads_or(is_eq && s_eq_cnt < state.rank)) {
+            const uint32_t mask = __ballot_sync(0xFFFFFFFF, is_eq);
+            if (lane == 0) {
+                s_eq_mask[warp] = mask;
+            }
+            __syncthreads();
+            if (tid == 0) {
+                const int eq_base = k - state.rank;
+                for (int w = 0; w < NWARPS && s_eq_cnt < state.rank; ++w) {
+                    uint32_t m = s_eq_mask[w];
+                    while (m != 0 && s_eq_cnt < state.rank) {
+                        const int bit = __ffs((int) m) - 1;
+                        m &= (m - 1);
+                        const int c = (int) (col_base + w * WARP_SIZE + bit);
+                        const int slot = eq_base + s_eq_cnt++;
+                        if (slot >= 0 && slot < k) {
+                            s_vals[slot] = row_src[c];
+                            s_idxs[slot] = c;
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    __syncthreads();
+    if (tid < k) {
+        const float my_v = s_vals[tid];
+        const int   my_i = s_idxs[tid];
+        const bool  my_nan = isnan(my_v);
+        int rank = 0;
+        for (int j = 0; j < k; ++j) {
+            const float j_v = s_vals[j];
+            const int   j_i = s_idxs[j];
+            const bool  j_nan = isnan(j_v);
+            bool j_better = false;
+            if (j_nan != my_nan) {
+                j_better = j_nan;
+            } else if (j_nan) {
+                j_better = j_i < my_i;
+            } else {
+                j_better = (j_v > my_v) || (j_v == my_v && j_i < my_i);
+            }
+            if (j_better) {
+                ++rank;
+            }
+        }
+        row_dst[rank] = my_i;
+    }
+}
+
 static void top_k_radix_cuda(
         ggml_cuda_pool & pool,
         const float * src, int * dst, int ncols, int64_t nrows, int k, cudaStream_t stream) {
@@ -239,11 +343,17 @@ static void top_k_radix_cuda(
                 <<<iter_nrows, BLOCK_SIZE, 0, stream>>>(histograms, states, blocks_per_row, shift);
         }
 
-        top_k_radix_reset_counters
-            <<<(iter_nrows + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(states, iter_nrows);
-        top_k_radix_gather<BLOCK_SIZE>
-            <<<row_grid, BLOCK_SIZE, 0, stream>>>(
-                src, dst, states, ncols, k, blocks_per_row);
+        if (k <= 128) {
+            top_k_radix_gather_sorted_128<BLOCK_SIZE>
+                <<<iter_nrows, BLOCK_SIZE, 0, stream>>>(
+                    src, dst, states, ncols, k);
+        } else {
+            top_k_radix_reset_counters
+                <<<(iter_nrows + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(states, iter_nrows);
+            top_k_radix_gather<BLOCK_SIZE>
+                <<<row_grid, BLOCK_SIZE, 0, stream>>>(
+                    src, dst, states, ncols, k, blocks_per_row);
+        }
 
         src += (size_t) ncols * iter_nrows;
         dst += (size_t) k     * iter_nrows;
@@ -292,6 +402,10 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t    ncols = src0->ne[0];
     const int64_t    nrows = ggml_nrows(src0);
     const int64_t    k     = dst->ne[0];
+    if (k == 1) {
+        ggml_cuda_argmax(ctx, dst);
+        return;
+    }
     ggml_cuda_pool & pool  = ctx.pool();
 
     const int device = ggml_cuda_get_device();
@@ -315,7 +429,7 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         }
     }
 
-    if (nrows > GGML_CUDA_TOP_K_NROWS_THRESHOLD) {
+    if (k <= 128 || nrows > GGML_CUDA_TOP_K_NROWS_THRESHOLD) {
         top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
         return;
     }

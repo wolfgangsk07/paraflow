@@ -1384,12 +1384,14 @@ int64_t llm_graph_result::get_max_nodes() const {
 }
 
 void llm_graph_result::reset() {
-    t_inp_tokens  = nullptr;
-    t_inp_embd    = nullptr;
-    t_logits      = nullptr;
-    t_embd        = nullptr;
-    t_embd_pooled = nullptr;
-    t_h_nextn     = nullptr;
+    t_inp_tokens      = nullptr;
+    t_inp_embd        = nullptr;
+    t_logits          = nullptr;
+    t_logits_topk_ids = nullptr;
+    t_logits_topk_vals = nullptr;
+    t_embd            = nullptr;
+    t_embd_pooled     = nullptr;
+    t_h_nextn         = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1425,7 +1427,10 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_result::set_outputs(const llm_graph_params & params) {
-    if (t_logits != nullptr) {
+    if (t_logits_topk_ids != nullptr && t_logits_topk_vals != nullptr) {
+        ggml_set_output(t_logits_topk_ids);
+        ggml_set_output(t_logits_topk_vals);
+    } else if (t_logits != nullptr) {
         ggml_set_output(t_logits);
     }
     if (t_embd != nullptr) {
@@ -1554,6 +1559,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     norm_rms_eps     (hparams.f_norm_rms_eps),
     n_tokens         (ubatch.n_tokens),
     n_outputs        (params.n_outputs),
+    logits_topk      (params.logits_topk),
     n_ctx_orig       (cparams.n_ctx_orig_yarn),
     pooling_type     (cparams.pooling_type),
     rope_type        (hparams.rope_type),
@@ -4186,6 +4192,21 @@ void llm_graph_context::build_logits() const {
     // the models declare t_logits without expanding it, so the LM head is computed only when it is expanded here
     if (res->t_logits != nullptr) {
         ggml_build_forward_expand(gf, res->t_logits);
+        if (logits_topk > 0 && res->t_logits->ne[1] > 0 && res->t_logits->type == GGML_TYPE_F32) {
+            const int64_t n_vocab_cur = res->t_logits->ne[0];
+            const int64_t n_out_cur   = res->t_logits->ne[1];
+            const int32_t k = (int32_t) std::min<int64_t>(logits_topk, n_vocab_cur);
+            ggml_tensor * ids = ggml_top_k(ctx0, res->t_logits, k);
+            cb(ids, "logits_topk_ids", -1);
+            ggml_tensor * logits_3d = ggml_reshape_3d(ctx0, res->t_logits, 1, n_vocab_cur, n_out_cur);
+            ggml_tensor * vals = ggml_get_rows(ctx0, logits_3d, ids);
+            vals = ggml_reshape_2d(ctx0, vals, k, n_out_cur);
+            cb(vals, "logits_topk_vals", -1);
+            res->t_logits_topk_ids  = ids;
+            res->t_logits_topk_vals = vals;
+            ggml_build_forward_expand(gf, ids);
+            ggml_build_forward_expand(gf, vals);
+        }
     }
 }
 

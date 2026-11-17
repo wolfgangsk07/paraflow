@@ -45,11 +45,53 @@ struct common_logit_iterator {
 };
 
 static int32_t common_direct_topk_limit(const common_params_sampling & params, const llama_model * model) {
-    if (params.mirostat != 0 || params.n_probs != 0 || !params.logit_bias.empty() ||
-            params.top_k <= 0 || params.top_k > 128) { return 0; }
+    if (params.mirostat != 0 || params.n_probs != 0 || !params.logit_bias.empty()) { return 0; }
     int32_t suppressed = 0;
     llama_vocab_get_suppress_tokens(llama_model_get_vocab(model), &suppressed);
     if (suppressed != 0) { return 0; }
+
+    const bool tail_greedy = !params.samplers.empty() &&
+        ((params.samplers.back() == COMMON_SAMPLER_TYPE_TEMPERATURE && params.temp == 0.0f && params.dynatemp_range == 0.0f) ||
+         (params.samplers.back() == COMMON_SAMPLER_TYPE_TOP_K && params.top_k == 1));
+    if (tail_greedy) {
+        bool pure_greedy = true;
+        for (auto stage : params.samplers) {
+            switch (stage) {
+                case COMMON_SAMPLER_TYPE_PENALTIES:
+                    if (params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f) { pure_greedy = false; }
+                    break;
+                case COMMON_SAMPLER_TYPE_DRY:
+                    if (params.dry_multiplier != 0.0f) { pure_greedy = false; }
+                    break;
+                case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+                    if (!(params.top_n_sigma <= 0.0f)) { pure_greedy = false; }
+                    break;
+                case COMMON_SAMPLER_TYPE_TOP_K:
+                    break;
+                case COMMON_SAMPLER_TYPE_TYPICAL_P:
+                    if (params.typ_p < 1.0f) { pure_greedy = false; }
+                    break;
+                case COMMON_SAMPLER_TYPE_TOP_P:
+                    break;
+                case COMMON_SAMPLER_TYPE_MIN_P:
+                    if (params.min_p > 1.0f) { pure_greedy = false; }
+                    break;
+                case COMMON_SAMPLER_TYPE_XTC:
+                    if (params.xtc_probability > 0.0f && params.xtc_threshold <= 0.5f) { pure_greedy = false; }
+                    break;
+                case COMMON_SAMPLER_TYPE_TEMPERATURE:
+                    if (params.temp != 0.0f || params.dynatemp_range != 0.0f) { pure_greedy = false; }
+                    break;
+                default:
+                    pure_greedy = false;
+                    break;
+            }
+            if (!pure_greedy) { break; }
+        }
+        if (pure_greedy) { return 1; }
+    }
+
+    if (params.top_k <= 0 || params.top_k > 128) { return 0; }
     for (auto stage : params.samplers) {
         switch (stage) {
             case COMMON_SAMPLER_TYPE_TOP_K: return params.top_k;
@@ -197,9 +239,26 @@ struct common_sampler {
         const int32_t count = std::min(n_vocab, direct_top_k);
         cur.resize(count);
         bool has_nan = false;
-        const auto compare = [](const llama_token_data & a, const llama_token_data & b) { return a.logit > b.logit; };
-        std::partial_sort_copy(common_logit_iterator{logits, 0, &has_nan},
-            common_logit_iterator{logits, n_vocab, &has_nan}, cur.begin(), cur.end(), compare);
+        if (count == 1) {
+            float best_val = -INFINITY;
+            int32_t best_id = 0;
+            for (int32_t i = 0; i < n_vocab; ++i) {
+                const float v = logits[i];
+                if (std::isnan(v)) {
+                    has_nan = true;
+                    break;
+                }
+                if (v > best_val) {
+                    best_val = v;
+                    best_id = i;
+                }
+            }
+            cur[0] = { best_id, best_val, 0.0f };
+        } else {
+            const auto compare = [](const llama_token_data & a, const llama_token_data & b) { return a.logit > b.logit; };
+            std::partial_sort_copy(common_logit_iterator{logits, 0, &has_nan},
+                common_logit_iterator{logits, n_vocab, &has_nan}, cur.begin(), cur.end(), compare);
+        }
         if (has_nan) {
             direct_topk_nan_fallbacks.fetch_add(1, std::memory_order_relaxed);
             return false;
@@ -708,6 +767,14 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     }
 
     return gsmpl->chain;
+}
+
+int32_t common_sampler_direct_topk(const struct common_sampler * gsmpl) {
+    if (!gsmpl) {
+        return 0;
+    }
+
+    return gsmpl->direct_top_k;
 }
 
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {

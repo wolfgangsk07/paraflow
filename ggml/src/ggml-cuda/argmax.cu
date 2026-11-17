@@ -5,16 +5,34 @@
 #include "common.cuh"
 #include "sum.cuh"
 
+static __device__ __forceinline__ bool argmax_better(float val, int col, float maxval, int argmax) {
+    if (argmax < 0) {
+        return col >= 0;
+    }
+    if (col < 0) {
+        return false;
+    }
+    const bool v_nan = isnan(val);
+    const bool m_nan = isnan(maxval);
+    if (v_nan != m_nan) {
+        return v_nan;
+    }
+    if (v_nan) {
+        return col < argmax;
+    }
+    return val > maxval || (val == maxval && col < argmax);
+}
+
 static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __restrict__ dst, const int64_t ncols) {
     const int64_t row = blockIdx.x;
 
-    float maxval = -FLT_MAX;
+    float maxval = -INFINITY;
     int   argmax = -1;
     const float * rowx = x + row * ncols;
 
     for (int32_t col = threadIdx.x; col < ncols; col += blockDim.x) {
         const float val = rowx[col];
-        if (val > maxval) {
+        if (argmax_better(val, col, maxval, argmax)) {
             maxval = val;
             argmax = col;
         }
@@ -24,7 +42,7 @@ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __rest
     for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
         const float val = __shfl_xor_sync(0xFFFFFFFF, maxval, offset, WARP_SIZE);
         const int   col = __shfl_xor_sync(0xFFFFFFFF, argmax, offset, WARP_SIZE);
-        if (val > maxval) {
+        if (argmax_better(val, col, maxval, argmax)) {
             maxval = val;
             argmax = col;
         }
@@ -48,12 +66,15 @@ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __rest
             if (lane_id < n_warps) {
                 maxval = shared_maxval[lane_id];
                 argmax = shared_argmax[lane_id];
+            } else {
+                maxval = -INFINITY;
+                argmax = -1;
             }
 #pragma unroll
             for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
                 const float val = __shfl_xor_sync(0xFFFFFFFF, maxval, offset, WARP_SIZE);
                 const int   col = __shfl_xor_sync(0xFFFFFFFF, argmax, offset, WARP_SIZE);
-                if (val > maxval) {
+                if (argmax_better(val, col, maxval, argmax)) {
                     maxval = val;
                     argmax = col;
                 }
@@ -62,7 +83,7 @@ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __rest
     }
 
     if (warp_id == 0 && lane_id == 0) {
-        dst[row] = argmax;
+        dst[row] = argmax >= 0 ? argmax : 0;
     }
 }
 

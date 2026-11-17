@@ -494,6 +494,7 @@ struct server_slot {
         n_predict_max = -1;
 
         llama_set_sampler(ctx_tgt, id, nullptr);
+        llama_set_seq_direct_topk(ctx_tgt, id, 0);
 
         // clear alora start
         alora_invocation_start = -1;
@@ -1947,6 +1948,13 @@ private:
             if (dest.smpl && dest.task->params.sampling.backend_sampling && !pipeline_on && !dest.can_speculate() &&
                     !(dest.task->params.sampling.n_probs > 0 && !dest.task->params.post_sampling_probs)) {
                 llama_set_sampler(ctx_tgt, dest.id, common_sampler_get(dest.smpl.get()));
+                llama_set_seq_direct_topk(ctx_tgt, dest.id, 0);
+            } else {
+                const int32_t gpu_topk = (dest.smpl && dest.task && dest.task->decision.labels.empty() &&
+                        dest.task->params.sampling.n_probs == 0 &&
+                        !(spec && !common_speculative_get_synth_probs(spec.get()).empty()))
+                    ? common_sampler_direct_topk(dest.smpl.get()) : 0;
+                llama_set_seq_direct_topk(ctx_tgt, dest.id, gpu_topk);
             }
             SRV_INF("continuation verified, slot=%d, task=%" PRId64 ", generation=%" PRIu64 "\n", dest.id, dest.task->id, saved.generation);
             it = suspended_requests.erase(it);
@@ -4790,8 +4798,14 @@ private:
             // TODO: tmp until backend sampling is fully implemented
             if (use_backend_sampling) {
                 llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
+                llama_set_seq_direct_topk(ctx_tgt, slot.id, 0);
             } else {
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
+                const int32_t gpu_topk = (task.decision.labels.empty() &&
+                        task.params.sampling.n_probs == 0 &&
+                        !(spec && !common_speculative_get_synth_probs(spec.get()).empty()))
+                    ? common_sampler_direct_topk(slot.smpl.get()) : 0;
+                llama_set_seq_direct_topk(ctx_tgt, slot.id, gpu_topk);
             }
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
@@ -4805,6 +4819,7 @@ private:
             }
         } else {
             slot.smpl.reset();
+            llama_set_seq_direct_topk(ctx_tgt, slot.id, 0);
         }
 
         // the per-request limit takes priority over the global one

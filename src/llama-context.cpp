@@ -1414,6 +1414,9 @@ float * llama_context::get_embeddings_layer_inp(uint32_t lid) {
 }
 
 llama_token llama_context::get_sampled_token_ith(int32_t idx) {
+    if (selected_ticket) {
+        return LLAMA_TOKEN_NULL;
+    }
     output_reorder();
 
     if (!sampling.sampled.has_data()) {
@@ -1431,6 +1434,9 @@ llama_token llama_context::get_sampled_token_ith(int32_t idx) {
 }
 
 float * llama_context::get_sampled_probs_ith(int32_t idx) {
+    if (selected_ticket) {
+        return nullptr;
+    }
     output_reorder();
 
     if (!sampling.probs.has_data()) {
@@ -1450,6 +1456,17 @@ float * llama_context::get_sampled_probs_ith(int32_t idx) {
 }
 
 float * llama_context::get_sampled_logits_ith(int32_t idx) {
+    if (selected_ticket) {
+        auto & tk = tickets[selected_ticket % n_decode_tickets];
+        if (tk.id == selected_ticket && !tk.fallback && tk.topk > 0 && tk.data) {
+            const int32_t row = idx < 0 ? tk.n_outputs + idx :
+                    (size_t) idx < tk.output_ids.size() ? tk.output_ids[idx] : -1;
+            if (row >= 0 && row < tk.n_outputs) {
+                return tk.data + (size_t) row * tk.topk;
+            }
+        }
+        return nullptr;
+    }
     output_reorder();
 
     if (!sampling.logits.has_data()) {
@@ -1469,6 +1486,17 @@ float * llama_context::get_sampled_logits_ith(int32_t idx) {
 }
 
 const llama_token * llama_context::get_sampled_candidates_ith(int32_t idx) {
+    if (selected_ticket) {
+        const auto & tk = tickets[selected_ticket % n_decode_tickets];
+        if (tk.id == selected_ticket && !tk.fallback && tk.topk > 0 && tk.topk_ids) {
+            const int32_t row = idx < 0 ? tk.n_outputs + idx :
+                    (size_t) idx < tk.output_ids.size() ? tk.output_ids[idx] : -1;
+            if (row >= 0 && row < tk.n_outputs) {
+                return tk.topk_ids + (size_t) row * tk.topk;
+            }
+        }
+        return sampling.token_ids_full_vocab.data();
+    }
     output_reorder();
 
     try {
@@ -1487,6 +1515,15 @@ const llama_token * llama_context::get_sampled_candidates_ith(int32_t idx) {
 }
 
 size_t llama_context::get_sampled_candidates_count(int32_t idx) {
+    if (selected_ticket) {
+        const auto & tk = tickets[selected_ticket % n_decode_tickets];
+        if (tk.id == selected_ticket && !tk.fallback && tk.topk > 0 && tk.topk_ids) {
+            const int32_t row = idx < 0 ? tk.n_outputs + idx :
+                    (size_t) idx < tk.output_ids.size() ? tk.output_ids[idx] : -1;
+            return (row >= 0 && row < tk.n_outputs) ? (size_t) tk.topk : 0;
+        }
+        return 0;
+    }
     output_reorder();
 
     if (!sampling.candidates.has_data()) {
@@ -1506,6 +1543,15 @@ size_t llama_context::get_sampled_candidates_count(int32_t idx) {
 }
 
 size_t llama_context::get_sampled_logits_count(int32_t idx) {
+    if (selected_ticket) {
+        const auto & tk = tickets[selected_ticket % n_decode_tickets];
+        if (tk.id == selected_ticket && !tk.fallback && tk.topk > 0 && tk.data) {
+            const int32_t row = idx < 0 ? tk.n_outputs + idx :
+                    (size_t) idx < tk.output_ids.size() ? tk.output_ids[idx] : -1;
+            return (row >= 0 && row < tk.n_outputs) ? (size_t) tk.topk : 0;
+        }
+        return model.vocab.n_tokens();
+    }
     output_reorder();
 
     if (!sampling.logits.has_data()) {
@@ -1525,6 +1571,9 @@ size_t llama_context::get_sampled_logits_count(int32_t idx) {
 }
 
 size_t llama_context::get_sampled_probs_count(int32_t idx) {
+    if (selected_ticket) {
+        return 0;
+    }
     output_reorder();
 
     if (!sampling.probs.has_data()) {
@@ -2333,9 +2382,31 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                         [](bool enabled) { return enabled; });
 
         if (can_slab) {
-            const size_t logits_need = (size_t) n_vocab * n_outputs_all;
+            int32_t batch_topk = 0;
+            if (n_outputs_all > 0 && n_vocab >= 128 && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+                int32_t max_k = 0;
+                bool all_eligible = true;
+                for (const auto & tok : batch_inp.tokens) {
+                    if (!tok.output) { continue; }
+                    if (tok.seq_ids.empty()) { all_eligible = false; break; }
+                    for (const auto sid : tok.seq_ids) {
+                        if (sid < 0 || (size_t) sid >= seq_direct_topk.size() || seq_direct_topk[sid] <= 0) {
+                            all_eligible = false;
+                            break;
+                        }
+                        max_k = std::max(max_k, seq_direct_topk[sid]);
+                    }
+                    if (!all_eligible) { break; }
+                }
+                if (all_eligible && max_k > 0) {
+                    batch_topk = max_k == 1 ? 1 : 128;
+                }
+            }
+            static_assert(sizeof(llama_token) == sizeof(float), "llama_token must match float width for slab packing");
+            const size_t logits_need = batch_topk > 0 ? (size_t) batch_topk * n_outputs_all : (size_t) n_vocab * n_outputs_all;
+            const size_t ids_need    = batch_topk > 0 ? (size_t) batch_topk * n_outputs_all : 0;
             const size_t hidden_rows = cparams.embeddings_nextn ? n_tokens_all : 0;
-            const size_t need = logits_need + hidden_rows * hparams.n_embd_out();
+            const size_t need = logits_need + hidden_rows * hparams.n_embd_out() + ids_need;
             if (need > 0 && (!tk->data || tk->size < need)) {
                 auto * buft = ggml_backend_cpu_buffer_type();
                 auto * output_dev = model.dev_output();
@@ -2349,9 +2420,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
             tk->hidden = hidden_rows && tk->data ? tk->data + logits_need : nullptr;
             tk->hidden_rows = hidden_rows;
+            tk->topk = tk->data ? batch_topk : 0;
+            tk->topk_ids = tk->topk > 0 ? (llama_token *) (tk->data + logits_need + hidden_rows * hparams.n_embd_out()) : nullptr;
             tk->output_ids.assign(n_tokens_all, -1);
             tk->fallback = need > 0 && !tk->data;
         } else {
+            tk->topk = 0;
+            tk->topk_ids = nullptr;
             tk->fallback = true;
         }
 
@@ -2385,6 +2460,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     for (const auto & entry : sampling.samplers) {
         llama_sampler_backend_begin(entry.second);
     }
+
+    struct logits_topk_scope {
+        int32_t & slot;
+        int32_t prev;
+        logits_topk_scope(int32_t & s, int32_t v) : slot(s), prev(s) { slot = v; }
+        ~logits_topk_scope() { slot = prev; }
+    } topk_guard(cur_logits_topk, (tk && !tk->fallback) ? tk->topk : 0);
 
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
@@ -2482,7 +2564,23 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
 
         // extract logits
-        if (tk && !tk->fallback && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+        if (tk && !tk->fallback && tk->topk > 0 && res->t_logits_topk_ids && res->t_logits_topk_vals && n_outputs > 0) {
+            const int32_t k = tk->topk;
+            GGML_ASSERT(res->t_logits_topk_ids->ne[0]  == k && res->t_logits_topk_ids->ne[1]  == n_outputs);
+            GGML_ASSERT(res->t_logits_topk_vals->ne[0] == k && res->t_logits_topk_vals->ne[1] == n_outputs);
+            ggml_backend_t backend_ids  = ggml_backend_sched_get_tensor_backend(cur_sched(), res->t_logits_topk_ids);
+            ggml_backend_t backend_vals = ggml_backend_sched_get_tensor_backend(cur_sched(), res->t_logits_topk_vals);
+            GGML_ASSERT(backend_ids != nullptr && backend_vals != nullptr);
+            GGML_ASSERT(n_outputs_prev + n_outputs <= n_outputs_all);
+
+            ggml_backend_tensor_get_async(backend_vals, res->t_logits_topk_vals,
+                    tk->data + n_outputs_prev * k, 0, (size_t) n_outputs * k * sizeof(float));
+            ggml_backend_tensor_get_async(backend_ids, res->t_logits_topk_ids,
+                    tk->topk_ids + n_outputs_prev * k, 0, (size_t) n_outputs * k * sizeof(llama_token));
+
+            tk->use_backend(backend_vals);
+            tk->use_backend(backend_ids);
+        } else if (tk && !tk->fallback && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
             // pipelined decode: copy into this ticket's private slab instead of the shared
             // main buffer, so a later in-flight decode cannot clobber it
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(cur_sched(), t_logits);
@@ -3381,6 +3479,7 @@ llm_graph_params llama_context::graph_params(
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
+        /*.logits_topk =*/ n_outputs > 0 ? cur_logits_topk : 0,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
@@ -5087,31 +5186,35 @@ float * llama_get_sampled_probs_ith(llama_context * ctx, int32_t i) {
 }
 
 float * llama_get_sampled_logits_ith(llama_context * ctx, int32_t i) {
-    if (ctx->decode_ticket_selected()) { return nullptr; }
-    ctx->synchronize();
+    if (!ctx->decode_ticket_selected()) {
+        ctx->synchronize();
+    }
 
     return ctx->get_sampled_logits_ith(i);
 }
 
 llama_token * llama_get_sampled_candidates_ith(llama_context * ctx, int32_t i) {
-    if (ctx->decode_ticket_selected()) { return nullptr; }
-    ctx->synchronize();
+    if (!ctx->decode_ticket_selected()) {
+        ctx->synchronize();
+    }
 
     return const_cast<llama_token *>(ctx->get_sampled_candidates_ith(i));
 }
 
 uint32_t llama_get_sampled_candidates_count_ith(llama_context * ctx, int32_t i) {
-    if (ctx->decode_ticket_selected()) { return 0; }
-    ctx->synchronize();
+    if (!ctx->decode_ticket_selected()) {
+        ctx->synchronize();
+    }
 
     return static_cast<uint32_t>(ctx->get_sampled_candidates_count(i));
 }
 
 uint32_t llama_get_sampled_logits_count_ith(llama_context * ctx, int32_t i) {
-    // Ticket slabs contain the full vocabulary, just like the non-backend
-    // sampling fallback. Probability consumers need its actual row width.
-    if (ctx->decode_ticket_selected()) { return ctx->get_model().vocab.n_tokens(); }
-    ctx->synchronize();
+    // When a ticket is selected, get_sampled_logits_count returns tk.topk (> 0) or full n_vocab (when tk.topk == 0)
+    // without draining unrelated in-flight pipeline lanes.
+    if (!ctx->decode_ticket_selected()) {
+        ctx->synchronize();
+    }
 
     return static_cast<uint32_t>(ctx->get_sampled_logits_count(i));
 }
@@ -5546,6 +5649,26 @@ int32_t llama_decode_ticket_retained_count(const llama_context * ctx) {
 
 bool llama_decode_ticket_is_selected(const llama_context * ctx) {
     return ctx->decode_ticket_selected();
+}
+
+void llama_context::set_seq_direct_topk(llama_seq_id seq_id, int32_t k) {
+    if (seq_id < 0) {
+        return;
+    }
+    const int32_t clamped = (k > 0 && k <= 128) ? k : 0;
+    if ((size_t) seq_id >= seq_direct_topk.size()) {
+        if (clamped == 0) {
+            return;
+        }
+        seq_direct_topk.resize((size_t) seq_id + 1, 0);
+    }
+    seq_direct_topk[seq_id] = clamped;
+}
+
+void llama_set_seq_direct_topk(llama_context * ctx, llama_seq_id seq_id, int32_t k) {
+    if (ctx) {
+        ctx->set_seq_direct_topk(seq_id, k);
+    }
 }
 
 //

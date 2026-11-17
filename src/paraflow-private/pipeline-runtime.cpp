@@ -135,6 +135,10 @@ void llama_context::set_decode_pipelined(bool enable) {
                 } else {
                     GGML_ASSERT(!lane_shapes.empty());
                 }
+                const int32_t prev_topk = cur_logits_topk;
+                if (!cparams.embeddings && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP && model.vocab.n_tokens() >= 128) {
+                    cur_logits_topk = 128;
+                }
                 for (const auto & shape : lane_shapes) {
                     if (reserve_kv) reserve_kv->set_reserve_streams(shape.second);
                     if (!graph_reserve(shape.first, shape.second, shape.first, mctx_full.get())) {
@@ -142,6 +146,7 @@ void llama_context::set_decode_pipelined(bool enable) {
                                 __func__, i, shape.first, shape.second);
                     }
                 }
+                cur_logits_topk = prev_topk;
             }
         }
 
@@ -199,11 +204,17 @@ void llama_context::set_decode_pipelined(bool enable) {
             pf_cur          = true;
             pf_cur_backends = &prefill_backend_ptrs;
 
-            if (!graph_reserve(n_tokens_pp,
+            const int32_t prev_topk = cur_logits_topk;
+            if (!cparams.embeddings && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP && model.vocab.n_tokens() >= 128) {
+                cur_logits_topk = 128;
+            }
+            const bool pf_ok = graph_reserve(n_tokens_pp,
                             llama_prefill_initial_reserve_sequences(model, cparams, cparams.n_seq_max),
                             llama_prefill_initial_reserve_sequences(model, cparams, cparams.n_seq_max) != cparams.n_seq_max
                                 ? std::min(n_tokens_pp, cparams.n_outputs_max) : n_tokens_pp,
-                            mctx_full.get())) {
+                            mctx_full.get()) != nullptr;
+            cur_logits_topk = prev_topk;
+            if (!pf_ok) {
                 LLAMA_LOG_WARN("%s: failed to reserve compute buffers for the prefill sched\n", __func__);
                 prefill_sched.reset();
                 prefill_gf_res.reset();
@@ -337,6 +348,10 @@ float * llama_context::decode_ticket_logits_ith(uint64_t ticket, int32_t i) {
     if (tk.fallback) {
         // outputs went to the main buffer (already synchronized by ticket_wait)
         return get_logits_ith(i);
+    }
+
+    if (tk.topk > 0) {
+        return nullptr;
     }
 
     const int32_t row = i < 0 ? tk.n_outputs + i :

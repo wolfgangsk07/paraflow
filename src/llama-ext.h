@@ -25,6 +25,10 @@ LLAMA_API bool llama_decode_ticket_retain(llama_context * ctx, uint64_t ticket);
 LLAMA_API bool llama_decode_ticket_release(llama_context * ctx, uint64_t ticket);
 LLAMA_API int32_t llama_decode_ticket_retained_count(const llama_context * ctx);
 
+// Configure per-sequence GPU direct top-k limit (0 = disabled/full logits, 1 = pure greedy argmax, <= 128 = top-k)
+// for pipelined decode ticket slabs. Preserves graph reuse and probabilistic MTP rejection sampling.
+LLAMA_API void llama_set_seq_direct_topk(llama_context * ctx, llama_seq_id seq_id, int32_t k);
+
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         struct llama_context * ctx,
