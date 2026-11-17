@@ -561,11 +561,18 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             const size_t cached_bytes = pool_size;
             GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: alloc of %.2f MiB failed, flushing %.2f MiB of cached buffers and retrying\n",
                            device, look_ahead_size/1024.0/1024.0, cached_bytes/1024.0/1024.0);
-            CUDA_CHECK(cudaDeviceSynchronize());
-            clear_pool();
-            err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
-            if (err == cudaSuccess) {
-                GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: retry succeeded\n", device);
+            cudaError_t sync_err = cudaDeviceSynchronize();
+            if (sync_err == cudaSuccess) {
+                clear_pool();
+                err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
+                if (err == cudaSuccess) {
+                    GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: retry succeeded\n", device);
+                }
+            } else if (sync_err == cudaErrorStreamCaptureUnsupported) {
+                (void)cudaGetLastError();
+                err = cudaErrorMemoryAllocation;
+            } else {
+                CUDA_CHECK(sync_err);
             }
         }
         if (err == cudaErrorMemoryAllocation) {
@@ -3782,20 +3789,39 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    // fold the src data pointers of the leading nodes into the key: with multi-GPU
-    // pipeline parallelism the scheduler rotates between input-copy sets, and each
-    // set must map to its own cached graph instance or the node properties would
-    // change on every call and the graph would never leave warmup
-    // separate by batch size as well, so alternating prompt/generation batches
-    // do not evict each other's warmed-up instances
-    uintptr_t key = (uintptr_t) cgraph->nodes[0] + (uintptr_t) cgraph->nodes[0]->ne[1];
-    for (int i = 0; i < cgraph->n_nodes && i < 4; ++i) {
+    // fold the src data pointers, ops, dtypes, and leading/trailing tensor shapes into the key:
+    // with multi-GPU pipeline parallelism the scheduler rotates between input-copy sets, and distinct
+    // ubatch shapes or source dtypes (e.g. F16 vs BF16 with identical byte strides) must never collide.
+    auto fold_node = [](uintptr_t & key, const ggml_tensor * n) {
+        key = (key ^ (uintptr_t) n->op)    * 0x9E3779B97F4A7C15ull;
+        key = (key ^ (uintptr_t) n->type)  * 0x9E3779B97F4A7C15ull;
+        key = (key ^ (uintptr_t) n->data)  * 0x9E3779B97F4A7C15ull;
+        key = (key ^ (uintptr_t) n->ne[0]) * 0x9E3779B97F4A7C15ull;
+        key = (key ^ (uintptr_t) n->ne[1]) * 0x9E3779B97F4A7C15ull;
+        key = (key ^ (uintptr_t) n->ne[2]) * 0x9E3779B97F4A7C15ull;
+        key = (key ^ (uintptr_t) n->ne[3]) * 0x9E3779B97F4A7C15ull;
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
-            const ggml_tensor * s = cgraph->nodes[i]->src[j];
+            const ggml_tensor * s = n->src[j];
             if (s != nullptr) {
-                key = key * 0x9E3779B97F4A7C15ull + (uintptr_t) s->data;
+                key = (key ^ (uintptr_t) s->op)    * 0x9E3779B97F4A7C15ull;
+                key = (key ^ (uintptr_t) s->type)  * 0x9E3779B97F4A7C15ull;
+                key = (key ^ (uintptr_t) s->data)  * 0x9E3779B97F4A7C15ull;
+                key = (key ^ (uintptr_t) s->ne[0]) * 0x9E3779B97F4A7C15ull;
+                key = (key ^ (uintptr_t) s->ne[1]) * 0x9E3779B97F4A7C15ull;
+                key = (key ^ (uintptr_t) s->ne[2]) * 0x9E3779B97F4A7C15ull;
+                key = (key ^ (uintptr_t) s->ne[3]) * 0x9E3779B97F4A7C15ull;
             }
         }
+    };
+    uintptr_t key = (uintptr_t) cgraph->nodes[0];
+    key ^= (uintptr_t) cgraph->n_nodes * 0x517CC1B727220A95ull;
+    const int head_end = std::min(cgraph->n_nodes, 8);
+    for (int i = 0; i < head_end; ++i) {
+        fold_node(key, cgraph->nodes[i]);
+    }
+    const int tail_start = std::max(head_end, cgraph->n_nodes - 4);
+    for (int i = tail_start; i < cgraph->n_nodes; ++i) {
+        fold_node(key, cgraph->nodes[i]);
     }
     return (const void *) key;
 }
@@ -3828,10 +3854,16 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         memcpy(&prop.node, cgraph->nodes[i], sizeof(ggml_tensor));
 
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
-            if (cgraph->nodes[i]->src[j]) {
-                prop.node_src_data_ptrs[j] = cgraph->nodes[i]->src[j]->data;
-                memcpy(prop.node_src_ne[j], cgraph->nodes[i]->src[j]->ne, sizeof(prop.node_src_ne[j]));
-                memcpy(prop.node_src_nb[j], cgraph->nodes[i]->src[j]->nb, sizeof(prop.node_src_nb[j]));
+            const ggml_tensor * s = cgraph->nodes[i]->src[j];
+            if (s) {
+                prop.node_src_data_ptrs[j] = s->data;
+                memcpy(prop.node_src_ne[j], s->ne, sizeof(prop.node_src_ne[j]));
+                memcpy(prop.node_src_nb[j], s->nb, sizeof(prop.node_src_nb[j]));
+                // Mix src->type and src->op into the snapshot's src[j] slot (used solely for memcmp)
+                // so same-sized dtypes (e.g. F16 vs BF16) at reused heap/device addresses trigger recapture.
+                const uintptr_t tag = ((uintptr_t) s->type * 0x9E3779B97F4A7C15ull) ^
+                                      ((uintptr_t) s->op   * 0xBF58476D1CE4E5B9ull);
+                prop.node.src[j] = (ggml_tensor *) (((uintptr_t) s) ^ tag);
             }
         }
 
@@ -5963,6 +5995,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             cuda_ctx->cuda_graphs.erase(graph_key);
         }
 #endif // USE_CUDA_GRAPH
+        // Synchronize any kernels already launched on this context's streams before returning
+        // GGML_STATUS_ALLOC_FAILED so caller recovery (seq_rm / state_read) never races in-flight writes.
+        ggml_cuda_set_device(cuda_ctx->device);
+        for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+            if (cuda_ctx->streams[cuda_ctx->device][s] != nullptr) {
+                (void) cudaStreamSynchronize(cuda_ctx->streams[cuda_ctx->device][s]);
+            }
+        }
         (void) cudaGetLastError();
         GGML_LOG_ERROR("%s: %s; graph compute failed with GGML_STATUS_ALLOC_FAILED\n", __func__, e.what());
         return GGML_STATUS_ALLOC_FAILED;

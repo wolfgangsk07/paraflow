@@ -517,6 +517,10 @@ bool socket_t::impl::rdma_recv(void * data, size_t size) {
 
         int slot = (int)wc.wr_id;
         size_t got = wc.byte_len;
+        if (got > rem) {
+            LOG_ERROR("rdma_recv overflow: got=%zu > rem=%zu\n", got, rem);
+            return false;
+        }
         memcpy(dst, c->rx_slot(slot), got);
 
         if (!c->post_rx(slot)) return false;
@@ -542,13 +546,21 @@ bool socket_t::impl::send_data(const void * data, size_t size) {
         return rdma_send(data, size);
     }
 #endif
+#ifdef MSG_NOSIGNAL
+    const int send_flags = MSG_NOSIGNAL;
+#else
+    const int send_flags = 0;
+#endif
     size_t bytes_sent = 0;
     while (bytes_sent < size) {
         size_t size_to_send = std::min(size - bytes_sent, MAX_CHUNK_SIZE);
-        ssize_t n = send(fd, (const char *)data + bytes_sent, size_to_send, 0);
+        ssize_t n = send(fd, (const char *)data + bytes_sent, size_to_send, send_flags);
         if (n < 0) {
-            LOG_ERROR("send failed (bytes_sent=%zu, size_to_send=%zu)\n",
-                           bytes_sent, size_to_send);
+            if (errno == EINTR) {
+                continue;
+            }
+            LOG_ERROR("send failed (bytes_sent=%zu, size_to_send=%zu, errno=%d)\n",
+                           bytes_sent, size_to_send, errno);
             return false;
         }
         bytes_sent += (size_t)n;
@@ -572,8 +584,11 @@ bool socket_t::impl::recv_data(void * data, size_t size) {
         size_t size_to_recv = std::min(size - bytes_recv, MAX_CHUNK_SIZE);
         ssize_t n = recv(fd, (char *)data + bytes_recv, size_to_recv, 0);
         if (n < 0) {
-            LOG_ERROR("recv failed (bytes_recv=%zu, size_to_recv=%zu)\n",
-                           bytes_recv, size_to_recv);
+            if (errno == EINTR) {
+                continue;
+            }
+            LOG_ERROR("recv failed (bytes_recv=%zu, size_to_recv=%zu, errno=%d)\n",
+                           bytes_recv, size_to_recv, errno);
             return false;
         }
         if (n == 0) {

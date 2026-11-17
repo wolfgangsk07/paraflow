@@ -892,6 +892,27 @@ static bool ggml_gallocr_reserve_n_impl(
         #undef V56_ADD
     }
 
+    // Snapshot previous plan metadata so an OOM during buffer reallocation can roll back cleanly
+    // instead of ratcheting floor_sizes to the failed OOM size or leaving dangling aliased buffers.
+    struct node_alloc * prev_node_allocs = NULL;
+    int prev_n_nodes = galloc->n_nodes;
+    struct leaf_alloc * prev_leaf_allocs = NULL;
+    int prev_n_leafs = galloc->n_leafs;
+    if (!no_alloc) {
+        if (galloc->node_allocs && prev_n_nodes > 0) {
+            prev_node_allocs = malloc((size_t) prev_n_nodes * sizeof(struct node_alloc));
+            if (prev_node_allocs) {
+                memcpy(prev_node_allocs, galloc->node_allocs, (size_t) prev_n_nodes * sizeof(struct node_alloc));
+            }
+        }
+        if (galloc->leaf_allocs && prev_n_leafs > 0) {
+            prev_leaf_allocs = malloc((size_t) prev_n_leafs * sizeof(galloc->leaf_allocs[0]));
+            if (prev_leaf_allocs) {
+                memcpy(prev_leaf_allocs, galloc->leaf_allocs, (size_t) prev_n_leafs * sizeof(galloc->leaf_allocs[0]));
+            }
+        }
+    }
+
     // allocate in hash table
     ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
 
@@ -952,11 +973,16 @@ static bool ggml_gallocr_reserve_n_impl(
     // reallocate buffers if needed
     for (int i = 0; i < galloc->n_buffers; i++) {
         // if the buffer type is used multiple times, we reuse the same buffer
+        bool is_alias = false;
         for (int j = 0; j < i; j++) {
             if (galloc->buf_tallocs[j] == galloc->buf_tallocs[i]) {
                 galloc->buffers[i] = galloc->buffers[j];
+                is_alias = true;
                 break;
             }
+        }
+        if (is_alias) {
+            continue;
         }
 
         // even if there are no tensors allocated in this buffer, we still need to allocate it to initialize views
@@ -980,19 +1006,40 @@ static bool ggml_gallocr_reserve_n_impl(
                 }
             }
 #endif
-            ggml_vbuffer_free(galloc->buffers[i]);
+            struct vbuffer * old_buf = galloc->buffers[i];
+            if (old_buf != NULL) {
+                for (int k = 0; k < galloc->n_buffers; k++) {
+                    if (galloc->buffers[k] == old_buf) {
+                        galloc->buffers[k] = NULL;
+                    }
+                }
+                ggml_vbuffer_free(old_buf);
+            }
             if (no_alloc) {
                 galloc->buffers[i] = NULL;
             } else {
                 galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
                 if (galloc->buffers[i] == NULL) {
                     GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
+                    free(galloc->node_allocs);
+                    galloc->node_allocs = prev_node_allocs;
+                    galloc->n_nodes = prev_node_allocs ? prev_n_nodes : 0;
+                    free(galloc->leaf_allocs);
+                    galloc->leaf_allocs = prev_leaf_allocs;
+                    galloc->n_leafs = prev_leaf_allocs ? prev_n_leafs : 0;
                     return false;
+                }
+                for (int k = i + 1; k < galloc->n_buffers; k++) {
+                    if (galloc->buf_tallocs[k] == galloc->buf_tallocs[i]) {
+                        galloc->buffers[k] = galloc->buffers[i];
+                    }
                 }
             }
         }
     }
 
+    free(prev_node_allocs);
+    free(prev_leaf_allocs);
     return true;
 }
 

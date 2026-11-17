@@ -671,7 +671,7 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
 template <int ncols1>
 __launch_bounds__(FATTN_KQ_STRIDE/2, 1)
 static __global__ void flash_attn_mask_to_KV_max(
-        const half2 * mask_ptr, int * KV_max_ptr, const int ne30, const int64_t s31, const int64_t s33) {
+        const half2 * mask_ptr, int * KV_max_ptr, const int ne30, const int ne31_rows, const int ne33_seqs, const int64_t s31, const int64_t s33) {
     const half2 * GGML_CUDA_RESTRICT mask   = mask_ptr;
     int         * GGML_CUDA_RESTRICT KV_max = KV_max_ptr;
 
@@ -680,7 +680,7 @@ static __global__ void flash_attn_mask_to_KV_max(
     const int sequence = blockIdx.y;
     const int jt       = blockIdx.x;
 
-    mask += sequence*s33 + jt*ncols1*s31;
+    mask += (sequence % ne33_seqs)*s33 + jt*ncols1*s31;
 
     __shared__ int buf_iw[WARP_SIZE];
     if (tid < WARP_SIZE) {
@@ -695,8 +695,10 @@ static __global__ void flash_attn_mask_to_KV_max(
 
 #pragma unroll
         for (int j = 0; j < ncols1; ++j) {
-            const float2 tmp = __half22float2(mask[j*s31 + KV_max_sj/2 + tid]);
-            all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
+            if (jt*ncols1 + j < ne31_rows) {
+                const float2 tmp = __half22float2(mask[j*s31 + KV_max_sj/2 + tid]);
+                all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
+            }
         }
 
         all_inf = warp_reduce_all(all_inf);
@@ -1128,7 +1130,7 @@ static void launch_fattn_impl(
         KV_max.alloc(ne_KV_max);
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
         ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
-            (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
+            (const half2 *) mask->data, KV_max.ptr, iter_k, (int) mask->ne[1], (int) mask->ne[3], s31, s33);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -1357,10 +1359,10 @@ void launch_fattn(
         ggml_tensor dst_s = *dst;
         ggml_tensor mask_s;
 
-        Q_s.data   = (char *) Q->data   + s*Q->nb[3];   Q_s.ne[3]   = 1;
-        K_s.data   = (char *) K->data   + s*K->nb[3];   K_s.ne[3]   = 1;
-        V_s.data   = (char *) V->data   + s*V->nb[3];   V_s.ne[3]   = 1;
-        dst_s.data = (char *) dst->data + s*dst->nb[3]; dst_s.ne[3] = 1;
+        Q_s.data   = (char *) Q->data   + s*Q->nb[3];               Q_s.ne[3]   = 1;
+        K_s.data   = (char *) K->data   + (s % K->ne[3])*K->nb[3];  K_s.ne[3]   = 1;
+        V_s.data   = (char *) V->data   + (s % V->ne[3])*V->nb[3];  V_s.ne[3]   = 1;
+        dst_s.data = (char *) dst->data + s*dst->nb[3];             dst_s.ne[3] = 1;
 
         // keep the V-is-a-view-of-K relation visible to the launcher
         K_s.view_src = nullptr; K_s.view_offs = 0;

@@ -1897,7 +1897,7 @@ static bool ggml_backend_sched_remote_copy_async(ggml_backend_sched_t sched, int
         return false;
     }
     const size_t size = ggml_nbytes(input);
-    if (size == 0 || size != ggml_nbytes(input_cpy)) {
+    if (size == 0 || size != ggml_nbytes(input_cpy) || !ggml_is_contiguous(input) || !ggml_is_contiguous(input_cpy)) {
         return false;
     }
     if (!sched->remote_ring) {
@@ -2084,6 +2084,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
+                for (int k = 0; k <= split_id; ++k) {
+                    if (splits[k].backend_id >= 0) {
+                        ggml_backend_synchronize(sched->backends[splits[k].backend_id]);
+                    }
+                }
                 return ec;
             }
         } else {
@@ -2106,6 +2111,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
+                    for (int k = 0; k <= split_id; ++k) {
+                        if (splits[k].backend_id >= 0) {
+                            ggml_backend_synchronize(sched->backends[splits[k].backend_id]);
+                        }
+                    }
                     return ec;
                 }
 
