@@ -72,11 +72,22 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
 }
 
 int32_t llama_memory_hybrid_iswa::seq_swap_stream(llama_seq_id seq_id_a, llama_seq_id seq_id_b) {
+    const bool a_had_tail = seq_id_a >= 0 && (size_t) seq_id_a < mem_recr->cells.size() && mem_recr->cells[seq_id_a].tail >= 0;
     const int32_t res = mem_attn->seq_swap_stream(seq_id_a, seq_id_b);
     if (res == 1 && seq_id_a != seq_id_b) {
         // keep each recurrent state in the cell of its stream (see llama_memory_recurrent::set_cell_hint)
-        mem_recr->seq_move_cell(seq_id_a, (uint32_t) mem_attn->seq_stream(seq_id_a), seq_id_b);
-        mem_recr->seq_move_cell(seq_id_b, (uint32_t) mem_attn->seq_stream(seq_id_b), seq_id_a);
+        const bool moved_a = mem_recr->seq_move_cell(seq_id_a, (uint32_t) mem_attn->seq_stream(seq_id_a), seq_id_b);
+        const bool moved_b = moved_a && mem_recr->seq_move_cell(seq_id_b, (uint32_t) mem_attn->seq_stream(seq_id_b), seq_id_a);
+        if (!moved_a || !moved_b) {
+            if ((!moved_a || !a_had_tail) && mem_attn->seq_swap_stream(seq_id_a, seq_id_b) == 1) {
+                return 0;
+            }
+            for (const auto seq : { seq_id_a, seq_id_b }) {
+                mem_attn->seq_rm(seq, -1, -1);
+                mem_recr->seq_rm(seq, -1, -1);
+            }
+            return -1;
+        }
     }
     return res;
 }

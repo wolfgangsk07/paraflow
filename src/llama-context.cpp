@@ -676,6 +676,17 @@ llama_context::~llama_context() {
             }
         }
     }
+    if (ckpt_state) {
+        for (auto & kv : ckpt_state->async_events) {
+            for (auto * ev : kv.second) {
+                if (ev) {
+                    ggml_backend_event_synchronize(ev);
+                    ggml_backend_event_free(ev);
+                }
+            }
+        }
+        ckpt_state->async_events.clear();
+    }
 
     for (auto & f : pf_fences) {
         for (auto & [ev, b] : f.events) {
@@ -1840,6 +1851,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+        res->reset();
         ret = status;
         return nullptr;
     }
@@ -2096,9 +2108,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     ckpt_state.soft = true;
     ckpt_state.decode_open = true;
     struct ckpt_decode_close {
+        llama_context & self;
         llama_ckpt_capture_state & st;
-        ~ckpt_decode_close() { st.decode_open = false; }
-    } ckpt_close_guard{ckpt_state};
+        ~ckpt_decode_close() {
+            st.decode_open      = false;
+            self.sched_cur       = nullptr;
+            self.gf_res_cur      = nullptr;
+            self.pf_cur_backends = nullptr;
+            self.pf_cur          = false;
+        }
+    } ckpt_close_guard{*this, ckpt_state};
     selected_ticket = 0;
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -2401,6 +2420,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
         if (!res) {
+            // Synchronize any earlier ubatches already queued before mutating memory or reverting ticket state
+            synchronize();
+            if (tk) {
+                tk->id             = 0;
+                tk->event_recorded = false;
+                tk->n_outputs      = 0;
+                if (ticket_seq > 0) { --ticket_seq; }
+            }
+
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
             llama_pos pos_min[LLAMA_MAX_SEQ];
             for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
@@ -4945,6 +4973,9 @@ bool llama_decode_ticket_ready(const llama_context * ctx, uint64_t ticket) {
 }
 
 float * llama_get_logits(llama_context * ctx) {
+    if (ctx->decode_ticket_selected()) {
+        return ctx->get_logits_ith(-1);
+    }
     ctx->synchronize();
 
     return ctx->get_logits();

@@ -82,6 +82,7 @@ let Hist=new Map(),BMS=2000,hStart=0,hCur=0,tStart=null;
 document.querySelectorAll('#win button').forEach(b=>b.onclick=()=>{win=+b.dataset.s;document.querySelectorAll('#win button').forEach(x=>x.classList.toggle('on',x===b));draw()});
 const f0=x=>x==null||!isFinite(x)?'–':Math.round(x).toLocaleString();
 const f1=x=>x==null||!isFinite(x)?'–':x.toFixed(1);
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const pct=x=>x==null||!isFinite(x)?'–':(x*100).toFixed(1)+'%';
 const gib=b=>(b/1073741824).toFixed(2);
 const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
@@ -112,7 +113,7 @@ function base(){ // oldest snapshot inside the window
   return H.length?H[0]:null;
 }
 function render(d){
-  if(cfg){const c=cfg;$('cfg').innerHTML=[[tr('模型','Model'),c.model],['C',c.n_parallel],[tr('上下文池','Context pool'),f0(c.n_ctx)],[tr('单路','Per slot'),f0(c.n_ctx_slot)],['ub',c.n_ubatch],['b',c.n_batch],['lanes',c.pipe_lanes],['prefill lanes',c.prefill_lanes],['chunk',c.prefill_chunk],['KV',c.cache_type_k+'/'+c.cache_type_v],['MTP',c.mtp?('n_max '+c.draft_n_max):tr('关','off')],[tr('系统缓存','System cache'),c.system_cache_mib+' MiB'],['VIP',c.vip?tr('开','on'):tr('关','off')],[tr('卡','GPUs'),(c.devices||[]).length],[tr('构建','Build'),c.build]].map(([k,v])=>`<span class="chip">${k} <b>${v}</b></span>`).join('')}
+  if(cfg){const c=cfg;$('cfg').innerHTML=[[tr('模型','Model'),esc(c.model)],['C',c.n_parallel],[tr('上下文池','Context pool'),f0(c.n_ctx)],[tr('单路','Per slot'),f0(c.n_ctx_slot)],['ub',c.n_ubatch],['b',c.n_batch],['lanes',c.pipe_lanes],['prefill lanes',c.prefill_lanes],['chunk',c.prefill_chunk],['KV',esc(c.cache_type_k+'/'+c.cache_type_v)],['MTP',c.mtp?('n_max '+c.draft_n_max):tr('关','off')],[tr('系统缓存','System cache'),c.system_cache_mib+' MiB'],['VIP',c.vip?tr('开','on'):tr('关','off')],[tr('卡','GPUs'),(c.devices||[]).length],[tr('构建','Build'),esc(c.build)]].map(([k,v])=>`<span class="chip">${k} <b>${v}</b></span>`).join('')}
   // instantaneous rates from the last ~5 samples
   let dt=0,dp=0,dd=0;for(let k=hCur-1;k>=hCur-3&&k>=hStart;k--){const v=Hist.get(k);if(v===undefined)break;dt+=BMS/1e3;if(v){dp+=v[0];dd+=v[1]}}
   const b=base(),span=b?(d.t_us-b.t_us)/1e6:0,D=k=>b?d[k]-b[k]:0;

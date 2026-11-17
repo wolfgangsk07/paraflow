@@ -848,9 +848,9 @@ bool llama_memory_recurrent::seq_move_cell(llama_seq_id seq_id, uint32_t dst, ll
         v.view_offs = t->view_offs + size_t{row} * t->nb[1];
         return v;
     };
-    if (compact_s) {
-        // A settled stream exchange must keep recurrent rows physically aligned.
-        // The compact basis and journal are live data, never scratch space.
+    if (compact_s || n_rs_seq > 0) {
+        // A settled stream exchange must keep recurrent rows physically aligned across all planes
+        // (live state + rollback snapshots / journal). Never overwrite a rollback plane as scratch.
         const bool have_a = a.src >= 0;
         const bool have_b = other >= 0 && b.src >= 0;
         std::vector<ggml_tensor *> tensors;
@@ -858,7 +858,7 @@ bool llama_memory_recurrent::seq_move_cell(llama_seq_id seq_id, uint32_t dst, ll
         for (uint32_t il = 0; il < r_l.size(); ++il) {
             for (ggml_tensor * tensor : { r_l[il], s_l[il],
                     il < p_l.size() ? p_l[il] : nullptr,
-                    il < j_l.size() ? j_l[il] : nullptr }) {
+                    (compact_s && il < j_l.size()) ? j_l[il] : nullptr }) {
                 if (!tensor) { continue; }
                 if (!ggml_is_contiguous(tensor) || tensor->ne[2] != 1 || tensor->ne[3] != 1 ||
                         tensor->ne[1] < size || tensor->ne[1] % size != 0) { return false; }
@@ -898,25 +898,6 @@ bool llama_memory_recurrent::seq_move_cell(llama_seq_id seq_id, uint32_t dst, ll
                 }
             }
         }
-    } else if (n_rs_seq > 0) {
-        // Different live planes cannot overlap. Equal planes use one stale snapshot row as scratch.
-        const uint32_t scratch_plane = pa == 0 ? 1 : 0;
-        for (uint32_t il = 0; il < r_l.size(); ++il) {
-            for (ggml_tensor * t : { r_l[il], s_l[il], il < p_l.size() ? p_l[il] : nullptr }) {
-                if (t == nullptr) { continue; }
-                ggml_tensor from_a = row_view(t, pa*size + src), to_a = row_view(t, pa*size + dst);
-                ggml_tensor from_b = row_view(t, pb*size + dst), to_b = row_view(t, pb*size + src);
-                if (pa != pb) {
-                    if (a.src >= 0) { ggml_backend_tensor_copy(&from_a, &to_a); }
-                    if (other >= 0 && b.src >= 0) { ggml_backend_tensor_copy(&from_b, &to_b); }
-                } else {
-                    ggml_tensor scratch = row_view(t, scratch_plane*size + src);
-                    if (a.src >= 0) { ggml_backend_tensor_copy(&from_a, &scratch); }
-                    if (other >= 0 && b.src >= 0) { ggml_backend_tensor_copy(&from_b, &to_b); }
-                    if (a.src >= 0) { ggml_backend_tensor_copy(&scratch, &to_a); }
-                }
-            }
-        }
     } else {
         // Without snapshot planes, preserve both rows through host staging.
         struct staged_t { ggml_tensor * t; size_t offs; std::vector<uint8_t> data; };
@@ -952,7 +933,7 @@ bool llama_memory_recurrent::seq_move_cell(llama_seq_id seq_id, uint32_t dst, ll
     std::swap(a.seq_id, b.seq_id);
     b.src = a_state ? (int32_t) dst : -1;
     a.src = b_state ? src : -1;
-    if (compact_s) { a.src0 = a.src; b.src0 = b.src; }
+    if (compact_s || n_rs_seq > 0) { a.src0 = a.src; b.src0 = b.src; }
     cells[seq_id].tail = dst;
     if (other >= 0) {
         cells[other].tail = src;

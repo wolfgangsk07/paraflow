@@ -1736,6 +1736,8 @@ private:
         }
         if (!victim) { return false; }
         pipeline_drain();
+        if (victim->ckpt_barrier) { victim->ckpt_barrier(victim->id); }
+        else if (!ckpt_async_items.empty()) { ckpt_async_poll(victim->id, true); }
         // Finish every read of this sequence before capturing or unmapping its pages.
         llama_synchronize(ctx_tgt);
         if (victim->ctx_dft) { llama_synchronize(victim->ctx_dft); }
@@ -1763,6 +1765,8 @@ private:
         fresh.n_ctx = victim->n_ctx;
         fresh.mctx = victim->mctx;
         fresh.prompt.tokens.has_mtmd = victim->prompt.tokens.has_mtmd;
+        fresh.ckpt_barrier = victim->ckpt_barrier;
+        fresh.ckpt_recycle = victim->ckpt_recycle;
         fresh.callback_on_release = victim->callback_on_release;
         fresh.callback_on_reset = victim->callback_on_reset;
         fresh.borrowed_generation = saved.generation;
@@ -2014,8 +2018,10 @@ private:
     static constexpr int checkpoint_async_max_bufs = 6;
     struct ckpt_async_buf { ggml_backend_buffer_t buf = nullptr; size_t size = 0; bool busy = false; };
     struct ckpt_async_item { int slot_id; common_prompt_checkpoint * ckpt; int buf; int64_t handle; size_t size; };
+    struct ckpt_dft_spec_fixup { int slot_id; common_prompt_checkpoint * ckpt; llama_pos pos_max; };
     std::vector<ckpt_async_buf> ckpt_async_bufs;
     std::vector<ckpt_async_item> ckpt_async_items;
+    std::vector<ckpt_dft_spec_fixup> ckpt_dft_fixups;
     uint64_t ckpt_async_enqueued = 0, ckpt_async_immediate = 0, ckpt_async_verified = 0, ckpt_async_mismatches = 0;
     uint64_t ckpt_async_barriers = 0, ckpt_async_settled = 0, ckpt_async_pool_waits = 0;
     static constexpr size_t checkpoint_recycle_max = 4; // recycled host checkpoint buffers
@@ -2053,6 +2059,8 @@ private:
         }
     }
     void ckpt_async_settle(const common_prompt_checkpoint * p) {
+        ckpt_dft_fixups.erase(std::remove_if(ckpt_dft_fixups.begin(), ckpt_dft_fixups.end(),
+                [&](const ckpt_dft_spec_fixup & fx) { return fx.ckpt == p; }), ckpt_dft_fixups.end());
         for (size_t i = 0; i < ckpt_async_items.size(); ++i) {
             if (ckpt_async_items[i].ckpt != p) { continue; }
             GGML_ASSERT(llama_state_seq_async_wait(ctx_tgt, ckpt_async_items[i].handle, true) == 1);
@@ -2268,6 +2276,26 @@ private:
             auto & h = dft_hbuf[idx];
             h.resize((size_t) n * dft_n_embd);
             std::memcpy(h.data(), base, h.size() * sizeof(float));
+            if (!ckpt_dft_fixups.empty() && dft_n_embd > 0) {
+                for (int k = 0; k < n; ++k) {
+                    const auto & tk_row = view.tokens[k];
+                    const llama_pos tk_pos_max = view.n_pos <= 1
+                        ? tk_row.pos[0]
+                        : std::max({tk_row.pos[0], tk_row.pos[1], tk_row.pos[2], tk_row.pos[3]});
+                    for (auto fx = ckpt_dft_fixups.begin(); fx != ckpt_dft_fixups.end(); ) {
+                        if (fx->slot_id == tk_row.seq_id && fx->pos_max == tk_pos_max) {
+                            const uint32_t hdr[3] = { 0x3150544d, (uint32_t) dft_n_embd, 0u };
+                            const size_t hb = (size_t) dft_n_embd * sizeof(float);
+                            fx->ckpt->data_spec.resize(sizeof(hdr) + hb);
+                            std::memcpy(fx->ckpt->data_spec.data(), hdr, sizeof(hdr));
+                            std::memcpy(fx->ckpt->data_spec.data() + sizeof(hdr), base + (size_t) k * dft_n_embd, hb);
+                            fx = ckpt_dft_fixups.erase(fx);
+                        } else {
+                            ++fx;
+                        }
+                    }
+                }
+            }
             dft_copy_rows += n;
             dft_copy_us += ggml_time_us() - t0;
             ++dft_catchups;
@@ -4093,7 +4121,14 @@ private:
 
             slot.id      = i;
             slot.ctx_tgt = ctx_tgt;
-            slot.ckpt_barrier = [this](int sid) { if (!ckpt_async_items.empty()) { ckpt_async_poll(sid, true); } };
+            slot.ckpt_barrier = [this](int sid) {
+                dft_join(__LINE__);
+                if (!ckpt_async_items.empty()) { ckpt_async_poll(sid, true); }
+                if (sid >= 0 && (size_t) sid < slots.size()) {
+                    ckpt_dft_fixups.erase(std::remove_if(ckpt_dft_fixups.begin(), ckpt_dft_fixups.end(),
+                            [&](const ckpt_dft_spec_fixup & fx) { return fx.slot_id == sid; }), ckpt_dft_fixups.end());
+                }
+            };
             if (checkpoint_recycle_max > 0) { slot.ckpt_recycle = [this](std::vector<uint8_t> & v) { ckpt_recycle_push(v); }; }
             slot.ctx_dft = ctx_dft;
             slot.mem.init(ctx_tgt, ctx_dft);
@@ -5509,8 +5544,21 @@ private:
             cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         }
         cur.update_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        // stash the draft's speculative state with the checkpoint
+        // stash the draft's speculative state with the checkpoint; if earlier cars of this slot are still
+        // in pipeline_fifo, refresh data_spec from the exact settled NextN row in dft_submit_catchup().
         common_speculative_get_state(slot.spec, slot.id, cur.data_spec);
+        if (pipeline_on && dft_exec && dft_route && slot.can_speculate() && cur.pos_max >= 0) {
+            bool slot_in_flight = false;
+            for (const int lid : pipeline_fifo) {
+                for (const auto & tk_in : pipeline_lanes[lid].batch.tokens) {
+                    if (tk_in.id_slot == slot.id) { slot_in_flight = true; break; }
+                }
+                if (slot_in_flight) { break; }
+            }
+            if (slot_in_flight) {
+                ckpt_dft_fixups.push_back({slot.id, &cur, cur.pos_max});
+            }
+        }
         ++prompt_checkpoint_saves;
         prompt_checkpoint_bytes += cur.size();
         prompt_checkpoint_save_us += ggml_time_us() - checkpoint_begin;
@@ -5873,6 +5921,9 @@ private:
                                 if (child.slot->id == it->slot->id && child.slot->borrowed_generation == it->generation) {
                                     child.slot->borrowed_generation = parent;
                                 }
+                            }
+                            for (const auto & ck : it->slot->prompt.checkpoints) {
+                                ckpt_async_settle(&ck);
                             }
                             it->slot->callback_on_reset(*it->slot);
                             suspended_requests.erase(it);

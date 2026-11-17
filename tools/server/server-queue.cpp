@@ -464,6 +464,11 @@ void server_response::remove_waiting_task_ids(const std::unordered_set<server_ta
         RES_DBG("remove task %" PRId64 " from waiting list. current waiting = %d (before remove)\n", id_task, (int) waiting_task_ids.size());
         waiting_task_ids.erase(id_task);
     }
+    queue_results.erase(
+        std::remove_if(queue_results.begin(), queue_results.end(), [&id_tasks](const server_task_result_ptr & res) {
+            return id_tasks.count(res->id) > 0;
+        }),
+        queue_results.end());
 }
 
 static server_task_result_ptr server_response_shutdown_error(const std::unordered_set<server_task_id> & id_tasks) {

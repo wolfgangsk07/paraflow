@@ -118,12 +118,13 @@ int32_t llama_memory_hybrid::seq_swap_stream(llama_seq_id seq_id_a, llama_seq_id
     }
     const int32_t res = mem_attn->seq_swap_stream(seq_id_a, seq_id_b);
     if (res == 1 && seq_id_a != seq_id_b) {
+        const bool a_tail = a_had_tail || (seq_id_a >= 0 && (size_t) seq_id_a < mem_recr->cells.size() && mem_recr->cells[seq_id_a].tail >= 0);
         const bool moved_a = mem_recr->seq_move_cell(seq_id_a, (uint32_t) mem_attn->seq_stream(seq_id_a), seq_id_b);
-        const bool moved_b = (!compact || moved_a) && mem_recr->seq_move_cell(seq_id_b, (uint32_t) mem_attn->seq_stream(seq_id_b), seq_id_a);
-        if (compact && (!moved_a || !moved_b)) {
+        const bool moved_b = moved_a && mem_recr->seq_move_cell(seq_id_b, (uint32_t) mem_attn->seq_stream(seq_id_b), seq_id_a);
+        if (!moved_a || !moved_b) {
             // A refused first move made no writes. With no A tail the first move
             // was a no-op, so a refused B move can also undo attention safely.
-            if ((!moved_a || !a_had_tail) && mem_attn->seq_swap_stream(seq_id_a, seq_id_b) == 1) {
+            if ((!moved_a || !a_tail) && mem_attn->seq_swap_stream(seq_id_a, seq_id_b) == 1) {
                 return 0;
             }
             // Preserve the API's failure contract if atomic restoration is impossible.
