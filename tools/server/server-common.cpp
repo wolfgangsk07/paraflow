@@ -535,6 +535,31 @@ const mtmd::input_chunk_ptr & server_tokens::find_chunk(size_t idx) const {
     throw std::runtime_error("Chunk not found");
 }
 
+const mtmd_input_chunk * server_tokens::find_chunk_at(size_t idx) const {
+    auto it = map_idx_to_media.find(idx);
+    return it != map_idx_to_media.end() ? it->second.get() : nullptr;
+}
+
+std::pair<const mtmd_input_chunk *, size_t> server_tokens::find_chunk_containing(size_t idx) const {
+    if (map_idx_to_media.empty() || idx >= tokens.size() || tokens[idx] != LLAMA_TOKEN_NULL) {
+        return { nullptr, 0 };
+    }
+    auto it = map_idx_to_media.upper_bound(idx);
+    if (it == map_idx_to_media.begin()) {
+        return { nullptr, 0 };
+    }
+    --it;
+    const mtmd_input_chunk * chunk = it->second.get();
+    if (!chunk) {
+        return { nullptr, 0 };
+    }
+    const size_t n_tok = mtmd_input_chunk_get_n_tokens(chunk);
+    if (idx < it->first + n_tok) {
+        return { chunk, it->first };
+    }
+    return { nullptr, 0 };
+}
+
 std::pair<const mtmd::input_chunk_ptr *, size_t> server_tokens::find_next_media_chunk(size_t idx) const {
     auto it = map_idx_to_media.upper_bound(idx);
     if (it != map_idx_to_media.end()) {

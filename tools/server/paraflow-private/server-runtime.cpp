@@ -1313,8 +1313,10 @@ public:
         size_t queued = 0;
         const auto & tokens = slot.task->tokens;
         if (from < tokens.size() && tokens[from] == LLAMA_TOKEN_NULL) {
-            mtmd_pool->submit(slot.id, slot.task->id, from, tokens.find_chunk(from).get());
-            ++queued;
+            if (const auto * chunk = tokens.find_chunk_at(from)) {
+                mtmd_pool->submit(slot.id, slot.task->id, from, chunk);
+                ++queued;
+            }
         }
         for (auto [c, i] = tokens.find_next_media_chunk(from); c && queued < max_ahead; std::tie(c, i) = tokens.find_next_media_chunk(i)) {
             mtmd_pool->submit(slot.id, slot.task->id, i, c->get());
@@ -1792,9 +1794,35 @@ private:
         return used;
     }
 
+    int effective_prompt_cursor(const server_slot & slot) const {
+        if (!slot.task) { return 0; }
+        if (slot.state == SLOT_STATE_STARTED) {
+            if (!slot.can_split() || !slot.task->params.cache_prompt || slot.task->is_stateless()) {
+                return 0;
+            }
+            int common = (int) slot.prompt.tokens.get_common_prefix(slot.task->tokens);
+            if (slot.task->n_tokens_shared > 0) {
+                common = std::min(common, slot.task->n_tokens_shared);
+            }
+            const int32_t n_dec = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
+            if (n_dec >= 0) {
+                common = std::min(common, n_dec);
+            }
+            if (slot.alora_invocation_start > 0) {
+                common = std::min(common, slot.alora_invocation_start - 1);
+            }
+            if (common >= slot.task->n_tokens() && common > 0) {
+                const auto [chunk, start_idx] = slot.task->tokens.find_chunk_containing((size_t) (common - 1));
+                common = chunk ? (int) start_idx : (common - 1);
+            }
+            return std::max(0, common);
+        }
+        return slot.prompt.n_tokens();
+    }
+
     int canonical_prefill_tokens(const server_slot & slot) const {
         if (!pipeline_on || !slot.task || !slot.task->need_sampling() || slot.task->tokens.has_media()) { return 0; }
-        const int remaining = slot.task->n_tokens() - slot.prompt.n_tokens();
+        const int remaining = slot.task->n_tokens() - effective_prompt_cursor(slot);
         if (remaining <= 0) { return 0; }
         // Leave room for generation rows so peers cannot clip the prompt quantum.
         const int room = std::max(1, int(llama_n_batch(ctx_tgt)) - params_base.n_outputs_max);
@@ -1807,13 +1835,16 @@ private:
         const int cq = canonical_prefill_tokens(slot);
         if (cq > 0) { return (uint64_t) cq; }
         if (!slot.task) { return 1; }
-        const int cur_idx = slot.prompt.n_tokens();
-        if (cur_idx >= slot.task->n_tokens()) { return 1; }
+        const int cur_idx = effective_prompt_cursor(slot);
+        if (cur_idx < 0 || cur_idx >= slot.task->n_tokens()) { return 1; }
         if (slot.task->tokens.has_media() && slot.task->tokens[cur_idx] == LLAMA_TOKEN_NULL) {
-            const auto & chunk = slot.task->tokens.find_chunk(cur_idx);
+            const auto [chunk, start_idx] = slot.task->tokens.find_chunk_containing((size_t) cur_idx);
             if (chunk) {
-                return (uint64_t) std::min<size_t>((size_t) n_ctx, std::max<size_t>(1, mtmd_input_chunk_get_n_tokens(chunk.get())));
+                const size_t n_tok = mtmd_input_chunk_get_n_tokens(chunk);
+                const size_t rem_tok = (start_idx + n_tok > (size_t) cur_idx) ? (start_idx + n_tok - (size_t) cur_idx) : 1;
+                return (uint64_t) std::min<size_t>((size_t) n_ctx, std::max<size_t>(1, rem_tok));
             }
+            return 1;
         }
         int span = 0;
         while (cur_idx + span < slot.task->n_tokens() && slot.task->tokens[cur_idx + span] != LLAMA_TOKEN_NULL) {
@@ -2869,7 +2900,7 @@ private:
     bool pipeline_hold_for_checkpoint(const server_slot & slot) const {
         if (params_base.n_ctx_checkpoints <= 0 || !slot.task) { return false; }
         if (!slot.task->params.cache_prompt) { return false; }   // no checkpoint will be made
-        const int64_t remaining = int64_t(slot.task->n_tokens()) - int64_t(slot.prompt.n_tokens());
+        const int64_t remaining = int64_t(slot.task->n_tokens()) - int64_t(effective_prompt_cursor(slot));
         const int64_t n_ub = llama_n_ubatch(ctx_tgt);
         if (remaining > n_ub + 8) { return false; }   // tail checkpoints sit at 4 + n_ubatch and 4 tokens from the end
         for (const auto & lane : pipeline_lanes) {
@@ -3491,7 +3522,7 @@ private:
             if (!producer.is_processing() || producer.resident_paused || !producer.task ||
                     producer.task->params.priority < task.params.priority ||
                     (task.params.mtp && !producer.task->params.mtp) ||
-                    producer.prompt.n_tokens() > boundary || system_prefix_length(*producer.task) != boundary) { continue; }
+                    effective_prompt_cursor(producer) > boundary || system_prefix_length(*producer.task) != boundary) { continue; }
             if (producer.task->tokens.get_common_prefix(task.tokens) >= size_t(boundary)) {
                 ++system_cache_waits;
                 SRV_DBG("system cache: task %" PRId64 " waits for prefix producer %" PRId64 "\n", task.id, producer.task->id);
@@ -7520,7 +7551,12 @@ private:
                         // [TAG_PROMPT_LOGITS]
                         if (n_past == slot.task->n_tokens() && n_past > 0) {
                             SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
-                            n_past--;
+                            if (slot.prompt.tokens.has_mtmd && slot.prompt.tokens[n_past - 1] == LLAMA_TOKEN_NULL) {
+                                const auto [chunk, start_idx] = slot.prompt.tokens.find_chunk_containing((size_t) (n_past - 1));
+                                n_past = chunk ? (int) start_idx : 0;
+                            } else {
+                                n_past--;
+                            }
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
 
@@ -7637,8 +7673,15 @@ private:
                         size_t n_tokens_out = 0;
                         int32_t res = 0;
                         server_mtmd_pool::result encoded;
-                        const auto & media_chunk = input_tokens.find_chunk(cur_token_idx);
-                        const bool chunk_non_causal = mctx && media_chunk && mtmd_decode_use_non_causal(mctx, media_chunk.get());
+                        const mtmd_input_chunk * media_chunk = input_tokens.find_chunk_at(cur_token_idx);
+                        if (!media_chunk) {
+                            SLT_ERR(slot, "missing mtmd chunk at token idx = %zu\n", cur_token_idx);
+                            batch.truncate(n_tokens_prev);
+                            send_error(slot, "corrupted multimodal token alignment", ERROR_TYPE_SERVER);
+                            slot.release();
+                            return;
+                        }
+                        const bool chunk_non_causal = mctx && mtmd_decode_use_non_causal(mctx, media_chunk);
                         // only prefill-only lanes: they carry no generation rows, so the car stays pure embedding;
                         // chunks requiring non-causal attention must decode standalone so non-causal attention is applied
                         const bool in_car = mtmd_pool && mtmd_batched && !chunk_non_causal && pipeline_filter >= 0 &&
@@ -7647,7 +7690,7 @@ private:
                             mtmd_prefetch(slot, cur_token_idx);
                             // an image car holds only embedding rows: the MTP draft context cannot mix rows
                             if (in_car && (batch.size() > 0 || batch.size() +
-                                    (int32_t) mtmd_input_chunk_get_n_tokens(input_tokens.find_chunk(cur_token_idx).get()) > n_batch_media)) {
+                                    (int32_t) mtmd_input_chunk_get_n_tokens(media_chunk) > n_batch_media)) {
                                 return; // wait for an empty car with room for the whole image
                             }
                             if (!mtmd_pool->take(slot.id, slot.task->id, cur_token_idx, encoded)) {
@@ -7657,8 +7700,7 @@ private:
 
                         if (in_car) {
                             // the image rows decode with the car on the pipeline lanes, overlapping the other lanes
-                            const auto & chunk = input_tokens.find_chunk(cur_token_idx);
-                            if (encoded.res != 0 || !add_mtmd_chunk(slot, chunk.get(), encoded.embd.data(), batch)) {
+                            if (encoded.res != 0 || !add_mtmd_chunk(slot, media_chunk, encoded.embd.data(), batch)) {
                                 SLT_ERR(slot, "failed to add mtmd chunk to the car, res = %d\n", encoded.res);
                                 batch.truncate(n_tokens_prev);
                                 send_error(slot, "failed to process mtmd chunk", ERROR_TYPE_SERVER);
@@ -7666,8 +7708,8 @@ private:
                                 return;
                             }
                             SLT_INF(slot, "mtmd car: idx = %zu, n_tokens = %zu, lane = %d\n", cur_token_idx,
-                                    mtmd_input_chunk_get_n_tokens(chunk.get()), pipeline_filter);
-                            slot.prompt.tokens.push_back_placeholder(chunk.get());
+                                    mtmd_input_chunk_get_n_tokens(media_chunk), pipeline_filter);
+                            slot.prompt.tokens.push_back_placeholder(media_chunk);
                             has_mtmd = true;
                             media_in_car = true;
                             slot.mtmd_ckpt_skip = !mtmd_ckpt_after;
@@ -7680,7 +7722,7 @@ private:
                         metrics_pre_decode();
 
                         if (mtmd_pool) {
-                            res = encoded.res != 0 ? -1 : decode_mtmd_embd(slot, input_tokens.find_chunk(cur_token_idx).get(),
+                            res = encoded.res != 0 ? -1 : decode_mtmd_embd(slot, media_chunk,
                                     encoded.embd.data(), cur_token_idx, n_tokens_out);
                         } else {
                             // encode on the worker thread, so we can still handle metrics tasks
@@ -7703,9 +7745,8 @@ private:
 
                         // add the mtmd chunk to cache
                         {
-                            const auto & chunk = input_tokens.find_chunk(cur_token_idx);
                             // the chunk is already in the KV cache at this point, so we don't need to keep its data around
-                            slot.prompt.tokens.push_back_placeholder(chunk.get());
+                            slot.prompt.tokens.push_back_placeholder(media_chunk);
                         }
 
                         has_mtmd = true;

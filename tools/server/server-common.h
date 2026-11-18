@@ -202,6 +202,12 @@ public:
 
     const mtmd::input_chunk_ptr & find_chunk(size_t idx) const;
 
+    // non-throwing exact chunk-start lookup (nullptr if idx is not a media chunk start)
+    const mtmd_input_chunk * find_chunk_at(size_t idx) const;
+
+    // non-throwing lookup of the media chunk covering idx (start <= idx < start + n_tokens)
+    std::pair<const mtmd_input_chunk *, size_t> find_chunk_containing(size_t idx) const;
+
     // find next media chunk after idx
     // returns a pair of pointer to the chunk (nullptr if not found) and its start index in tokens
     std::pair<const mtmd::input_chunk_ptr *, size_t> find_next_media_chunk(size_t idx) const;
