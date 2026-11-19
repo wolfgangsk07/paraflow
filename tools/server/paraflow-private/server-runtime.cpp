@@ -1104,7 +1104,7 @@ struct paraflow_dash_susp { // a request whose KV was paged out to host RAM
 };
 struct paraflow_dash_dev {
     char     name[32];
-    uint64_t model, context, compute, total;
+    uint64_t model, context, compute, used, total;
 };
 struct paraflow_dash_snap {
     uint64_t seq = 0;
@@ -1125,7 +1125,7 @@ struct paraflow_dash_snap {
     uint64_t sc_hits = 0, sc_hit_tokens = 0, sc_misses = 0, sc_evictions = 0, sc_failures = 0, sc_bytes = 0;
     // live state
     int32_t  n_slots = 0, n_processing = 0, n_prompt = 0, n_gen = 0, n_paused = 0, n_suspended = 0, n_vip = 0, n_deferred = 0;
-    uint64_t kv_used = 0, kv_cap = 0, kv_max = 0;
+    uint64_t kv_used = 0, kv_active = 0, kv_cached = 0, kv_cap = 0, kv_max = 0;
     int32_t  n_rows = 0;
     paraflow_dash_slot rows[256];
     int32_t  n_susp = 0;
@@ -1898,6 +1898,11 @@ private:
         }
     }
 
+    bool has_capacity_suspended() const {
+        return std::any_of(suspended_requests.begin(), suspended_requests.end(),
+                [](const suspended_request & saved) { return saved.capacity_page; });
+    }
+
     void resume_paused() {
         if (queue_tasks.has_pending_vip()) { return; }
         const int budget = ordinary_budget();
@@ -1947,6 +1952,7 @@ private:
                 send_error(old, "continuation ownership verification failed", ERROR_TYPE_SERVER);
                 old.callback_on_reset(old);
                 dest.borrowed_generation = 0;
+                changed = true;
                 it = suspended_requests.erase(it);
                 continue;
             }
@@ -1967,6 +1973,7 @@ private:
                 send_error(old, "continuation KV verification failed", ERROR_TYPE_SERVER);
                 old.callback_on_reset(old);
                 dest.borrowed_generation = 0;
+                changed = true;
                 it = suspended_requests.erase(it);
                 continue;
             }
@@ -2006,7 +2013,12 @@ private:
             changed = true;
             SLT_INF(*next, "%s", "VIP resident resume\n");
         }
-        if (changed && !active_vip()) { queue_tasks.pop_deferred_task(-1); }
+        if (changed && !active_vip() && !has_capacity_suspended()) {
+            const size_t n_wake = std::min<size_t>(queue_tasks.queue_tasks_deferred_size(), slots.size());
+            for (size_t i = 0; i < n_wake; ++i) {
+                queue_tasks.pop_deferred_task(-1);
+            }
+        }
     }
 
     std::vector<pipeline_lane> pipeline_lanes;
@@ -4202,8 +4214,9 @@ private:
 
             slot.callback_on_release = [this](int id_slot) {
                 // The continuation owns this slot against ordinary queued work,
-                // but a waiting VIP must still be allowed to take over.
-                queue_tasks.pop_deferred_task(id_slot, slots[id_slot].borrowed_generation != 0);
+                // and while capacity-paged requests are waiting to resume, keep
+                // ordinary queued work deferred so continuations reclaim KV first.
+                queue_tasks.pop_deferred_task(id_slot, slots[id_slot].borrowed_generation != 0 || has_capacity_suspended());
             };
 
             slot.callback_on_reset = [this](const server_slot & slot) {
@@ -5905,7 +5918,7 @@ private:
                         pause_for_vip();
                     } else {
                         resume_paused();
-                        if (params_base.vip_enable && active_ordinary() >= ordinary_budget()) {
+                        if ((params_base.vip_enable && active_ordinary() >= ordinary_budget()) || has_capacity_suspended()) {
                             queue_tasks.defer(std::move(task));
                             break;
                         }
@@ -5992,8 +6005,15 @@ private:
                             for (const auto & ck : it->slot->prompt.checkpoints) {
                                 ckpt_async_settle(&ck);
                             }
+                            const bool was_capacity = it->capacity_page;
                             it->slot->callback_on_reset(*it->slot);
                             suspended_requests.erase(it);
+                            if (was_capacity && !active_vip() && !has_capacity_suspended()) {
+                                const size_t n_wake = std::min<size_t>(queue_tasks.queue_tasks_deferred_size(), slots.size());
+                                for (size_t i = 0; i < n_wake; ++i) {
+                                    queue_tasks.pop_deferred_task(-1);
+                                }
+                            }
                             break;
                         }
                     }
@@ -6575,17 +6595,21 @@ private:
         d.n_slots = (int32_t) slots.size();
         d.n_processing = d.n_prompt = d.n_gen = d.n_paused = d.n_vip = 0;
         d.n_rows = 0;
+        uint64_t kv_active = 0, kv_cached = 0;
         llama_memory_t mem = llama_get_memory(ctx_tgt);
         for (const auto & slot : slots) {
             const bool busy = slot.is_processing();
             const int32_t cells = (int32_t) llama_memory_seq_n_cells(mem, slot.id);
             if (busy) {
+                kv_active += (uint64_t) std::max<int32_t>(0, cells);
                 d.n_processing++;
                 d.n_gen    += (slot.state == SLOT_STATE_GENERATING) && !slot.resident_paused;
                 d.n_prompt += (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) && !slot.resident_paused;
                 d.n_paused += slot.resident_paused;
                 d.n_vip    += slot.task && slot.task->params.priority > 0;
                 add_live(slot);
+            } else {
+                kv_cached += (uint64_t) std::max<int32_t>(0, cells);
             }
             if (d.n_rows < (int32_t) (sizeof(d.rows) / sizeof(d.rows[0]))) {
                 auto & r = d.rows[d.n_rows++];
@@ -6615,7 +6639,9 @@ private:
         }
         d.n_suspended = (int32_t) suspended_requests.size();
         d.n_deferred  = (int32_t) queue_tasks.queue_tasks_deferred_size();
-        d.kv_used = resident_tokens();
+        d.kv_active = kv_active;
+        d.kv_cached = kv_cached;
+        d.kv_used   = kv_active + kv_cached;
         if (d.kv_used > dash_kv_max) dash_kv_max = d.kv_used;
         d.kv_max  = dash_kv_max;
         d.kv_cap  = (uint64_t) n_ctx;
@@ -6651,8 +6677,18 @@ private:
                     auto & o = d.dev[d.n_dev++];
                     snprintf(o.name, sizeof(o.name), "%s", name.c_str());
                     o.model = e.model; o.context = e.context; o.compute = e.compute;
+                    o.used = 0;
                     const auto it = dash_dev_total.find(name);
                     o.total = it != dash_dev_total.end() ? it->second : 0;
+                    const auto dev_it = dash_devs.find(name);
+                    if (dev_it != dash_devs.end() && dev_it->second) {
+                        size_t free_b = 0, total_b = 0;
+                        ggml_backend_dev_memory(dev_it->second, &free_b, &total_b);
+                        if (total_b > 0) {
+                            o.total = total_b;
+                            o.used  = total_b > free_b ? (total_b - free_b) : 0;
+                        }
+                    }
                 }
                 d.mem_t_us = now;
             }
@@ -6665,6 +6701,7 @@ private:
     }
 
     std::map<std::string, uint64_t> dash_dev_total;
+    std::map<std::string, ggml_backend_dev_t> dash_devs;
 
     paraflow_dash_bucket & dash_hist_bucket(int64_t k) {
         auto & b = dash_hist[k % PARAFLOW_DASH_BUCKETS];
@@ -6729,6 +6766,7 @@ private:
             size_t free_b = 0, total_b = 0;
             ggml_backend_dev_memory(dev, &free_b, &total_b);
             dash_dev_total[ggml_backend_dev_name(dev)] = total_b;
+            dash_devs[ggml_backend_dev_name(dev)] = dev;
             devices.push_back({{"name", ggml_backend_dev_name(dev)}, {"desc", ggml_backend_dev_description(dev)}, {"total", total_b}});
         }
         std::string path = params_base.model.path;
@@ -9188,7 +9226,7 @@ void server_routes::init_routes() {
         u64("sc_evictions", d.sc_evictions); u64("sc_failures", d.sc_failures); u64("sc_bytes", d.sc_bytes);
         i64("n_slots", d.n_slots); i64("n_processing", d.n_processing); i64("n_prompt", d.n_prompt); i64("n_gen", d.n_gen);
         i64("n_paused", d.n_paused); i64("n_suspended", d.n_suspended); i64("n_vip", d.n_vip); i64("n_deferred", d.n_deferred);
-        u64("kv_used", d.kv_used); u64("kv_cap", d.kv_cap); u64("kv_max", d.kv_max);
+        u64("kv_used", d.kv_used); u64("kv_active", d.kv_active); u64("kv_cached", d.kv_cached); u64("kv_cap", d.kv_cap); u64("kv_max", d.kv_max);
         // slots: [id, state, lane, stream, tokens, cells, vip, mtp, paused]
         o += ",\"slots\":[";
         for (int i = 0; i < d.n_rows; ++i) {
@@ -9211,8 +9249,8 @@ void server_routes::init_routes() {
         o += "],\"devices\":[";
         for (int i = 0; i < d.n_dev; ++i) {
             const auto & e = d.dev[i];
-            snprintf(b, sizeof(b), "%s{\"name\":\"%s\",\"model\":%" PRIu64 ",\"context\":%" PRIu64 ",\"compute\":%" PRIu64 ",\"total\":%" PRIu64 "}",
-                     i ? "," : "", e.name, e.model, e.context, e.compute, e.total);
+            snprintf(b, sizeof(b), "%s{\"name\":\"%s\",\"model\":%" PRIu64 ",\"context\":%" PRIu64 ",\"compute\":%" PRIu64 ",\"used\":%" PRIu64 ",\"total\":%" PRIu64 "}",
+                     i ? "," : "", e.name, e.model, e.context, e.compute, e.used, e.total);
             o += b;
         }
         o += "]";
