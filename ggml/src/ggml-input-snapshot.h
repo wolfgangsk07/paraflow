@@ -14,6 +14,8 @@
 // Default scope remains single-GPU/single-copy. Explicit pipeline callers may
 // opt in with one owned arena per backend/copy and gate it at every submission.
 struct ggml_backend_sched_input_staging {
+    // Ring of pinned staging buffers per backend so consecutive prefill chunks overlap GPU compute without fencing the prior car's event.
+    static constexpr int N_RING = 8;
     struct arena {
         ggml_backend_buffer_t buffer = nullptr;
         ggml_backend_event_t event = nullptr;
@@ -28,19 +30,20 @@ struct ggml_backend_sched_input_staging {
     };
     ggml_backend_sched_t owner;
     std::vector<arena> arenas;
+    std::vector<int> ring_next;
     size_t limit;
     std::atomic<uint64_t> tensors{0}, bytes{0}, fences{0}, wait_ns{0}, fallbacks{0}, allocated{0};
 
     explicit ggml_backend_sched_input_staging(ggml_backend_sched_t sched)
-        : owner(sched), arenas(sched->n_backends * sched->n_copies), limit(16 * 1024 * 1024) {
+        : owner(sched), arenas(sched->n_backends * N_RING), ring_next(sched->n_backends, 0), limit(16 * 1024 * 1024) {
     }
     ggml_backend_sched_input_staging(const ggml_backend_sched_input_staging &) = delete;
-    arena & get(int backend, int copy) {
-        GGML_ASSERT(copy >= 0 && copy < owner->n_copies);
-        return arenas[backend * owner->n_copies + copy];
+    arena & get(int backend, int ring) {
+        GGML_ASSERT(ring >= 0 && ring < N_RING);
+        return arenas[backend * N_RING + ring];
     }
-    void wait(int backend, int copy) {
-        auto & a = get(backend, copy);
+    void wait(int backend, int ring) {
+        auto & a = get(backend, ring);
         if (!a.pending) return;
         const auto begin = std::chrono::steady_clock::now();
         if (a.event) ggml_backend_event_synchronize(a.event);
@@ -52,9 +55,9 @@ struct ggml_backend_sched_input_staging {
     }
     ~ggml_backend_sched_input_staging() {
         for (int b = 0; b < owner->n_backends; ++b) {
-            for (int copy = 0; copy < owner->n_copies; ++copy) {
-                wait(b, copy);
-                auto & a = get(b, copy);
+            for (int r = 0; r < N_RING; ++r) {
+                wait(b, r);
+                auto & a = get(b, r);
                 if (a.event) ggml_backend_event_free(a.event);
                 if (a.buffer) ggml_backend_buffer_free(a.buffer);
             }
@@ -64,13 +67,17 @@ struct ggml_backend_sched_input_staging {
     struct call {
         ggml_backend_sched_input_staging * state;
         std::unordered_map<ggml_tensor *, upload> uploads;
-        std::vector<bool> usable, queued;
+        std::vector<bool> usable, queued, recorded;
+        std::vector<int> ring_slot, last_input_split;
         int copy_slot;
         explicit call(ggml_backend_sched_t sched, const std::unordered_set<const ggml_tensor *> * read_tensors = nullptr)
             : state(sched->input_staging), copy_slot(sched->cur_copy) {
             if (!state) return;
             usable.assign(sched->n_backends, false);
             queued.assign(sched->n_backends, false);
+            recorded.assign(sched->n_backends, false);
+            ring_slot.assign(sched->n_backends, 0);
+            last_input_split.assign(sched->n_backends, -1);
             if (sched->callback_eval) return;
             if (sched->callback_copy) {
                 for (int si = 0; si < sched->n_splits; ++si) {
@@ -106,9 +113,11 @@ struct ggml_backend_sched_input_staging {
                         if (!is_read) continue;
                     }
                     auto * destination = tensor_copy(source, b, sched->cur_copy);
-                    if (!destination || !ggml_is_contiguous(destination) || uploads.count(destination)) continue;
+                    if (!destination || !ggml_is_contiguous(destination)) continue;
                     const size_t size = ggml_nbytes(source);
                     if (!size) continue;
+                    last_input_split[b] = s;
+                    if (uploads.count(destination)) continue;
                     const size_t offset = GGML_PAD(required[b], 64);
                     if (size > state->limit || offset > state->limit - size) {
                         fits[b] = false;
@@ -121,9 +130,12 @@ struct ggml_backend_sched_input_staging {
             }
             for (int b = 0; b < sched->n_backends; ++b) {
                 if (!fits[b] || !required[b]) continue;
-                auto & a = state->get(b, copy_slot);
-                // The previous call may still be reading this host snapshot.
-                state->wait(b, copy_slot);
+                const int rslot = state->ring_next[b];
+                ring_slot[b] = rslot;
+                state->ring_next[b] = (rslot + 1) % ggml_backend_sched_input_staging::N_RING;
+                auto & a = state->get(b, rslot);
+                // The previous use of this ring slot (N_RING calls ago) may still be reading the host snapshot.
+                state->wait(b, rslot);
                 if (a.capacity < required[b]) {
                     size_t capacity = std::min<size_t>(state->limit, std::max<size_t>(65536, a.capacity));
                     while (capacity < required[b]) capacity = std::min(state->limit, capacity * 2);
@@ -144,7 +156,7 @@ struct ggml_backend_sched_input_staging {
             for (const auto & entry : uploads) {
                 const auto & u = entry.second;
                 if (!usable[u.backend]) continue;
-                auto * base = static_cast<char *>(ggml_backend_buffer_get_base(state->get(u.backend, copy_slot).buffer));
+                auto * base = static_cast<char *>(ggml_backend_buffer_get_base(state->get(u.backend, ring_slot[u.backend]).buffer));
                 std::memcpy(base + u.offset, u.source->data, u.bytes);
             }
         }
@@ -153,7 +165,7 @@ struct ggml_backend_sched_input_staging {
             const auto it = uploads.find(destination);
             if (it == uploads.end() || !usable[it->second.backend]) return false;
             const auto & u = it->second;
-            const auto & a = state->get(u.backend, copy_slot);
+            const auto & a = state->get(u.backend, ring_slot[u.backend]);
             const auto * base = static_cast<const char *>(ggml_backend_buffer_get_base(a.buffer));
             // Fence prior split completion on the destination stream before overwriting multi-copy inputs,
             // and rely on FIFO stream ordering for single-copy per-lane schedulers.
@@ -166,14 +178,25 @@ struct ggml_backend_sched_input_staging {
             state->bytes.fetch_add(u.bytes, std::memory_order_relaxed);
             return true;
         }
+        void after_split_inputs(int split_id) {
+            if (!state || queued.empty()) return;
+            for (int b = 0; b < state->owner->n_backends; ++b) {
+                if (queued[b] && !recorded[b] && last_input_split[b] == split_id) {
+                    auto & a = state->get(b, ring_slot[b]);
+                    if (a.event) ggml_backend_event_record(a.event, state->owner->backends[b]);
+                    a.pending = true;
+                    recorded[b] = true;
+                }
+            }
+        }
         void fallback() {
             if (state) state->fallbacks.fetch_add(1, std::memory_order_relaxed);
         }
         ~call() {
             if (!state || queued.empty()) return;
             for (int b = 0; b < state->owner->n_backends; ++b) {
-                if (!queued[b]) continue;
-                auto & a = state->get(b, copy_slot);
+                if (!queued[b] || recorded[b]) continue;
+                auto & a = state->get(b, ring_slot[b]);
                 if (a.event) ggml_backend_event_record(a.event, state->owner->backends[b]);
                 a.pending = true;
             }

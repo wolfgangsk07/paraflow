@@ -1949,6 +1949,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
     if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+        if (ggml_nbytes(input) == 0) { return; }
         if (snapshots.copy(input_cpy)) { return; }
         snapshots.fallback();
         // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -2080,6 +2081,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id], snapshots);
             }
         }
+        snapshots.after_split_inputs(split_id);
 
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);

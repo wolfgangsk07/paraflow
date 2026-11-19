@@ -1011,6 +1011,31 @@ size_t llama_memory_recurrent::size_p_bytes() const {
     return size_p_bytes;
 }
 
+bool llama_memory_recurrent::has_pending_rollback(llama_seq_id seq_id) const {
+    if (!compact_s || n_rs_seq == 0) {
+        return false;
+    }
+    for (uint32_t i = 0; i < size; ++i) {
+        const auto & cell = cells[i];
+        if ((seq_id == -1 && !cell.is_empty()) || cell.has_seq_id(seq_id)) {
+            uint32_t rs_idx_cur = 0;
+            if (seq_id != -1) {
+                GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < rs_idx.size());
+                rs_idx_cur = rs_idx[seq_id];
+            } else if (!cell.seq_id.empty()) {
+                const llama_seq_id cell_seq_id = *cell.seq_id.begin();
+                GGML_ASSERT(cell_seq_id >= 0 && (size_t) cell_seq_id < rs_idx.size());
+                rs_idx_cur = rs_idx[cell_seq_id];
+            }
+            const uint32_t cell_id = rs_idx_cur * size + (cell.src >= 0 ? cell.src : (int32_t) i);
+            if (cell_id >= size) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     GGML_UNUSED(flags);
 

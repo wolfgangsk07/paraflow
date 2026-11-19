@@ -208,6 +208,7 @@ struct llama_context {
     int32_t state_seq_prepare_capture(llama_seq_id seq_id);
     int64_t state_seq_get_data_async(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags);
     int32_t state_seq_async_wait(int64_t handle, bool block);
+    int32_t state_seq_async_fence_lane(int64_t handle, int32_t lane_id);
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
 
     bool state_load_file(

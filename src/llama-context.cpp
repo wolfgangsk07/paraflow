@@ -57,7 +57,7 @@ struct llama_ckpt_capture_state {
     uint64_t last_full_sync_ticket = 0;
     uint64_t fast = 0, full = 0, verified = 0, mismatches = 0;
     std::vector<const void *> pfset;       // backend set (prefill_backend_ptrs) that ran the ticket, else null
-    std::unordered_map<int64_t, std::vector<ggml_backend_event_t>> async_events;
+    std::unordered_map<int64_t, std::vector<std::pair<ggml_backend_dev_t, ggml_backend_event_t>>> async_events;
     int64_t  async_next = 1;
     uint64_t async_enqueued = 0, async_sync = 0, async_unmapped = 0;
 };
@@ -680,10 +680,10 @@ llama_context::~llama_context() {
     }
     if (ckpt_state) {
         for (auto & kv : ckpt_state->async_events) {
-            for (auto * ev : kv.second) {
-                if (ev) {
-                    ggml_backend_event_synchronize(ev);
-                    ggml_backend_event_free(ev);
+            for (auto & item : kv.second) {
+                if (item.second) {
+                    ggml_backend_event_synchronize(item.second);
+                    ggml_backend_event_free(item.second);
                 }
             }
         }
@@ -5764,6 +5764,7 @@ LLAMA_API void llama_state_seq_capture_record_verify(const llama_context * ctx, 
 
 LLAMA_API int64_t llama_state_seq_get_data_async(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags);
 LLAMA_API int32_t llama_state_seq_async_wait(llama_context * ctx, int64_t handle, bool block);
+LLAMA_API int32_t llama_state_seq_async_fence_lane(llama_context * ctx, int64_t handle, int32_t lane_id);
 LLAMA_API void    llama_state_seq_async_counts(const llama_context * ctx, uint64_t * enqueued, uint64_t * sync, uint64_t * unmapped, uint64_t * outstanding);
 
 namespace {
@@ -5797,8 +5798,7 @@ int64_t llama_context::state_seq_get_data_async(llama_seq_id seq_id, uint8_t * d
     if (const auto * hybrid = dynamic_cast<const llama_memory_hybrid *>(memory.get())) {
         recurrent = hybrid->get_mem_recr();
     }
-    if (recurrent && recurrent->compact_s) { async_ok = false; }
-    bool pending = false;
+    if (recurrent && recurrent->has_pending_rollback(seq_id)) { async_ok = false; }
     for (int32_t i = 0; async_ok && i < n_decode_tickets; ++i) {
         const auto & tk = tickets[i];
         if (tk.id == 0 || tk.id <= ck.last_full_sync_ticket) { continue; }
@@ -5814,9 +5814,9 @@ int64_t llama_context::state_seq_get_data_async(llama_seq_id seq_id, uint8_t * d
             if (c.used && !ggml_backend_event_query(c.event)) { done = false; }
         }
         if (done) { continue; }
-        if (known && !tk.fallback && ck.pfset[i] == pfkey) { pending = true; } else { async_ok = false; }
+        if (!known || tk.fallback || ck.pfset[i] != pfkey) { async_ok = false; }
     }
-    if (!async_ok || !pending) {
+    if (!async_ok) {
         ++ck.async_sync;
         state_seq_prepare_capture(seq_id);
         return state_seq_get_data(seq_id, dst, size, flags) == size ? 0 : -1;
@@ -5855,17 +5855,18 @@ int64_t llama_context::state_seq_get_data_async(llama_seq_id seq_id, uint8_t * d
         ggml_backend_tensor_get_async(owner[k], w.tensor, w.ptr, w.offset, w.size);
         if (std::find(used.begin(), used.end(), owner[k]) == used.end()) { used.push_back(owner[k]); }
     }
-    std::vector<ggml_backend_event_t> evs;
+    std::vector<std::pair<ggml_backend_dev_t, ggml_backend_event_t>> evs;
     for (auto * b : used) {
-        ggml_backend_event_t ev = ggml_backend_event_new(ggml_backend_get_device(b));
+        ggml_backend_dev_t dev = ggml_backend_get_device(b);
+        ggml_backend_event_t ev = ggml_backend_event_new(dev);
         if (!ev) {
             for (auto * x : used) { ggml_backend_synchronize(x); }
-            for (auto * e : evs) { ggml_backend_event_free(e); }
+            for (auto & e : evs) { ggml_backend_event_free(e.second); }
             ++ck.async_sync;
             return 0;
         }
         ggml_backend_event_record(ev, b);
-        evs.push_back(ev);
+        evs.emplace_back(dev, ev);
     }
     const int64_t handle = ck.async_next++;
     ck.async_events[handle] = std::move(evs);
@@ -5877,12 +5878,44 @@ int32_t llama_context::state_seq_async_wait(int64_t handle, bool block) {
     auto & ck = llama_ckpt_state(this);
     auto it = ck.async_events.find(handle);
     if (it == ck.async_events.end()) { return -1; }
-    for (auto * ev : it->second) {
+    for (auto & item : it->second) {
+        ggml_backend_event_t ev = item.second;
         if (block) { ggml_backend_event_synchronize(ev); }
         else if (!ggml_backend_event_query(ev)) { return 0; }
     }
-    for (auto * ev : it->second) { ggml_backend_event_free(ev); }
+    for (auto & item : it->second) { ggml_backend_event_free(item.second); }
     ck.async_events.erase(it);
+    return 1;
+}
+
+int32_t llama_context::state_seq_async_fence_lane(int64_t handle, int32_t lane_id) {
+    auto & ck = llama_ckpt_state(this);
+    auto it = ck.async_events.find(handle);
+    if (it == ck.async_events.end()) { return 0; }
+    ggml_backend_sched_t target_sched = nullptr;
+    if (decode_pipelined && !pipe_scheds.empty()) {
+        const size_t n_pipe_scheds = pipe_scheds.size();
+        const size_t idx = (lane_id >= 0 && n_pipe_scheds > 1)
+                ? (size_t(lane_id) % (n_pipe_scheds - 1))
+                : (n_pipe_scheds - 1);
+        target_sched = pipe_scheds[idx].get();
+    }
+    const int n_b = target_sched ? ggml_backend_sched_get_n_backends(target_sched) : (int) backend_ptrs.size();
+    for (const auto & item : it->second) {
+        ggml_backend_event_t ev = item.second;
+        if (!ev || ggml_backend_event_query(ev)) { continue; }
+        ggml_backend_t target_b = nullptr;
+        for (int bi = 0; bi < n_b; ++bi) {
+            ggml_backend_t b = target_sched ? ggml_backend_sched_get_backend(target_sched, bi) : backend_ptrs[bi];
+            if (b && ggml_backend_get_device(b) == item.first) {
+                target_b = b;
+                break;
+            }
+        }
+        if (!target_b) { return -1; }
+        // Queue GPU stream-wait before the decode lane overwrites shared recurrent/KV tensors.
+        ggml_backend_event_wait(target_b, ev);
+    }
     return 1;
 }
 
@@ -5892,6 +5925,10 @@ LLAMA_API int64_t llama_state_seq_get_data_async(llama_context * ctx, uint8_t * 
 
 LLAMA_API int32_t llama_state_seq_async_wait(llama_context * ctx, int64_t handle, bool block) {
     return ctx->state_seq_async_wait(handle, block);
+}
+
+LLAMA_API int32_t llama_state_seq_async_fence_lane(llama_context * ctx, int64_t handle, int32_t lane_id) {
+    return ctx->state_seq_async_fence_lane(handle, lane_id);
 }
 
 LLAMA_API void llama_state_seq_async_counts(const llama_context * ctx, uint64_t * enqueued, uint64_t * sync, uint64_t * unmapped, uint64_t * outstanding) {

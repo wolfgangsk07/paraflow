@@ -12,6 +12,7 @@ LLAMA_API void    llama_state_seq_capture_counts(const llama_context * ctx, uint
 LLAMA_API void    llama_state_seq_capture_record_verify(const llama_context * ctx, bool match);
 LLAMA_API int64_t llama_state_seq_get_data_async(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags);
 LLAMA_API int32_t llama_state_seq_async_wait(llama_context * ctx, int64_t handle, bool block);
+LLAMA_API int32_t llama_state_seq_async_fence_lane(llama_context * ctx, int64_t handle, int32_t lane_id);
 LLAMA_API void    llama_state_seq_async_counts(const llama_context * ctx, uint64_t * enqueued, uint64_t * sync, uint64_t * unmapped, uint64_t * outstanding);
 #include <functional>
 #include "server-chat.h"
@@ -1643,6 +1644,7 @@ private:
     uint64_t pipeline_vip_pause_skipped = 0;
     void pause_for_vip() {
         if (!vip_pause_needed()) { ++pipeline_vip_pause_skipped; return; }
+        dft_join(__LINE__);
         pipeline_drain();
         const int keep = ordinary_budget(1);
         std::vector<int> survivors;
@@ -3059,6 +3061,26 @@ private:
                     llama_synchronize(ctx_tgt);
                 }
             }
+            const bool on_prefill_stream = pipeline_prefill_slot >= 0 && !std::all_of(batch.tokens.begin(), batch.tokens.end(),
+                    [](const server_batch::token & token) { return token.output; });
+            if (!on_prefill_stream && !ckpt_async_items.empty()) {
+                for (size_t bi = 0; bi < batch.tokens.size(); ++bi) {
+                    const int sid = batch.tokens[bi].id_slot;
+                    bool seen = false;
+                    for (size_t bj = 0; bj < bi; ++bj) {
+                        if (batch.tokens[bj].id_slot == sid) { seen = true; break; }
+                    }
+                    if (seen) { continue; }
+                    for (const auto & item : ckpt_async_items) {
+                        if (item.slot_id == sid) {
+                            if (llama_state_seq_async_fence_lane(ctx_tgt, item.handle, lane_id) < 0) {
+                                ckpt_async_poll(sid, true);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
             llama_set_decode_pipelane(ctx_tgt, lane_id);
             metrics_pre_decode();
             const auto issue_start = ggml_time_us();
@@ -3665,8 +3687,25 @@ private:
             entry.prompt.mtp_ready = mtp;
             entry.data.main.resize(main_size);
             entry.data.drft.resize(draft_size);
-            if (!main_size || llama_state_seq_get_data_ext(ctx_tgt, entry.data.main.data(), main_size, slot.id, 0) != main_size ||
-                    (mtp && llama_state_seq_get_data_ext(slot.ctx_dft, entry.data.drft.data(), draft_size, slot.id, 0) != draft_size)) {
+            if (!main_size) {
+                throw std::runtime_error("prefix snapshot failed");
+            }
+            if (pipeline_on) {
+                if (checkpoint_pinned == nullptr || ggml_backend_buffer_get_size(checkpoint_pinned) < main_size) {
+                    if (checkpoint_pinned) { ggml_backend_buffer_free(checkpoint_pinned); }
+                    checkpoint_pinned = ggml_backend_buft_alloc_buffer(pinned_host_buft(), main_size + main_size / 8);
+                    GGML_ASSERT(checkpoint_pinned != nullptr);
+                }
+                uint8_t * capture_dst = (uint8_t *) ggml_backend_buffer_get_base(checkpoint_pinned);
+                llama_state_seq_prepare_capture(ctx_tgt, slot.id);
+                if (llama_state_seq_get_data_ext_prepared(ctx_tgt, capture_dst, main_size, slot.id, 0) != main_size) {
+                    throw std::runtime_error("prefix snapshot failed");
+                }
+                memcpy(entry.data.main.data(), capture_dst, main_size);
+            } else if (llama_state_seq_get_data_ext(ctx_tgt, entry.data.main.data(), main_size, slot.id, 0) != main_size) {
+                throw std::runtime_error("prefix snapshot failed");
+            }
+            if (mtp && llama_state_seq_get_data_ext(slot.ctx_dft, entry.data.drft.data(), draft_size, slot.id, 0) != draft_size) {
                 throw std::runtime_error("prefix snapshot failed");
             }
             for (auto it = system_prefixes.begin(); it != system_prefixes.end();) {
@@ -5494,7 +5533,6 @@ private:
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
-        dft_join(__LINE__);
         const auto checkpoint_begin = ggml_time_us();
         const server_task_id id_task = slot.task->id;
 
@@ -5622,6 +5660,10 @@ private:
             }
         } else {
             cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        }
+        // Defer draft executor join until target D2H copy is already queued asynchronously on GPU.
+        if (slot.ctx_dft != nullptr || slot.spec != nullptr) {
+            dft_join(__LINE__);
         }
         cur.update_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint; if earlier cars of this slot are still
@@ -5867,9 +5909,11 @@ private:
 
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
+        const bool is_completion = task.type == SERVER_TASK_TYPE_COMPLETION;
         // tasks read and modify slot, draft and speculative state directly; metrics/slot reads only read counters,
-        // and the NEXT_RESPONSE wake-up posted on every scheduler pass does nothing
-        if (task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET &&
+        // and the NEXT_RESPONSE wake-up posted on every scheduler pass does nothing.
+        // For completions, defer joining/draining until we know the task will actually be admitted rather than deferred.
+        if (!is_completion && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET &&
                 task.type != SERVER_TASK_TYPE_NEXT_RESPONSE) { dft_join(__LINE__); }
         // while yielding, an encode / decode is running and only reading the server state is safe
         if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
@@ -5877,17 +5921,12 @@ private:
             return false;
         }
 
-        if (task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET &&
+        if (!is_completion && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET &&
                 task.type != SERVER_TASK_TYPE_NEXT_RESPONSE) {
-            const auto admission_start = ggml_time_us();
             if (admission_drain_skippable(task)) {
                 ++pipeline_admission_skipped;
             } else {
                 pipeline_drain();
-            }
-            if (task.type == SERVER_TASK_TYPE_COMPLETION) {
-                ++pipeline_admission_calls;
-                pipeline_admission_drain_us += ggml_time_us() - admission_start;
             }
         }
         switch (task.type) {
@@ -5910,9 +5949,11 @@ private:
                         queue_tasks.defer(std::move(task));
                         break;
                     }
-                    const bool admission_skip = admission_drain_skippable(task);
-                    if (!admission_skip) {
-                        pipeline_drain();
+                    if (!is_completion) {
+                        const bool admission_skip = admission_drain_skippable(task);
+                        if (!admission_skip) {
+                            pipeline_drain();
+                        }
                     }
                     if (params_base.vip_enable && task.params.priority > 0) {
                         pause_for_vip();
@@ -5927,12 +5968,6 @@ private:
                     if (params_base.vip_enable && task.params.priority > 0 &&
                             (!slot || slot->is_processing()) && page_out_paused(task.id_slot)) {
                         slot = get_available_slot(task);
-                    }
-                    if (admission_skip && slot && task.params.cache_prompt &&
-                            slot->prompt.tokens.get_common_prefix(task.tokens) > 0) {
-                        // possible prompt-state reuse (checkpoint restore writes device state): keep the old drain
-                        ++pipeline_admission_late_drains;
-                        pipeline_drain();
                     }
 
                     //
@@ -5953,15 +5988,39 @@ private:
                         break;
                     }
 
+                    std::vector<server_slot *> child_slots;
                     if (task.is_parent()) {
-                        // try getting free slots for all child tasks
-                        size_t n_child_tasks = task.child_tasks.size();
-                        std::vector<server_slot *> child_slots = get_free_slots(n_child_tasks, slot->id);
+                        // try getting free slots for all child tasks before draining the pipeline
+                        const size_t n_child_tasks = task.child_tasks.size();
+                        child_slots = get_free_slots(n_child_tasks, slot->id);
                         if (child_slots.size() < n_child_tasks) {
                             SRV_DBG("not enough free slots for child tasks, n_free = %zu, n_children = %zu, defer task, id_task = %" PRId64 "\n", child_slots.size(), n_child_tasks, id_task);
                             queue_tasks.defer(std::move(task));
                             break;
                         }
+                    }
+
+                    if (is_completion) {
+                        const auto admission_start = ggml_time_us();
+                        const bool admission_skip = admission_drain_skippable(task);
+                        if (!admission_skip) {
+                            pipeline_drain();
+                        } else if (task.params.cache_prompt && slot->prompt.tokens.get_common_prefix(task.tokens) > 0) {
+                            // possible prompt-state reuse (checkpoint restore writes device state): keep the old drain
+                            ++pipeline_admission_late_drains;
+                            pipeline_drain();
+                        } else {
+                            ++pipeline_admission_skipped;
+                        }
+                        ++pipeline_admission_calls;
+                        pipeline_admission_drain_us += ggml_time_us() - admission_start;
+                    } else if (admission_drain_skippable(task) && task.params.cache_prompt &&
+                            slot->prompt.tokens.get_common_prefix(task.tokens) > 0) {
+                        ++pipeline_admission_late_drains;
+                        pipeline_drain();
+                    }
+
+                    if (task.is_parent()) {
                         if (!launch_slots_with_parent_task(*slot, child_slots, std::move(task))) {
                             SRV_ERR("failed to launch slot with parent task, id_task = %" PRId64 "\n", id_task);
                             break; // drop the task
