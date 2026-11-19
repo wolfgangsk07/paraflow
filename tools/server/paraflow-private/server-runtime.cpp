@@ -3691,17 +3691,29 @@ private:
                 throw std::runtime_error("prefix snapshot failed");
             }
             if (pipeline_on) {
-                if (checkpoint_pinned == nullptr || ggml_backend_buffer_get_size(checkpoint_pinned) < main_size) {
-                    if (checkpoint_pinned) { ggml_backend_buffer_free(checkpoint_pinned); }
-                    checkpoint_pinned = ggml_backend_buft_alloc_buffer(pinned_host_buft(), main_size + main_size / 8);
-                    GGML_ASSERT(checkpoint_pinned != nullptr);
-                }
-                uint8_t * capture_dst = (uint8_t *) ggml_backend_buffer_get_base(checkpoint_pinned);
                 llama_state_seq_prepare_capture(ctx_tgt, slot.id);
-                if (llama_state_seq_get_data_ext_prepared(ctx_tgt, capture_dst, main_size, slot.id, 0) != main_size) {
+                constexpr size_t max_pinned_prefix_bytes = 256ull * 1024 * 1024;
+                uint8_t * capture_dst = nullptr;
+                if (main_size <= max_pinned_prefix_bytes) {
+                    if (checkpoint_pinned == nullptr || ggml_backend_buffer_get_size(checkpoint_pinned) < main_size) {
+                        if (checkpoint_pinned) {
+                            ggml_backend_buffer_free(checkpoint_pinned);
+                            checkpoint_pinned = nullptr;
+                        }
+                        checkpoint_pinned = ggml_backend_buft_alloc_buffer(pinned_host_buft(), std::min(max_pinned_prefix_bytes, main_size + main_size / 8));
+                    }
+                    if (checkpoint_pinned != nullptr && ggml_backend_buffer_get_size(checkpoint_pinned) >= main_size) {
+                        capture_dst = (uint8_t *) ggml_backend_buffer_get_base(checkpoint_pinned);
+                    }
+                }
+                if (capture_dst != nullptr) {
+                    if (llama_state_seq_get_data_ext_prepared(ctx_tgt, capture_dst, main_size, slot.id, 0) != main_size) {
+                        throw std::runtime_error("prefix snapshot failed");
+                    }
+                    memcpy(entry.data.main.data(), capture_dst, main_size);
+                } else if (llama_state_seq_get_data_ext_prepared(ctx_tgt, entry.data.main.data(), main_size, slot.id, 0) != main_size) {
                     throw std::runtime_error("prefix snapshot failed");
                 }
-                memcpy(entry.data.main.data(), capture_dst, main_size);
             } else if (llama_state_seq_get_data_ext(ctx_tgt, entry.data.main.data(), main_size, slot.id, 0) != main_size) {
                 throw std::runtime_error("prefix snapshot failed");
             }
