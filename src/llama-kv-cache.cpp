@@ -3747,6 +3747,13 @@ bool llama_kv_cache_context::can_use_compact_kq_mask(
         const llama_ubatch & ubatch,
         const llama_hparams & hparams,
         const llama_cparams & cparams) const {
+    static const bool compact_disabled = []() {
+        const char * env = std::getenv("PARAFLOW_COMPACT_KQ_MASK");
+        return env != nullptr && std::strcmp(env, "0") == 0;
+    }();
+    if (compact_disabled) {
+        return false;
+    }
     if (!cparams.flash_attn || cparams.kv_unified) {
         return false;
     }

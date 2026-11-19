@@ -25,6 +25,8 @@ thread_local uint32_t llama_recurrent_reserve_sequences = 0;
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -32,6 +34,25 @@ thread_local uint32_t llama_recurrent_reserve_sequences = 0;
 #include <string>
 #include <unordered_map>
 #include <utility>
+
+static bool paraflow_issue_profile_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("PARAFLOW_ISSUE_PROFILE");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+struct paraflow_issue_profile_bucket {
+    uint64_t calls = 0, reused = 0;
+    int64_t total_us = 0, mem_us = 0, build_us = 0, alloc_us = 0, set_inp_us = 0, compute_us = 0, pf_fence_us = 0, post_us = 0;
+};
+
+static thread_local struct {
+    bool active = false;
+    int64_t build_us = 0, alloc_us = 0, set_inp_us = 0, compute_us = 0;
+    uint64_t reused = 0;
+} g_pf_ubatch_prof;
 
 // MTP context: the drafting graph (every row is an output) gets its own allocator
 // on the SAME backend instances/streams as the catch-up graph (KV writes, no logits),
@@ -1851,8 +1872,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
+    const bool prof_active = g_pf_ubatch_prof.active;
+
     if (!graph_reuse_disable && !prefill && (ring || !decode_pipelined) && (ring || gf_res_prev_active == res) && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
+        if (prof_active) {
+            ++g_pf_ubatch_prof.reused;
+        }
 
         // with pipeline parallelism, the previous graph_compute_async on the main sched
         // may still be running on the GPU. we must synchronize before set_inputs to avoid
@@ -1864,6 +1890,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
+        const int64_t t_b0 = prof_active ? ggml_time_us() : 0;
         gf_res_prev_active = nullptr;
         res->reset();
 
@@ -1873,6 +1900,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         gf = model.build_graph(gparams);
+        if (prof_active) {
+            g_pf_ubatch_prof.build_us += ggml_time_us() - t_b0;
+        }
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1882,7 +1912,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        if (!ggml_backend_sched_alloc_graph(cur_sched(), gf)) {
+        const int64_t t_a0 = prof_active ? ggml_time_us() : 0;
+        const bool alloc_ok = ggml_backend_sched_alloc_graph(cur_sched(), gf);
+        if (prof_active) {
+            g_pf_ubatch_prof.alloc_us += ggml_time_us() - t_a0;
+        }
+        if (!alloc_ok) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             // build_graph already stored this ubatch's params in res. A ring slot reuses its graph without
             // the gf_res_prev_active check, so an identical later ubatch (e.g. a new request admitted into
@@ -1901,12 +1936,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+        const int64_t t_s0 = prof_active ? ggml_time_us() : 0;
         res->set_inputs(&ubatch);
+        if (prof_active) {
+            g_pf_ubatch_prof.set_inp_us += ggml_time_us() - t_s0;
+        }
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const int64_t t_c0 = prof_active ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (prof_active) {
+        g_pf_ubatch_prof.compute_us += ggml_time_us() - t_c0;
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         res->reset();
@@ -2192,6 +2235,70 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 __func__, batch_inp.n_embd, batch_inp.n_embd_inp);
         return -1;
     }
+
+    const bool issue_prof_on = paraflow_issue_profile_enabled() && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP;
+    const int64_t t_decode_start = issue_prof_on ? ggml_time_us() : 0;
+    int64_t t_loop_start = 0;
+    int64_t pf_fence_us  = 0;
+    struct issue_profile_guard {
+        const llama_context & self;
+        bool      enabled;
+        int64_t   t_start;
+        int64_t & t_loop;
+        int64_t & t_fence;
+        ~issue_profile_guard() {
+            const bool active = g_pf_ubatch_prof.active;
+            g_pf_ubatch_prof.active = false;
+            if (!enabled || !active || t_loop <= 0) {
+                return;
+            }
+            const int64_t total_us = ggml_time_us() - t_start;
+            const int64_t mem_us   = t_loop - t_start;
+            const int64_t b_us     = g_pf_ubatch_prof.build_us;
+            const int64_t a_us     = g_pf_ubatch_prof.alloc_us;
+            const int64_t s_us     = g_pf_ubatch_prof.set_inp_us;
+            const int64_t c_us     = g_pf_ubatch_prof.compute_us;
+            const int64_t f_us     = t_fence;
+            const int64_t post_us  = total_us - mem_us - b_us - a_us - s_us - c_us - f_us;
+            const int idx = self.pf_cur ? 1 : 0;
+            static std::mutex prof_mtx;
+            static paraflow_issue_profile_bucket prof_buckets[2];
+            paraflow_issue_profile_bucket snap;
+            bool should_log = false;
+            {
+                std::lock_guard<std::mutex> lock(prof_mtx);
+                auto & bk = prof_buckets[idx];
+                ++bk.calls;
+                bk.reused      += g_pf_ubatch_prof.reused;
+                bk.total_us    += total_us;
+                bk.mem_us      += mem_us;
+                bk.build_us    += b_us;
+                bk.alloc_us    += a_us;
+                bk.set_inp_us  += s_us;
+                bk.compute_us  += c_us;
+                bk.pf_fence_us += f_us;
+                bk.post_us     += post_us;
+                snap = bk;
+                should_log = (idx == 1) ? (bk.calls <= 10 || bk.calls % 30 == 0) : (bk.calls % 500 == 0);
+            }
+            if (should_log) {
+                std::fprintf(
+                    stderr,
+                    "ISSUE_PROFILE kind=%s calls=%llu reused=%llu total_ms=%.1f mem_ms=%.1f build_ms=%.1f alloc_ms=%.1f set_inp_ms=%.1f compute_ms=%.1f pf_fence_ms=%.1f post_ms=%.1f\n",
+                    idx ? "pf" : "dec",
+                    (unsigned long long) snap.calls,
+                    (unsigned long long) snap.reused,
+                    snap.total_us / 1000.0,
+                    snap.mem_us / 1000.0,
+                    snap.build_us / 1000.0,
+                    snap.alloc_us / 1000.0,
+                    snap.set_inp_us / 1000.0,
+                    snap.compute_us / 1000.0,
+                    snap.pf_fence_us / 1000.0,
+                    snap.post_us / 1000.0);
+            }
+        }
+    } prof_guard{*this, issue_prof_on, t_decode_start, t_loop_start, pf_fence_us};
 
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
@@ -2480,6 +2587,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
+
+    if (issue_prof_on) {
+        t_loop_start = ggml_time_us();
+        g_pf_ubatch_prof = {true, 0, 0, 0, 0, 0};
+    }
 
     do {
         const auto & ubatch = mctx->get_ubatch();
@@ -2837,9 +2949,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         if (selected < 0) {
             selected = pf_fence_next;
             auto & oldest = pf_fences[selected];
+            const int64_t t_f0 = issue_prof_on ? ggml_time_us() : 0;
             for (auto & [ev, b] : oldest.events) {
                 GGML_UNUSED(b);
                 ggml_backend_event_synchronize(ev);
+            }
+            if (issue_prof_on) {
+                pf_fence_us += ggml_time_us() - t_f0;
             }
             oldest.pending = false;
         }

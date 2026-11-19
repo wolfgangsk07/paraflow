@@ -3879,7 +3879,7 @@ static bool ggml_cuda_graph_stats_enabled() {
     return enabled;
 }
 
-struct ggml_cuda_graph_stats_counters {
+struct ggml_cuda_graph_bucket_stats {
     std::atomic<uint64_t> launches{0};
     std::atomic<uint64_t> hits{0};
     std::atomic<uint64_t> updates{0};
@@ -3887,6 +3887,17 @@ struct ggml_cuda_graph_stats_counters {
     std::atomic<uint64_t> update_reinstantiates{0};
     std::atomic<uint64_t> lru_evicts{0};
     std::atomic<uint64_t> eager_fallbacks{0};
+    std::atomic<uint64_t> upd_req_us{0};
+    std::atomic<uint64_t> capture_us{0};
+    std::atomic<uint64_t> inst_us{0};
+    std::atomic<uint64_t> upd_exec_us{0};
+    std::atomic<uint64_t> launch_us{0};
+    std::atomic<uint64_t> eager_us{0};
+};
+
+struct ggml_cuda_graph_stats_counters {
+    ggml_cuda_graph_bucket_stats buckets[2]; // 0 = fg (decode/main), 1 = bg (background prefill)
+    std::atomic<uint64_t> upd_fail_logs{0};
 };
 
 static ggml_cuda_graph_stats_counters & ggml_cuda_graph_stats() {
@@ -3894,23 +3905,47 @@ static ggml_cuda_graph_stats_counters & ggml_cuda_graph_stats() {
     return stats;
 }
 
-static void ggml_cuda_graph_stats_maybe_log(int device) {
+static int ggml_cuda_graph_stats_bucket(const ggml_backend_cuda_context * ctx) {
+    return ctx->stream_priority == 0 ? 1 : 0;
+}
+
+static void ggml_cuda_graph_stats_maybe_log(ggml_backend_cuda_context * ctx, bool is_eager = false) {
     if (!ggml_cuda_graph_stats_enabled()) {
         return;
     }
-    auto & st = ggml_cuda_graph_stats();
-    const uint64_t launches = st.launches.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (launches % 500 == 0) {
-        GGML_LOG_INFO(
-            "CUDA_GRAPH_STATS dev=%d launches=%llu hits=%llu updates=%llu inst=%llu upd_reinst=%llu lru_evict=%llu eager=%llu\n",
-            device,
+    const int bg = ggml_cuda_graph_stats_bucket(ctx);
+    auto & b = ggml_cuda_graph_stats().buckets[bg];
+    bool should_log = false;
+    uint64_t launches = 0;
+    if (is_eager) {
+        const uint64_t eager = b.eager_fallbacks.load(std::memory_order_relaxed);
+        launches = b.launches.load(std::memory_order_relaxed);
+        should_log = (eager <= 10 || eager % 50 == 0);
+    } else {
+        launches = b.launches.fetch_add(1, std::memory_order_relaxed) + 1;
+        should_log = bg ? (launches <= 10 || launches % 50 == 0) : (launches % 500 == 0);
+    }
+    if (should_log) {
+        std::fprintf(
+            stderr,
+            "CUDA_GRAPH_STATS dev=%d bg=%d launches=%llu hits=%llu updates=%llu inst=%llu upd_reinst=%llu lru_evict=%llu eager=%llu live=%zu map=%zu upd_req_ms=%.1f cap_ms=%.1f inst_ms=%.1f upd_exec_ms=%.1f launch_ms=%.1f eager_ms=%.1f\n",
+            ctx->device,
+            bg,
             (unsigned long long) launches,
-            (unsigned long long) st.hits.load(std::memory_order_relaxed),
-            (unsigned long long) st.updates.load(std::memory_order_relaxed),
-            (unsigned long long) st.instantiates.load(std::memory_order_relaxed),
-            (unsigned long long) st.update_reinstantiates.load(std::memory_order_relaxed),
-            (unsigned long long) st.lru_evicts.load(std::memory_order_relaxed),
-            (unsigned long long) st.eager_fallbacks.load(std::memory_order_relaxed));
+            (unsigned long long) b.hits.load(std::memory_order_relaxed),
+            (unsigned long long) b.updates.load(std::memory_order_relaxed),
+            (unsigned long long) b.instantiates.load(std::memory_order_relaxed),
+            (unsigned long long) b.update_reinstantiates.load(std::memory_order_relaxed),
+            (unsigned long long) b.lru_evicts.load(std::memory_order_relaxed),
+            (unsigned long long) b.eager_fallbacks.load(std::memory_order_relaxed),
+            ctx->live_cuda_graph_count(),
+            ctx->cuda_graphs.size(),
+            b.upd_req_us.load(std::memory_order_relaxed) / 1000.0,
+            b.capture_us.load(std::memory_order_relaxed) / 1000.0,
+            b.inst_us.load(std::memory_order_relaxed) / 1000.0,
+            b.upd_exec_us.load(std::memory_order_relaxed) / 1000.0,
+            b.launch_us.load(std::memory_order_relaxed) / 1000.0,
+            b.eager_us.load(std::memory_order_relaxed) / 1000.0);
     }
 }
 
@@ -4040,7 +4075,8 @@ static bool ggml_cuda_graph_instantiate_checked(ggml_backend_cuda_context * cuda
         ggml_cuda_lock_cv.wait(lock, [] { return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
         const size_t evicted_lru = cuda_ctx->evict_lru_cuda_graphs(graph_key, max_graphs);
         if (ggml_cuda_graph_stats_enabled() && evicted_lru > 0) {
-            ggml_cuda_graph_stats().lru_evicts.fetch_add(evicted_lru, std::memory_order_relaxed);
+            auto & b = ggml_cuda_graph_stats().buckets[ggml_cuda_graph_stats_bucket(cuda_ctx)];
+            b.lru_evicts.fetch_add(evicted_lru, std::memory_order_relaxed);
         }
     }
 #ifdef GGML_DIAGNOSTICS
@@ -4128,7 +4164,19 @@ static bool ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         }
 
         if (ggml_cuda_graph_stats_enabled()) {
-            ggml_cuda_graph_stats().update_reinstantiates.fetch_add(1, std::memory_order_relaxed);
+            auto & st = ggml_cuda_graph_stats();
+            const int bg = ggml_cuda_graph_stats_bucket(cuda_ctx);
+            st.buckets[bg].update_reinstantiates.fetch_add(1, std::memory_order_relaxed);
+            if (st.upd_fail_logs.fetch_add(1, std::memory_order_relaxed) < 30) {
+#if CUDART_VERSION >= 12000
+                const int reason = (int) result_info.result;
+#else
+                const int reason = (int) result_info;
+#endif
+                std::fprintf(stderr, "CUDA_GRAPH_UPD_FAIL dev=%d bg=%d stat=%d reason=%d nodes=%zu live=%zu\n",
+                        cuda_ctx->device, bg, (int) stat, reason,
+                        graph->node_props.size(), cuda_ctx->live_cuda_graph_count());
+            }
         }
 
         // The pre-existing graph exec cannot be updated due to violated constraints
@@ -5890,6 +5938,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
     };
 
+#ifdef USE_CUDA_GRAPH
+    const bool stats_on = ggml_cuda_graph_stats_enabled();
+    const int64_t t_cap_start = (stats_on && use_cuda_graph && cuda_graph_update_required) ? ggml_time_us() : 0;
+#endif
+
     while (!graph_evaluated_or_captured) {
         // Only perform the graph execution if CUDA graphs are not enabled, or we are capturing the graph.
         // With the use of CUDA graphs, the execution will be performed by the graph launch.
@@ -6051,6 +6104,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
             graph_evaluated_or_captured = true; // CUDA graph has been captured
+            if (stats_on) {
+                ggml_cuda_graph_stats().buckets[ggml_cuda_graph_stats_bucket(cuda_ctx)].capture_us.fetch_add(
+                        (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_cap_start), std::memory_order_relaxed);
+            }
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
             if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
@@ -6062,33 +6119,53 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     }
 
     if (use_cuda_graph) {
+        auto & st_b = ggml_cuda_graph_stats().buckets[ggml_cuda_graph_stats_bucket(cuda_ctx)];
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         const bool had_instance = graph->instance != nullptr;
-        bool executable_ready = had_instance || ggml_cuda_graph_instantiate_checked(cuda_ctx, graph_key);
+        bool executable_ready = had_instance;
+        if (!had_instance) {
+            const int64_t t_i0 = stats_on ? ggml_time_us() : 0;
+            executable_ready = ggml_cuda_graph_instantiate_checked(cuda_ctx, graph_key);
+            if (stats_on) {
+                st_b.inst_us.fetch_add((uint64_t) std::max<int64_t>(0, ggml_time_us() - t_i0), std::memory_order_relaxed);
+            }
+        }
         if (had_instance && executable_ready && cuda_graph_update_required) { // Update graph executable
+            const int64_t t_u0 = stats_on ? ggml_time_us() : 0;
             executable_ready = ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+            if (stats_on) {
+                st_b.upd_exec_us.fetch_add((uint64_t) std::max<int64_t>(0, ggml_time_us() - t_u0), std::memory_order_relaxed);
+            }
         }
         if (executable_ready) {
-            if (ggml_cuda_graph_stats_enabled()) {
-                auto & st = ggml_cuda_graph_stats();
+            if (stats_on) {
                 if (!had_instance) {
-                    st.instantiates.fetch_add(1, std::memory_order_relaxed);
+                    st_b.instantiates.fetch_add(1, std::memory_order_relaxed);
                 } else if (cuda_graph_update_required) {
-                    st.updates.fetch_add(1, std::memory_order_relaxed);
+                    st_b.updates.fetch_add(1, std::memory_order_relaxed);
                 } else {
-                    st.hits.fetch_add(1, std::memory_order_relaxed);
+                    st_b.hits.fetch_add(1, std::memory_order_relaxed);
                 }
             }
+            const int64_t t_l0 = stats_on ? ggml_time_us() : 0;
             CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
-            ggml_cuda_graph_stats_maybe_log(cuda_ctx->device);
+            if (stats_on) {
+                st_b.launch_us.fetch_add((uint64_t) std::max<int64_t>(0, ggml_time_us() - t_l0), std::memory_order_relaxed);
+            }
+            ggml_cuda_graph_stats_maybe_log(cuda_ctx, false);
         } else {
-            if (ggml_cuda_graph_stats_enabled()) {
-                ggml_cuda_graph_stats().eager_fallbacks.fetch_add(1, std::memory_order_relaxed);
+            if (stats_on) {
+                st_b.eager_fallbacks.fetch_add(1, std::memory_order_relaxed);
             }
             // Capture recorded this computation but did not execute it. Run the
             // same nodes once through the ordinary launch path; never lose a car.
             graph->warmup_complete = false;
+            const int64_t t_e0 = stats_on ? ggml_time_us() : 0;
             ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, false, false, graph_key);
+            if (stats_on) {
+                st_b.eager_us.fetch_add((uint64_t) std::max<int64_t>(0, ggml_time_us() - t_e0), std::memory_order_relaxed);
+                ggml_cuda_graph_stats_maybe_log(cuda_ctx, true);
+            }
         }
 #else
         GGML_UNUSED(graph_key);
@@ -6136,7 +6213,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         if (graph->is_enabled()) {
             const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
             if (graph_compatible) {
+                const int64_t t_ur0 = ggml_cuda_graph_stats_enabled() ? ggml_time_us() : 0;
                 const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+                if (ggml_cuda_graph_stats_enabled()) {
+                    ggml_cuda_graph_stats().buckets[ggml_cuda_graph_stats_bucket(cuda_ctx)].upd_req_us.fetch_add(
+                            (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_ur0), std::memory_order_relaxed);
+                }
 
                 // Pipelined decode alternates graph shapes per lane. Instead of falling back to
                 // eager launches until a graph is stable again, re-capture and update the
@@ -6159,12 +6241,22 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
 #ifdef USE_CUDA_GRAPH
     } else if (!use_cuda_graph && ggml_cuda_graph_stats_enabled()) {
-        ggml_cuda_graph_stats().eager_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        ggml_cuda_graph_stats().buckets[ggml_cuda_graph_stats_bucket(cuda_ctx)].eager_fallbacks.fetch_add(1, std::memory_order_relaxed);
 #endif
     }
 
+#ifdef USE_CUDA_GRAPH
+    const int64_t t_eager0 = (!use_cuda_graph && ggml_cuda_graph_stats_enabled()) ? ggml_time_us() : 0;
+#endif
     try {
         ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+#ifdef USE_CUDA_GRAPH
+        if (!use_cuda_graph && ggml_cuda_graph_stats_enabled()) {
+            ggml_cuda_graph_stats().buckets[ggml_cuda_graph_stats_bucket(cuda_ctx)].eager_us.fetch_add(
+                    (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_eager0), std::memory_order_relaxed);
+            ggml_cuda_graph_stats_maybe_log(cuda_ctx, true);
+        }
+#endif
     } catch (const ggml_cuda_oom_error & e) {
         // Kernels already queued stay valid; the caller discards this graph's results.
         cuda_ctx->curr_stream_no = 0;
