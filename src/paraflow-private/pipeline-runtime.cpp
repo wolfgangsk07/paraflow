@@ -148,9 +148,7 @@ void llama_context::set_decode_pipelined(bool enable) {
                     GGML_ASSERT(!lane_shapes.empty());
                 }
                 const int32_t prev_topk = cur_logits_topk;
-                if (!cparams.embeddings && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP && model.vocab.n_tokens() >= 128) {
-                    cur_logits_topk = 128;
-                }
+                cur_logits_topk = default_pipelined_logits_topk();
                 for (const auto & shape : lane_shapes) {
                     if (reserve_kv) reserve_kv->set_reserve_streams(shape.second);
                     if (!graph_reserve(shape.first, shape.second, shape.first, mctx_full.get())) {
@@ -220,9 +218,7 @@ void llama_context::set_decode_pipelined(bool enable) {
             pf_cur_backends = &prefill_backend_ptrs;
 
             const int32_t prev_topk = cur_logits_topk;
-            if (!cparams.embeddings && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP && model.vocab.n_tokens() >= 128) {
-                cur_logits_topk = 128;
-            }
+            cur_logits_topk = default_pipelined_logits_topk();
             const bool pf_ok = graph_reserve(n_tokens_pp,
                             llama_prefill_initial_reserve_sequences(model, cparams, cparams.n_seq_max),
                             llama_prefill_initial_reserve_sequences(model, cparams, cparams.n_seq_max) != cparams.n_seq_max
@@ -235,6 +231,9 @@ void llama_context::set_decode_pipelined(bool enable) {
                 prefill_gf_res.reset();
                 prefill_backends.clear();
                 prefill_backend_ptrs.clear();
+            } else {
+                pf_reallocs.store(0, std::memory_order_relaxed);
+                ggml_backend_sched_set_realloc_callback(prefill_sched.get(), pf_sched_graph_realloc, this);
             }
         }
     }

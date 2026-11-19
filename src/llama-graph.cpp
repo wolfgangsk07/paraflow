@@ -4212,7 +4212,7 @@ void llm_graph_context::build_logits() const {
     // the models declare t_logits without expanding it, so the LM head is computed only when it is expanded here
     if (res->t_logits != nullptr) {
         ggml_build_forward_expand(gf, res->t_logits);
-        if (logits_topk > 0 && res->t_logits->ne[1] > 0 && res->t_logits->type == GGML_TYPE_F32) {
+        if (logits_topk > 0 && res->t_logits->type == GGML_TYPE_F32) {
             const int64_t n_vocab_cur = res->t_logits->ne[0];
             const int64_t n_out_cur   = res->t_logits->ne[1];
             const int32_t k = (int32_t) std::min<int64_t>(logits_topk, n_vocab_cur);

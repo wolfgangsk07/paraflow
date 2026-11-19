@@ -319,6 +319,8 @@ private:
 
     llm_graph_cb graph_get_cb() const;
 
+    int32_t default_pipelined_logits_topk() const;
+
     // create a new backend scheduler for a graph of the specified size and register the callbacks below
     void sched_new(size_t max_nodes, bool parallel);
 
@@ -327,6 +329,7 @@ private:
 
     // ggml_backend_sched realloc callback, counts and traces the graph reallocations of this context
     static void sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data);
+    static void pf_sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data);
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -437,6 +440,7 @@ private:
     // graph size is the same as the previously scheduled one (unexpected) or different
     int32_t n_reallocs_same = 0;
     int32_t n_reallocs_diff = 0;
+    mutable std::atomic<uint64_t> pf_reallocs{0};
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

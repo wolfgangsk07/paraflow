@@ -2284,7 +2284,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             if (should_log) {
                 std::fprintf(
                     stderr,
-                    "ISSUE_PROFILE kind=%s calls=%llu reused=%llu total_ms=%.1f mem_ms=%.1f build_ms=%.1f alloc_ms=%.1f set_inp_ms=%.1f compute_ms=%.1f pf_fence_ms=%.1f post_ms=%.1f\n",
+                    "ISSUE_PROFILE kind=%s calls=%llu reused=%llu total_ms=%.1f mem_ms=%.1f build_ms=%.1f alloc_ms=%.1f set_inp_ms=%.1f compute_ms=%.1f pf_fence_ms=%.1f post_ms=%.1f reallocs=%llu\n",
                     idx ? "pf" : "dec",
                     (unsigned long long) snap.calls,
                     (unsigned long long) snap.reused,
@@ -2295,7 +2295,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     snap.set_inp_us / 1000.0,
                     snap.compute_us / 1000.0,
                     snap.pf_fence_us / 1000.0,
-                    snap.post_us / 1000.0);
+                    snap.post_us / 1000.0,
+                    (unsigned long long) (idx ? self.pf_reallocs.load(std::memory_order_relaxed) : 0));
             }
         }
     } prof_guard{*this, issue_prof_on, t_decode_start, t_loop_start, pf_fence_us};
@@ -3607,10 +3608,27 @@ llm_graph_params llama_context::graph_params(
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
-        /*.logits_topk =*/ n_outputs > 0 ? cur_logits_topk : 0,
+        /*.logits_topk =*/ n_outputs > 0
+                ? cur_logits_topk
+                : (decode_pipelined && (cur_sched() == prefill_sched.get() || gf_res_cur != nullptr)
+                        ? default_pipelined_logits_topk()
+                        : 0),
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
+}
+
+int32_t llama_context::default_pipelined_logits_topk() const {
+    return (!cparams.embeddings && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP && model.vocab.n_tokens() >= 128) ? 128 : 0;
+}
+
+void llama_context::pf_sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data) {
+    GGML_UNUSED(sched);
+    GGML_UNUSED(gf);
+    GGML_UNUSED(backend_ids_changed);
+    GGML_UNUSED(graph_size_changed);
+    auto * lctx = static_cast<llama_context *>(user_data);
+    lctx->pf_reallocs.fetch_add(1, std::memory_order_relaxed);
 }
 
 void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data) {

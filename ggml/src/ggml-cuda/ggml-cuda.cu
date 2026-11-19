@@ -3949,7 +3949,7 @@ static void ggml_cuda_graph_stats_maybe_log(ggml_backend_cuda_context * ctx, boo
     }
 }
 
-static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+static const void * ggml_cuda_graph_get_key(const ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
     // Key by leading structure/shapes + input src->data (to separate copy_slot 0 vs 1),
     // while keeping trailing nodes independent of shifting galloc/KV pointers so n_kv growth
     // reuses cached graphs via fast cudaGraphExecUpdate instead of re-instantiating.
@@ -3996,13 +3996,18 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     for (int i = tail_start; i < cgraph->n_nodes; ++i) {
         fold_tail(key, cgraph->nodes[i]);
     }
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        if (n->op == GGML_OP_FLASH_ATTN_EXT && !ggml_is_empty(n)) {
+            key = (key ^ (uintptr_t) ggml_cuda_flash_attn_ext_graph_key_tag(cuda_ctx->device, n)) * 0x9E3779B97F4A7C15ull;
+        }
+    }
     return (const void *) key;
 }
 
-static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
+static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const void * graph_key) {
     bool res = false;
 
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (cgraph->uid != 0 &&
@@ -6205,7 +6210,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
 #ifdef USE_CUDA_GRAPH
     if (!cuda_ctx->disable_cuda_graphs) {
-        graph_key = ggml_cuda_graph_get_key(cgraph);
+        graph_key = ggml_cuda_graph_get_key(cuda_ctx, cgraph);
 
         ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
@@ -6214,7 +6219,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
             if (graph_compatible) {
                 const int64_t t_ur0 = ggml_cuda_graph_stats_enabled() ? ggml_time_us() : 0;
-                const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+                const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph, graph_key);
                 if (ggml_cuda_graph_stats_enabled()) {
                     ggml_cuda_graph_stats().buckets[ggml_cuda_graph_stats_bucket(cuda_ctx)].upd_req_us.fetch_add(
                             (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_ur0), std::memory_order_relaxed);
@@ -6435,15 +6440,6 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         }
     }
 
-#ifdef USE_CUDA_GRAPH
-    const bool use_cuda_graph = !cuda_ctx->disable_cuda_graphs &&
-            ggml_cuda_graph_set_enabled(cuda_ctx, ggml_cuda_graph_get_key(cgraph));
-#else
-    const bool use_cuda_graph = false;
-    GGML_UNUSED(cuda_ctx);
-    GGML_UNUSED(cgraph);
-#endif
-
     static bool enable_graph_optimization = [] {
         const char * env     = getenv("GGML_CUDA_GRAPH_OPT");
         return env != nullptr && atoi(env) == 1;
@@ -6452,6 +6448,15 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     if (!enable_graph_optimization) {
         return;
     }
+
+#ifdef USE_CUDA_GRAPH
+    const bool use_cuda_graph = !cuda_ctx->disable_cuda_graphs &&
+            ggml_cuda_graph_set_enabled(cuda_ctx, ggml_cuda_graph_get_key(cuda_ctx, cgraph));
+#else
+    const bool use_cuda_graph = false;
+    GGML_UNUSED(cuda_ctx);
+    GGML_UNUSED(cgraph);
+#endif
 
     ggml_cuda_stream_context & stream_context = cuda_ctx->stream_context();
     stream_context.reset();

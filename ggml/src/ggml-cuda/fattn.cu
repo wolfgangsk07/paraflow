@@ -763,6 +763,67 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+uint64_t ggml_cuda_flash_attn_ext_graph_key_tag(int device, const ggml_tensor * dst) {
+    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
+
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
+
+    bool need_f16_K = false;
+    bool need_f16_V = false;
+    switch (kernel) {
+        case BEST_FATTN_KERNEL_TILE:
+        case BEST_FATTN_KERNEL_MMA_F16:
+            need_f16_K = true;
+            need_f16_V = true;
+            break;
+        case BEST_FATTN_KERNEL_VEC: {
+            const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
+            need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;
+            need_f16_V = V->type == GGML_TYPE_F32 || f16_fallback;
+        } break;
+        case BEST_FATTN_KERNEL_NONE:
+            break;
+    }
+
+    const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
+        ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V);
+    const bool convert = (need_f16_K && K->type != GGML_TYPE_F16) || (need_f16_V && V->type != GGML_TYPE_F16);
+    const int64_t n_chunks = f16_extra.chunked
+        ? ((K->ne[1] + f16_extra.chunk_len - 1) / f16_extra.chunk_len)
+        : 1;
+    const bool is_sparse = ggml_get_op_params_i32(dst, 4) > 0;
+    const bool k_aligned = (K->ne[1] % FATTN_KQ_STRIDE) == 0;
+    const int  mask_type = mask ? (int) mask->type : -1;
+
+    uint64_t tag = (uint64_t) kernel;
+    tag = (tag ^ (uint64_t) Q->ne[1])                    * 0x9E3779B97F4A7C15ull;
+    tag = (tag ^ (uint64_t) Q->ne[3])                    * 0x9E3779B97F4A7C15ull;
+    tag = (tag ^ (uint64_t) mask_type)                   * 0x9E3779B97F4A7C15ull;
+    tag = (tag ^ (uint64_t) (convert ? 1 : 0))           * 0x9E3779B97F4A7C15ull;
+    tag = (tag ^ (uint64_t) (f16_extra.chunked ? 1 : 0)) * 0x9E3779B97F4A7C15ull;
+    tag = (tag ^ (uint64_t) n_chunks)                    * 0x9E3779B97F4A7C15ull;
+    tag = (tag ^ (uint64_t) (is_sparse ? 1 : 0))         * 0x9E3779B97F4A7C15ull;
+    tag = (tag ^ (uint64_t) (k_aligned ? 1 : 0))         * 0x9E3779B97F4A7C15ull;
+
+    // For MMA/TILE with small query batches, short KV lengths can change stream-K fixup
+    // mode (none / uniform / general) or parallel_blocks combine launch.
+    // Never depend on K->ne[1] for decode VEC kernels (canonical_vec / non-chunked).
+    if (kernel != BEST_FATTN_KERNEL_VEC && Q->ne[1] < 256) {
+        const int64_t last_len = f16_extra.chunked
+            ? (K->ne[1] - (n_chunks - 1) * f16_extra.chunk_len)
+            : K->ne[1];
+        const int64_t last_bucket = last_len < 2048 ? ((last_len + FATTN_KQ_STRIDE - 1) / FATTN_KQ_STRIDE) : 9;
+        tag = (tag ^ (uint64_t) last_bucket) * 0x9E3779B97F4A7C15ull;
+    }
+
+    return tag;
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
