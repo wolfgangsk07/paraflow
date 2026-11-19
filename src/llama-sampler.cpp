@@ -2960,6 +2960,42 @@ static void llama_sampler_penalties_apply(struct llama_sampler * smpl, llama_tok
         return;
     }
 
+    auto apply_one = [&](llama_token_data & tok_data, int count) {
+        assert(count > 0 && count <= ctx->penalty_last_n);
+
+        // The academic publication that described this technique actually just only divided, but that would cause tokens with negative logits to become more likely, which is obviously wrong.
+        // This is common fix for this problem, which is to multiply by the penalty instead of dividing.
+        if (tok_data.logit <= 0) {
+            tok_data.logit *= ctx->penalty_repeat;
+        } else {
+            tok_data.logit /= ctx->penalty_repeat;
+        }
+
+        tok_data.logit -= float(count) * ctx->penalty_freq + float(count > 0) * ctx->penalty_present;
+    };
+
+    // Fast path for full-vocab unsorted candidate arrays (cur_p->data[id].id == id):
+    // O(|token_count|) instead of O(n_vocab) unordered_map lookups.
+    bool direct_indexed = (cur_p->size == (size_t) ctx->n_vocab && !cur_p->sorted &&
+                           ctx->token_count.size() * 4 < cur_p->size);
+    if (direct_indexed) {
+        for (const auto & kv : ctx->token_count) {
+            const llama_token tok = kv.first;
+            if (tok < 0 || (size_t) tok >= cur_p->size || cur_p->data[tok].id != tok) {
+                direct_indexed = false;
+                break;
+            }
+        }
+    }
+
+    if (direct_indexed) {
+        for (const auto & kv : ctx->token_count) {
+            apply_one(cur_p->data[kv.first], kv.second);
+        }
+        cur_p->sorted = false;
+        return;
+    }
+
     // Apply frequency and presence penalties to the cur_p
     for (size_t i = 0; i < cur_p->size; ++i) {
         const auto token_iter = ctx->token_count.find(cur_p->data[i].id);
@@ -2967,19 +3003,7 @@ static void llama_sampler_penalties_apply(struct llama_sampler * smpl, llama_tok
             continue;
         }
 
-        const int count = token_iter->second;
-
-        assert(count > 0 && count <= ctx->penalty_last_n);
-
-        // The academic publication that described this technique actually just only divided, but that would cause tokens with negative logits to become more likely, which is obviously wrong.
-        // This is common fix for this problem, which is to multiply by the penalty instead of dividing.
-        if (cur_p->data[i].logit <= 0) {
-            cur_p->data[i].logit *= ctx->penalty_repeat;
-        } else {
-            cur_p->data[i].logit /= ctx->penalty_repeat;
-        }
-
-        cur_p->data[i].logit -= float(count) * ctx->penalty_freq + float(count > 0) * ctx->penalty_present;
+        apply_one(cur_p->data[i], token_iter->second);
     }
 
     cur_p->sorted = false;

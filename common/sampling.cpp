@@ -50,15 +50,35 @@ static int32_t common_direct_topk_limit(const common_params_sampling & params, c
     llama_vocab_get_suppress_tokens(llama_model_get_vocab(model), &suppressed);
     if (suppressed != 0) { return 0; }
 
+    const bool penalties_active =
+        params.penalty_last_n != 0 &&
+        (params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f);
+    // Non-negative penalties with a finite window can only lower the logits of at most
+    // penalty_last_n distinct tokens, so every post-penalty top-K token is guaranteed to
+    // lie within the pre-penalty top-(K + penalty_last_n) candidates.
+    const bool penalties_monotone_bounded =
+        !penalties_active ||
+        (params.penalty_last_n > 0 &&
+         params.penalty_repeat >= 1.0f &&
+         params.penalty_freq >= 0.0f &&
+         params.penalty_present >= 0.0f);
+
     const bool tail_greedy = !params.samplers.empty() &&
         ((params.samplers.back() == COMMON_SAMPLER_TYPE_TEMPERATURE && params.temp == 0.0f && params.dynatemp_range == 0.0f) ||
          (params.samplers.back() == COMMON_SAMPLER_TYPE_TOP_K && params.top_k == 1));
     if (tail_greedy) {
         bool pure_greedy = true;
+        int32_t greedy_margin = 0;
         for (auto stage : params.samplers) {
             switch (stage) {
                 case COMMON_SAMPLER_TYPE_PENALTIES:
-                    if (params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f) { pure_greedy = false; }
+                    if (penalties_active) {
+                        if (penalties_monotone_bounded && 1 + params.penalty_last_n <= 128) {
+                            greedy_margin = std::max(greedy_margin, params.penalty_last_n);
+                        } else {
+                            pure_greedy = false;
+                        }
+                    }
                     break;
                 case COMMON_SAMPLER_TYPE_DRY:
                     if (params.dry_multiplier != 0.0f) { pure_greedy = false; }
@@ -88,15 +108,22 @@ static int32_t common_direct_topk_limit(const common_params_sampling & params, c
             }
             if (!pure_greedy) { break; }
         }
-        if (pure_greedy) { return 1; }
+        if (pure_greedy) { return 1 + greedy_margin; }
     }
 
     if (params.top_k <= 0 || params.top_k > 128) { return 0; }
+    int32_t margin = 0;
     for (auto stage : params.samplers) {
         switch (stage) {
-            case COMMON_SAMPLER_TYPE_TOP_K: return params.top_k;
+            case COMMON_SAMPLER_TYPE_TOP_K:
+                return params.top_k + margin <= 128 ? params.top_k + margin : 0;
             case COMMON_SAMPLER_TYPE_PENALTIES:
-                if (params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f) { return 0; }
+                if (penalties_active) {
+                    if (!penalties_monotone_bounded || params.top_k + params.penalty_last_n > 128) {
+                        return 0;
+                    }
+                    margin = std::max(margin, params.penalty_last_n);
+                }
                 break;
             case COMMON_SAMPLER_TYPE_DRY:
                 if (params.dry_multiplier != 0.0f) { return 0; }
