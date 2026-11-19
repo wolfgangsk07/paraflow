@@ -865,6 +865,19 @@ struct ggml_backend_cuda_buffer_context {
     bool sparse_failed = false;
     bool sparse_elastic_pool = false;
     std::vector<uint64_t> sparse_owners;
+    std::vector<std::vector<size_t>> sparse_owner_pages;
+    std::vector<size_t> sparse_mapped_pages;
+    std::vector<size_t> sparse_mapped_pos;
+    uint32_t sparse_stamp = 0;
+    std::vector<uint32_t> sparse_data_stamp;
+    std::vector<uint32_t> sparse_access_stamp;
+    std::vector<uint32_t> sparse_padding_stamp;
+    std::vector<size_t> sparse_padding_dist;
+    std::vector<size_t> sparse_touched_data;
+    std::vector<size_t> sparse_touched_access;
+    std::vector<size_t> sparse_touched_padding;
+    std::vector<std::pair<size_t, uint32_t>> sparse_references;
+    std::vector<uint32_t> sparse_referenced_owners;
     std::vector<CUmemGenericAllocationHandle> sparse_free_handles;
     CUmemGenericAllocationHandle sparse_zero_handle = 0;
     std::mutex sparse_mutex;
@@ -1163,8 +1176,37 @@ static bool ggml_cuda_vmm_init_sparse_kv(
         chunk.size = ctx->vmm_chunk_size;
     }
     ctx->sparse_owners.assign(n_chunks * ctx->sparse_owner_words, 0);
+    ctx->sparse_owner_pages.assign(n_owners, {});
+    ctx->sparse_mapped_pages.clear();
+    ctx->sparse_mapped_pos.assign(n_chunks, SIZE_MAX);
+    ctx->sparse_stamp = 0;
+    ctx->sparse_data_stamp.assign(n_chunks, 0);
+    ctx->sparse_access_stamp.assign(n_chunks, 0);
+    ctx->sparse_padding_stamp.assign(n_chunks, 0);
+    ctx->sparse_padding_dist.assign(n_chunks, 0);
 
     return true;
+}
+
+static void ggml_cuda_sparse_track_mapped(
+        ggml_backend_cuda_buffer_context * ctx,
+        size_t page) {
+    GGML_ASSERT(ctx->sparse_mapped_pos[page] == SIZE_MAX);
+    ctx->sparse_mapped_pos[page] = ctx->sparse_mapped_pages.size();
+    ctx->sparse_mapped_pages.push_back(page);
+}
+
+static void ggml_cuda_sparse_untrack_mapped(
+        ggml_backend_cuda_buffer_context * ctx,
+        size_t page) {
+    const size_t pos = ctx->sparse_mapped_pos[page];
+    if (pos != SIZE_MAX) {
+        const size_t back = ctx->sparse_mapped_pages.back();
+        ctx->sparse_mapped_pages[pos] = back;
+        ctx->sparse_mapped_pos[back] = pos;
+        ctx->sparse_mapped_pages.pop_back();
+        ctx->sparse_mapped_pos[page] = SIZE_MAX;
+    }
 }
 
 static bool ggml_cuda_sparse_page_has_owner(
@@ -1215,6 +1257,7 @@ static bool ggml_cuda_sparse_unmap_pages(
             return false;
         }
         chunk.mapped = false;
+        ggml_cuda_sparse_untrack_mapped(ctx, page);
         if (chunk.sparse_zero_alias) {
             GGML_ASSERT(chunk.handle == 0);
             chunk.sparse_zero_alias = false;
@@ -1372,13 +1415,13 @@ static bool ggml_cuda_sparse_trim_elastic_free(ggml_backend_cuda_buffer_context 
 
 static std::vector<size_t> ggml_cuda_sparse_unused_pages(
         const ggml_backend_cuda_buffer_context * ctx,
-        const std::vector<uint8_t> * exclude = nullptr) {
+        uint32_t exclude_data_stamp = 0) {
     std::vector<size_t> result;
-    for (size_t page = 0; page < ctx->vmm_chunks.size(); ++page) {
+    for (size_t page : ctx->sparse_mapped_pages) {
         if (!ctx->vmm_chunks[page].mapped || ggml_cuda_sparse_page_has_owner(ctx, page)) {
             continue;
         }
-        if (exclude != nullptr && (*exclude)[page]) {
+        if (exclude_data_stamp != 0 && ctx->sparse_data_stamp[page] == exclude_data_stamp) {
             continue;
         }
         result.push_back(page);
@@ -1419,6 +1462,7 @@ static bool ggml_cuda_sparse_map_page(
         return false;
     }
 
+    ggml_cuda_sparse_track_mapped(ctx, page);
     ctx->sparse_committed_bytes += chunk.size;
     return true;
 }
@@ -1451,6 +1495,7 @@ static bool ggml_cuda_sparse_map_zero_alias(
         }
         return false;
     }
+    ggml_cuda_sparse_track_mapped(ctx, page);
     return true;
 }
 
@@ -1485,11 +1530,25 @@ bool ggml_backend_cuda_sparse_kv_ensure(
         return false;
     }
 
-    std::vector<std::pair<size_t, uint32_t>> references;
-    std::vector<uint32_t> referenced_owners;
-    std::vector<uint8_t> data_requested(ctx->vmm_chunks.size(), 0);
-    std::vector<uint8_t> access_requested(ctx->vmm_chunks.size(), 0);
-    std::map<size_t, size_t> padding_distance;
+    uint32_t stamp = ++ctx->sparse_stamp;
+    if (stamp == 0) {
+        std::fill(ctx->sparse_data_stamp.begin(), ctx->sparse_data_stamp.end(), 0);
+        std::fill(ctx->sparse_access_stamp.begin(), ctx->sparse_access_stamp.end(), 0);
+        std::fill(ctx->sparse_padding_stamp.begin(), ctx->sparse_padding_stamp.end(), 0);
+        stamp = ++ctx->sparse_stamp;
+    }
+
+    auto & references        = ctx->sparse_references;
+    auto & referenced_owners = ctx->sparse_referenced_owners;
+    auto & touched_data      = ctx->sparse_touched_data;
+    auto & touched_access    = ctx->sparse_touched_access;
+    auto & touched_padding   = ctx->sparse_touched_padding;
+    references.clear();
+    referenced_owners.clear();
+    touched_data.clear();
+    touched_access.clear();
+    touched_padding.clear();
+
     for (size_t range = 0; range < n_ranges; ++range) {
         if (owners[range] >= ctx->sparse_n_owners) {
             GGML_LOG_ERROR("%s: sparse-KV owner %u is outside [0, %u)\n",
@@ -1513,7 +1572,10 @@ bool ggml_backend_cuda_sparse_kv_ensure(
                     ctx->vmm_granularity;
             for (size_t page = first; page <= last; ++page) {
                 references.emplace_back(page, owners[range]);
-                data_requested[page] = 1;
+                if (ctx->sparse_data_stamp[page] != stamp) {
+                    ctx->sparse_data_stamp[page] = stamp;
+                    touched_data.push_back(page);
+                }
             }
         }
         if (accessible_sizes[range] != 0) {
@@ -1524,7 +1586,10 @@ bool ggml_backend_cuda_sparse_kv_ensure(
             const bool can_premap_frontier = !ctx->sparse_elastic_pool && resident_sizes[range] != 0;
             const size_t max_premap_distance = 2 * ctx->vmm_granularity;
             for (size_t page = first; page <= last; ++page) {
-                access_requested[page] = 1;
+                if (ctx->sparse_access_stamp[page] != stamp) {
+                    ctx->sparse_access_stamp[page] = stamp;
+                    touched_access.push_back(page);
+                }
                 if (!can_premap_frontier) {
                     continue;
                 }
@@ -1533,9 +1598,12 @@ bool ggml_backend_cuda_sparse_kv_ensure(
                 if (distance >= max_premap_distance) {
                     continue;
                 }
-                const auto it = padding_distance.find(page);
-                if (it == padding_distance.end() || distance < it->second) {
-                    padding_distance[page] = distance;
+                if (ctx->sparse_padding_stamp[page] != stamp) {
+                    ctx->sparse_padding_stamp[page] = stamp;
+                    ctx->sparse_padding_dist[page] = distance;
+                    touched_padding.push_back(page);
+                } else if (distance < ctx->sparse_padding_dist[page]) {
+                    ctx->sparse_padding_dist[page] = distance;
                 }
             }
         }
@@ -1553,10 +1621,7 @@ bool ggml_backend_cuda_sparse_kv_ensure(
     // storage. Read-only padding pages alias one shared zero allocation.
     size_t data_needed = 0;
     std::vector<size_t> pages_to_unmap;
-    for (size_t page = 0; page < ctx->vmm_chunks.size(); ++page) {
-        if (!data_requested[page]) {
-            continue;
-        }
+    for (size_t page : touched_data) {
         const auto & chunk = ctx->vmm_chunks[page];
         if (!chunk.mapped || chunk.sparse_zero_alias) {
             ++data_needed;
@@ -1570,7 +1635,7 @@ bool ggml_backend_cuda_sparse_kv_ensure(
         (void) ggml_cuda_sparse_grow_elastic_pool(ctx, data_needed);
     }
     if (data_needed > ctx->sparse_free_handles.size()) {
-        const auto recyclable = ggml_cuda_sparse_unused_pages(ctx, &data_requested);
+        const auto recyclable = ggml_cuda_sparse_unused_pages(ctx, stamp);
         g_sparse_recycled += recyclable.size();
         pages_to_unmap.insert(pages_to_unmap.end(), recyclable.begin(), recyclable.end());
     }
@@ -1581,8 +1646,8 @@ bool ggml_backend_cuda_sparse_kv_ensure(
     }
 
     std::vector<size_t> missing_data;
-    for (size_t page = 0; page < ctx->vmm_chunks.size(); ++page) {
-        if (data_requested[page] && !ctx->vmm_chunks[page].mapped) {
+    for (size_t page : touched_data) {
+        if (!ctx->vmm_chunks[page].mapped) {
             missing_data.push_back(page);
         }
     }
@@ -1614,11 +1679,12 @@ bool ggml_backend_cuda_sparse_kv_ensure(
     // device-synchronizing unmap/recycle stall. Farther or empty-stream padding
     // uses the shared read-only zero alias.
     std::vector<std::pair<size_t, size_t>> padding_priority;
-    padding_priority.reserve(padding_distance.size());
-    for (const auto & [page, distance] : padding_distance) {
-        if (access_requested[page] && !data_requested[page] &&
+    padding_priority.reserve(touched_padding.size());
+    for (size_t page : touched_padding) {
+        if (ctx->sparse_access_stamp[page] == stamp &&
+                ctx->sparse_data_stamp[page] != stamp &&
                 !ctx->vmm_chunks[page].mapped) {
-            padding_priority.emplace_back(distance, page);
+            padding_priority.emplace_back(ctx->sparse_padding_dist[page], page);
         }
     }
     std::sort(padding_priority.begin(), padding_priority.end());
@@ -1661,8 +1727,8 @@ bool ggml_backend_cuda_sparse_kv_ensure(
     }
 
     std::vector<size_t> created_aliases;
-    for (size_t page = 0; page < ctx->vmm_chunks.size(); ++page) {
-        if (!access_requested[page] || data_requested[page] || ctx->vmm_chunks[page].mapped) {
+    for (size_t page : touched_access) {
+        if (ctx->sparse_data_stamp[page] == stamp || ctx->vmm_chunks[page].mapped) {
             continue;
         }
         if (!ggml_cuda_sparse_map_zero_alias(ctx, page)) {
@@ -1678,16 +1744,19 @@ bool ggml_backend_cuda_sparse_kv_ensure(
     // set. Delaying this until every requested mapping is ready preserves the
     // old references if allocation or initialization fails.
     for (uint32_t owner : referenced_owners) {
+        auto & owned = ctx->sparse_owner_pages[owner];
         const size_t word = owner / 64u;
         const uint64_t mask = ~(uint64_t{1} << (owner % 64u));
-        for (size_t page = 0; page < ctx->vmm_chunks.size(); ++page) {
+        for (size_t page : owned) {
             ctx->sparse_owners[page * ctx->sparse_owner_words + word] &= mask;
         }
+        owned.clear();
     }
     for (const auto & [page, owner] : references) {
         const size_t word = owner / 64u;
         const uint64_t mask = uint64_t{1} << (owner % 64u);
         ctx->sparse_owners[page * ctx->sparse_owner_words + word] |= mask;
+        ctx->sparse_owner_pages[owner].push_back(page);
     }
 
     return true;
@@ -1705,11 +1774,16 @@ bool ggml_backend_cuda_sparse_kv_release_owner(
     }
 
     std::lock_guard<std::mutex> lock(ctx->sparse_mutex);
+    auto & owned = ctx->sparse_owner_pages[owner];
+    if (owned.empty()) {
+        return true;
+    }
     const size_t word = owner / 64u;
     const uint64_t mask = ~(uint64_t{1} << (owner % 64u));
-    for (size_t page = 0; page < ctx->vmm_chunks.size(); ++page) {
+    for (size_t page : owned) {
         ctx->sparse_owners[page * ctx->sparse_owner_words + word] &= mask;
     }
+    owned.clear();
     return true;
 }
 

@@ -167,6 +167,8 @@ llama_kv_cache::llama_kv_cache(
         v_heads[s] = 0;
     }
 
+    v_stream_released.assign(n_stream, 1);
+
     v_cells.resize(n_stream);
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].resize(kv_size);
@@ -672,6 +674,7 @@ void llama_kv_cache::clear(bool data) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
+        std::fill(v_stream_released.begin(), v_stream_released.end(), 1);
     } else {
         release_empty_streams();
     }
@@ -710,6 +713,9 @@ bool llama_kv_cache::release_stream(uint32_t stream) {
     if (!dynamic) {
         return true;
     }
+    if (stream < v_stream_released.size() && v_stream_released[stream]) {
+        return true;
+    }
 
 #ifdef GGML_USE_CUDA
     bool success = true;
@@ -717,6 +723,9 @@ bool llama_kv_cache::release_stream(uint32_t stream) {
         if (!ggml_backend_cuda_sparse_kv_release_owner(buffer.get(), stream)) {
             success = false;
         }
+    }
+    if (success && stream < v_stream_released.size()) {
+        v_stream_released[stream] = 1;
     }
     return success;
 #else
@@ -732,6 +741,9 @@ void llama_kv_cache::release_empty_streams() {
 
     for (uint32_t stream = 0; stream < n_stream; ++stream) {
         if (v_cells[stream].get_used() != 0) {
+            continue;
+        }
+        if (stream < v_stream_released.size() && v_stream_released[stream]) {
             continue;
         }
         if (!release_stream(stream)) {
@@ -1971,6 +1983,9 @@ bool llama_kv_cache::ensure_mapped(const slot_info & sinfo, uint32_t n_kv) {
     // resident; graph-only padding is mapped through the shared zero page.
     for (uint32_t stream = sinfo.s0; stream <= sinfo.s1; ++stream) {
         const uint32_t n_kv_stream = get_n_kv_for_stream(sinfo, stream);
+        if (n_kv_stream > 0 && stream < v_stream_released.size()) {
+            v_stream_released[stream] = 0;
+        }
         for (const auto & layer : layers) {
             if (!append(layer.k_stream[stream], stream, n_kv_stream) ||
                     !append(layer.v_stream[stream], stream, n_kv_stream)) {

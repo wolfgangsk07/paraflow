@@ -351,6 +351,9 @@ private:
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
     std::vector<uint32_t> v_heads;
 
+    // tracks whether each stream's sparse-KV owner pages are already known to be released
+    std::vector<uint8_t> v_stream_released;
+
     // TODO: temporary until we refactor to be able to share the same cells between 2 kv caches [TAG_KV_CACHE_SHARE_CELLS]
     llama_kv_cache * other;
 
