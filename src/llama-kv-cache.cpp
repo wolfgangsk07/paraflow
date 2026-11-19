@@ -519,8 +519,12 @@ bool llama_kv_cache::configure_dynamic_pool() {
 #ifndef GGML_USE_CUDA
     return false;
 #else
-    // A NextN-only draft cache grows its physical page pool on demand instead of reserving its budget.
-    const bool elastic_mtp = !other &&
+    // Pre-allocate the MTP draft KV physical pool upfront by default so startup
+    // guarantees full-capacity residency (no runtime draft_elastic_oom).
+    // Opt-in elastic growth remains available via PARAFLOW_MTP_ELASTIC_KV=1.
+    const char * elastic_env = std::getenv("PARAFLOW_MTP_ELASTIC_KV");
+    const bool allow_elastic = elastic_env != nullptr && std::strcmp(elastic_env, "1") == 0;
+    const bool elastic_mtp = allow_elastic && !other &&
             hparams.n_layer_nextn > 0 && hparams.n_layer() > 0 && !layers.empty() &&
             std::all_of(layers.begin(), layers.end(), [&](const auto & layer) {
                 return layer.il >= hparams.n_layer();

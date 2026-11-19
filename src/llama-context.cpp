@@ -2434,22 +2434,32 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         // the graph is reused across decodes instead of rebuilt, which keeps the
         // tensor objects stable for backend graph capture. slots are keyed by lane
         // (graph reuse needs an identical sequence set, which only holds per lane);
-        // out-of-lane decodes share the last slot. larger batches (prompt processing)
-        // keep the main sched and its rebuild-per-decode behavior.
+        // untagged or fallback decodes reuse the already-reserved prefill_sched
+        // instead of waking unreserved lazy_primary / lazy_global allocators at runtime.
         if (!tk->fallback && n_tokens_all <= cparams.n_outputs_max) {
-            const int slot = pipe_lane_hint >= 0 ? pipe_lane_hint % (n_pipe_scheds - 1)
-                                                 : n_pipe_scheds - 1;
-            if (pipe_scheds[slot]) {
-                sched_cur  = pipe_scheds[slot].get();
-                gf_res_cur = pipe_gf_res[slot].get();
+            if (pipe_lane_hint >= 0) {
+                const int slot = pipe_lane_hint % (n_pipe_scheds - 1);
+                if (pipe_scheds[slot]) {
+                    sched_cur  = pipe_scheds[slot].get();
+                    gf_res_cur = pipe_gf_res[slot].get();
+                }
+            } else if (prefill_sched) {
+                sched_cur       = prefill_sched.get();
+                gf_res_cur      = prefill_gf_res.get();
+                pf_cur_backends = &prefill_backend_ptrs;
+                pf_cur          = true;
+            } else if (pipe_scheds[n_pipe_scheds - 1]) {
+                sched_cur  = pipe_scheds[n_pipe_scheds - 1].get();
+                gf_res_cur = pipe_gf_res[n_pipe_scheds - 1].get();
             }
         }
     }
 
-    // prompt-sized pipelined decodes (interleaved chunks) run on a dedicated parallel
-    // sched so that consecutive chunks overlap across the pipeline stages.
+    // prompt-sized pipelined decodes (interleaved chunks) and fallback batches run
+    // on the dedicated prefill sched so consecutive chunks overlap and lazy_primary
+    // never triggers surprise runtime allocations.
     if (decode_pipelined && prefill_sched &&
-            (n_tokens_all > cparams.n_outputs_max || (pipe_lane_hint >= 0 && n_outputs_all < n_tokens_all))) {
+            (tk->fallback || n_tokens_all > cparams.n_outputs_max || (pipe_lane_hint >= 0 && n_outputs_all < n_tokens_all))) {
         sched_cur       = prefill_sched.get();
         gf_res_cur      = prefill_gf_res.get();
         pf_cur_backends = &prefill_backend_ptrs;
@@ -3374,20 +3384,22 @@ ggml_cgraph * llama_context::graph_reserve(
         }
         ~recurrent_reserve_scope() { llama_recurrent_reserve_sequences = prior; }
     } reserve_rs_scope(n_seqs);
-    // Target dynamic KV reserves a small initial workspace. Keep the MTP
-    // workspace fully reserved: bounded reservation caused persistent draft
-    // acceptance loss after interleaved requests. Stored KV is unchanged.
+    // With chunked F16 K/V conversion + compact prefix kq_mask, FlashAttention workspace
+    // is O(1) in n_kv, so dynamic KV can reserve at the true max n_kv without wasting VRAM
+    // or suffering runtime reallocations. Keep bounded 2048 reserve only for caches that
+    // cannot use the compact mask (e.g. non-FA, SWA, ALiBi, DSA).
     struct bounded_kv_reserve_scope {
         llama_kv_cache_context * kv = nullptr;
         uint32_t prior = 0;
         ~bounded_kv_reserve_scope() { if (kv) kv->set_reserve_n_kv(prior); }
     } bounded_kv;
     if (cparams.kv_dynamic && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
-        bounded_kv.kv = const_cast<llama_kv_cache_context *>(dynamic_cast<const llama_kv_cache_context *>(mctx));
+        auto * kv_ctx = const_cast<llama_kv_cache_context *>(dynamic_cast<const llama_kv_cache_context *>(mctx));
         if (auto * hybrid = dynamic_cast<const llama_memory_hybrid_context *>(mctx)) {
-            bounded_kv.kv = const_cast<llama_kv_cache_context *>(hybrid->get_attn());
+            kv_ctx = const_cast<llama_kv_cache_context *>(hybrid->get_attn());
         }
-        if (bounded_kv.kv) {
+        if (kv_ctx && !kv_ctx->can_use_compact_kq_mask(ubatch, model.hparams, cparams)) {
+            bounded_kv.kv = kv_ctx;
             bounded_kv.prior = bounded_kv.kv->get_n_kv();
             bounded_kv.kv->set_reserve_n_kv(std::min<uint32_t>(bounded_kv.prior, 2048));
         }
@@ -4497,6 +4509,21 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_context::pipeline_auxiliary_m
             auto scheduler = pf_generation->scheduler.get();
             result[ggml_backend_sched_get_buffer_type(scheduler, backend)] +=
                     ggml_backend_sched_get_buffer_size(scheduler, backend);
+        }
+    }
+    for (const auto & ps : pipe_scheds) {
+        if (!ps) {
+            continue;
+        }
+        for (auto backend : backend_ptrs) {
+            result[ggml_backend_sched_get_buffer_type(ps.get(), backend)] +=
+                    ggml_backend_sched_get_buffer_size(ps.get(), backend);
+        }
+    }
+    if (prefill_sched) {
+        for (auto backend : prefill_backend_ptrs) {
+            result[ggml_backend_sched_get_buffer_type(prefill_sched.get(), backend)] +=
+                    ggml_backend_sched_get_buffer_size(prefill_sched.get(), backend);
         }
     }
     return result;
