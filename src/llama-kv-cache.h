@@ -196,6 +196,10 @@ public:
 
     bool get_has_shift() const;
 
+    llama_swa_type get_swa_type() const { return swa_type; }
+    bool supports_compact_kq_mask() const;
+    bool is_stream_prefix_monotonic(llama_seq_id seq_id, bool is_2d) const;
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 
@@ -476,6 +480,8 @@ public:
     void set_reserve_n_kv(uint32_t value);
 
     uint32_t get_n_kv() const;
+
+    bool can_use_compact_kq_mask(const llama_ubatch & ubatch, const llama_hparams & hparams, const llama_cparams & cparams) const;
 
     // first and last KV stream of the current ubatch; the K/V views of a graph are built at this offset
     uint32_t get_s0() const;

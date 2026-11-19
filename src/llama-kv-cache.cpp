@@ -1856,6 +1856,33 @@ bool llama_kv_cache::get_has_shift() const {
     return result;
 }
 
+bool llama_kv_cache::supports_compact_kq_mask() const {
+    if (ctxs_bufs.empty()) {
+        return false;
+    }
+    for (const auto & [_, buf] : ctxs_bufs) {
+        if (!buf) {
+            return false;
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
+        const char * name = ggml_backend_buft_name(buft);
+        const bool is_cuda = name != nullptr && std::strncmp(name, "CUDA", 4) == 0;
+        const bool is_host = ggml_backend_buft_is_host(buft);
+        if (!is_cuda && !is_host) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool llama_kv_cache::is_stream_prefix_monotonic(llama_seq_id seq_id, bool is_2d) const {
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return false;
+    }
+    const auto & cells = v_cells[seq_to_stream[seq_id]];
+    return cells.is_prefix_monotonic(seq_id, is_2d);
+}
+
 ggml_type llama_kv_cache::type_k() const {
     return layers[0].k->type;
 }
@@ -2505,6 +2532,30 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
     };
+
+    if (dst->type == GGML_TYPE_I32) {
+        GGML_ASSERT(dst->ne[0] == 1);
+        const int64_t n_kv_eff = dst->op_params[2];
+        const bool is_2d = ubatch->is_pos_2d();
+        int32_t * data = (int32_t *) dst->data;
+
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            for (uint32_t ii = 0; ii < n_tps; ++ii) {
+                const uint32_t i = s*n_tps + ii;
+                const llama_seq_id seq_id = ubatch->seq_id[i][0];
+                const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+                const llama_pos p1   = ubatch->pos[i];
+                const llama_pos p1_x = is_2d ? ubatch->pos[i + ubatch->n_tokens*2] : 0;
+                const llama_pos p1_y = is_2d ? ubatch->pos[i + ubatch->n_tokens]   : 0;
+                uint32_t lim = cells.prefix_upper_bound(p1, p1_x, p1_y, is_2d);
+                if ((int64_t) lim > n_kv_eff) {
+                    lim = (uint32_t) n_kv_eff;
+                }
+                data[i] = (int32_t) lim;
+            }
+        }
+        return;
+    }
 
     if (dst->type == GGML_TYPE_F16) {
         set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data, causal_attn);
@@ -3671,6 +3722,63 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
+}
+
+bool llama_kv_cache_context::can_use_compact_kq_mask(
+        const llama_ubatch & ubatch,
+        const llama_hparams & hparams,
+        const llama_cparams & cparams) const {
+    if (!cparams.flash_attn || cparams.kv_unified) {
+        return false;
+    }
+    if (hparams.use_alibi || hparams.f_max_alibi_bias != 0.0f ||
+            hparams.n_rel_attn_bkts > 0 || hparams.indexer_n_head > 0) {
+        return false;
+    }
+    for (uint32_t il = 0; il < hparams.n_layer_all && il < LLAMA_MAX_LAYERS; ++il) {
+        if (hparams.dsv4_compress_ratios[il] > 0) {
+            return false;
+        }
+    }
+    if (kv->get_swa_type() != LLAMA_SWA_TYPE_NONE) {
+        return false;
+    }
+    bool causal_attn = cparams.causal_attn;
+    if (!causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_ONLY) {
+        causal_attn = true;
+    }
+    if (!causal_attn) {
+        return false;
+    }
+    if (!kv->supports_compact_kq_mask()) {
+        return false;
+    }
+
+    // Dummy full-cache context used during graph reservation: reserve the O(1) compact mask.
+    if (ubatches.empty() || ubatch.seq_id == nullptr) {
+        return true;
+    }
+
+    const uint32_t n_stream = ubatch.n_seqs_unq;
+    if (n_stream == 0 || ubatch.n_tokens == 0 || ubatch.n_tokens % n_stream != 0) {
+        return false;
+    }
+    const uint32_t n_tps = ubatch.n_tokens / n_stream;
+    const bool is_2d = ubatch.is_pos_2d();
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        const llama_seq_id seq0 = ubatch.seq_id[s*n_tps][0];
+        if (!kv->is_stream_prefix_monotonic(seq0, is_2d)) {
+            return false;
+        }
+        for (uint32_t ii = 1; ii < n_tps; ++ii) {
+            if (ubatch.seq_id[s*n_tps + ii][0] != seq0) {
+                return false;
+            }
+        }
+    }
+
+    return true;
 }
 
 uint32_t llama_kv_cache_context::get_s0() const {

@@ -9024,7 +9024,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             memset(VKQ32, 0, DV*sizeof(float));
         }
 
-        const ggml_fp16_t * mp = mask ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
+        const bool mask_is_prefix = mask && mask->type == GGML_TYPE_I32;
+        const ggml_fp16_t * mp = (mask && !mask_is_prefix) ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
+        const int32_t prefix_lim = mask_is_prefix ? *(const int32_t *)((const char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : 0;
+        const int64_t ic_end_eff = mask_is_prefix ? std::min<int64_t>(ic_end, std::max<int32_t>(0, prefix_lim)) : ic_end;
 
         // k indices
         const int ik3 = iq3 / rk3;
@@ -9041,7 +9044,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
-        for (int64_t ic = ic_start; ic < ic_end; ++ic) {
+        for (int64_t ic = ic_start; ic < ic_end_eff; ++ic) {
             const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
             if (mv == -INFINITY) {
                 continue;

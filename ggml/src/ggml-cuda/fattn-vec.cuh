@@ -39,7 +39,9 @@ static __global__ void flash_attn_ext_vec(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33) {
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+        float2     * dst_out_meta_ptr,
+        const int32_t mask_k_offset) {
     ggml_cuda_pdl_lc();
 #ifdef FLASH_ATTN_AVAILABLE
     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
@@ -61,7 +63,8 @@ static __global__ void flash_attn_ext_vec(
                   nb11, nb12, nb13,
                   nb21, nb22, nb23,
                   ne31, ne32, ne33,
-                  nb31, nb32, nb33);
+                  nb31, nb32, nb33,
+            dst_out_meta_ptr, mask_k_offset);
         NO_DEVICE_CODE;
         return;
     }
@@ -110,7 +113,8 @@ static __global__ void flash_attn_ext_vec(
     K += nb13*(sequence % ne13) + nb12*(head / gqa_ratio);
     V += nb23*(sequence % ne13) + nb22*(head / gqa_ratio);
 
-    const half * maskh  = (const half  *) (mask + nb33*(sequence % ne33) + nb31*ic0);
+    const half * maskh       = (const half *) (mask + nb33*(sequence % ne33) + nb31*ic0);
+    const int32_t * mask_i32 = mask ? (const int32_t *) (mask + nb33*(sequence % ne33) + nb31*ic0) : nullptr;
 
     const float slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
 
@@ -278,7 +282,12 @@ static __global__ void flash_attn_ext_vec(
                 }
 
                 if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
-                    sum += slope*__half2float(maskh[j*(nb31 / sizeof(half)) + i_KQ]);
+                    if (mask_k_offset >= 0) {
+                        const int32_t lim = mask_i32[j] - mask_k_offset;
+                        sum += (k_VKQ_0 + i_KQ < lim) ? 0.0f : -INFINITY;
+                    } else {
+                        sum += slope*__half2float(maskh[j*(nb31 / sizeof(half)) + i_KQ]);
+                    }
                 }
 
                 KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
@@ -495,7 +504,7 @@ static __global__ void flash_attn_ext_vec(
                         dst_val += float(KQ[w*V_cols_per_iter*D + v*D + i0 + tid]);
                     }
                 }
-                if (gridDim.y == 1) {
+                if (gridDim.y == 1 && dst_out_meta_ptr == nullptr) {
                     dst_val /= KQ_sum[j_VKQ];
                 }
                 dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] = dst_val;
@@ -510,6 +519,8 @@ static __global__ void flash_attn_ext_vec(
 
     if (gridDim.y != 1 && tid < ncols && (ncols == 1 || ic0 + tid < int(ne01.z))) {
         dst_meta[((sequence*int(ne01.z) + ic0 + tid)*ne02 + head)*gridDim.y + blockIdx.y] = make_float2(KQ_max[tid], KQ_sum[tid]);
+    } else if (gridDim.y == 1 && dst_out_meta_ptr != nullptr && tid < ncols && (ncols == 1 || ic0 + tid < int(ne01.z))) {
+        dst_out_meta_ptr[(sequence*int(ne01.z) + ic0 + tid)*ne02 + head] = make_float2(KQ_max[tid], KQ_sum[tid]);
     }
 #else
     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
@@ -520,7 +531,8 @@ static __global__ void flash_attn_ext_vec(
               nb11, nb12, nb13,
               nb21, nb22, nb23,
               ne31, ne32, ne33,
-              nb31, nb32, nb33);
+              nb31, nb32, nb33,
+        dst_out_meta_ptr, mask_k_offset);
     NO_DEVICE_CODE;
 #endif // FLASH_ATTN_AVAILABLE
 }

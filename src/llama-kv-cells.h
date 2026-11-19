@@ -46,6 +46,8 @@ public:
         }
 
         has_shift = false;
+        n_inv_1d  = 0;
+        n_inv_2d  = 0;
 
         used.clear();
 
@@ -181,9 +183,11 @@ public:
                 seq_pos_rm(i + j);
             }
 
+            inv_update_cell(idx, -1);
             pos[idx] = other.pos[j];
             ext[idx] = other.ext[j];
             seq[idx] = other.seq[j];
+            inv_update_cell(idx, +1);
 
             if (pos[idx] != -1) {
                 seq_pos_add(i + j);
@@ -212,9 +216,11 @@ public:
                 seq_pos_rm(idx);
             }
 
+            inv_update_cell(idx, -1);
             pos[idx] = other.pos[j];
             ext[idx] = other.ext[j];
             seq[idx] = other.seq[j];
+            inv_update_cell(idx, +1);
 
             if (pos[idx] != -1) {
                 seq_pos_add(idx);
@@ -232,9 +238,11 @@ public:
         seq_pos_rm(i);
         seq[i].reset();
 
+        inv_update_cell(i, -1);
         pos[i] = -1;
         ext[i].reset();
         shift[i] = 0;
+        inv_update_cell(i, +1);
 
         used.erase(i);
     }
@@ -251,9 +259,11 @@ public:
         seq_pos_dec(seq_id, i);
 
         if (seq[i].none()) {
+            inv_update_cell(i, -1);
             pos[i] = -1;
             ext[i].reset();
             shift[i] = 0;
+            inv_update_cell(i, +1);
 
             used.erase(i);
 
@@ -281,9 +291,11 @@ public:
             seq_pos_rm(i);
             seq[i].reset();
 
+            inv_update_cell(i, -1);
             pos[i] = -1;
             ext[i].reset();
             shift[i] = 0;
+            inv_update_cell(i, +1);
 
             used.erase(i);
 
@@ -432,14 +444,18 @@ public:
         assert(pos[i] == -1);
         assert(seq[i].none());
 
+        inv_update_cell(i, -1);
         pos[i] = p;
+        inv_update_cell(i, +1);
 
         used.insert(i);
     }
 
     void ext_set(uint32_t i, llama_kv_cell_ext p) {
         assert(i < ext.size());
+        inv_update_cell(i, -1);
         ext[i] = p;
+        inv_update_cell(i, +1);
     }
 
     // pos[i] = pos[i] + d
@@ -451,6 +467,7 @@ public:
 
         seq_pos_rm(i);
 
+        inv_update_cell(i, -1);
         pos[i]   += d;
         shift[i] += d;
 
@@ -459,13 +476,16 @@ public:
         if (pos[i] < 0) {
             seq[i].reset();
             pos[i] = -1;
+            ext[i].reset();
             shift[i] = 0;
+            inv_update_cell(i, +1);
 
             used.erase(i);
 
             return true;
         }
 
+        inv_update_cell(i, +1);
         seq_pos_add(i);
 
         return false;
@@ -482,16 +502,75 @@ public:
 
         seq_pos_rm(i);
 
+        inv_update_cell(i, -1);
         pos[i]   /= d;
         shift[i] += p_old - pos[i];
+        inv_update_cell(i, +1);
 
         seq_pos_add(i);
 
         has_shift = true;
     }
 
+    bool is_prefix_monotonic(llama_seq_id seq_id, bool is_2d) const {
+        if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ) {
+            return false;
+        }
+        const uint32_t n_used = get_used();
+        if (used_max_p1() != n_used) {
+            return false;
+        }
+        if (seq_pos[seq_id].size() != n_used) {
+            return false;
+        }
+        return is_2d ? (n_inv_2d == 0) : (n_inv_1d == 0);
+    }
+
+    uint32_t prefix_upper_bound(llama_pos p1, llama_pos p1_x, llama_pos p1_y, bool is_2d) const {
+        uint32_t lo = 0;
+        uint32_t hi = get_used();
+        while (lo < hi) {
+            const uint32_t mid = lo + (hi - lo) / 2;
+            const llama_pos pm = pos[mid];
+            bool greater = (pm > p1);
+            if (!greater && is_2d && pm == p1) {
+                greater = ext[mid].is_2d_gt(p1_x, p1_y);
+            }
+            if (greater) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        return lo;
+    }
+
 private:
     bool has_shift = false;
+    int64_t n_inv_1d = 0;
+    int64_t n_inv_2d = 0;
+
+    bool edge_inv_1d(uint32_t i) const {
+        return pos[i] != -1 && pos[i + 1] != -1 && pos[i] > pos[i + 1];
+    }
+
+    bool edge_inv_2d(uint32_t i) const {
+        if (pos[i] == -1 || pos[i + 1] == -1) {
+            return false;
+        }
+        return pos[i] > pos[i + 1] || (pos[i] == pos[i + 1] && ext[i].is_2d_gt(ext[i + 1].x, ext[i + 1].y));
+    }
+
+    void inv_update_cell(uint32_t i, int delta) {
+        if (i > 0) {
+            if (edge_inv_1d(i - 1)) { n_inv_1d += delta; }
+            if (edge_inv_2d(i - 1)) { n_inv_2d += delta; }
+        }
+        if (i + 1 < pos.size()) {
+            if (edge_inv_1d(i)) { n_inv_1d += delta; }
+            if (edge_inv_2d(i)) { n_inv_2d += delta; }
+        }
+    }
 
     // set of indices of used cells (i.e. pos[i] != -1, allowed to not have any seq_id)
     std::set<uint32_t> used;
