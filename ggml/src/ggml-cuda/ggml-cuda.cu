@@ -3874,14 +3874,53 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     return use_cuda_graph;
 }
 
+static bool ggml_cuda_graph_stats_enabled() {
+    static const bool enabled = ggml_cuda_env_flag("GGML_CUDA_GRAPH_STATS");
+    return enabled;
+}
+
+struct ggml_cuda_graph_stats_counters {
+    std::atomic<uint64_t> launches{0};
+    std::atomic<uint64_t> hits{0};
+    std::atomic<uint64_t> updates{0};
+    std::atomic<uint64_t> instantiates{0};
+    std::atomic<uint64_t> update_reinstantiates{0};
+    std::atomic<uint64_t> lru_evicts{0};
+    std::atomic<uint64_t> eager_fallbacks{0};
+};
+
+static ggml_cuda_graph_stats_counters & ggml_cuda_graph_stats() {
+    static ggml_cuda_graph_stats_counters stats;
+    return stats;
+}
+
+static void ggml_cuda_graph_stats_maybe_log(int device) {
+    if (!ggml_cuda_graph_stats_enabled()) {
+        return;
+    }
+    auto & st = ggml_cuda_graph_stats();
+    const uint64_t launches = st.launches.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (launches % 500 == 0) {
+        GGML_LOG_INFO(
+            "CUDA_GRAPH_STATS dev=%d launches=%llu hits=%llu updates=%llu inst=%llu upd_reinst=%llu lru_evict=%llu eager=%llu\n",
+            device,
+            (unsigned long long) launches,
+            (unsigned long long) st.hits.load(std::memory_order_relaxed),
+            (unsigned long long) st.updates.load(std::memory_order_relaxed),
+            (unsigned long long) st.instantiates.load(std::memory_order_relaxed),
+            (unsigned long long) st.update_reinstantiates.load(std::memory_order_relaxed),
+            (unsigned long long) st.lru_evicts.load(std::memory_order_relaxed),
+            (unsigned long long) st.eager_fallbacks.load(std::memory_order_relaxed));
+    }
+}
+
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    // fold the src data pointers, ops, dtypes, and leading/trailing tensor shapes into the key:
-    // with multi-GPU pipeline parallelism the scheduler rotates between input-copy sets, and distinct
-    // ubatch shapes or source dtypes (e.g. F16 vs BF16 with identical byte strides) must never collide.
-    auto fold_node = [](uintptr_t & key, const ggml_tensor * n) {
+    // Key by leading structure/shapes + input src->data (to separate copy_slot 0 vs 1),
+    // while keeping trailing nodes independent of shifting galloc/KV pointers so n_kv growth
+    // reuses cached graphs via fast cudaGraphExecUpdate instead of re-instantiating.
+    auto fold_head = [](uintptr_t & key, const ggml_tensor * n) {
         key = (key ^ (uintptr_t) n->op)    * 0x9E3779B97F4A7C15ull;
         key = (key ^ (uintptr_t) n->type)  * 0x9E3779B97F4A7C15ull;
-        key = (key ^ (uintptr_t) n->data)  * 0x9E3779B97F4A7C15ull;
         key = (key ^ (uintptr_t) n->ne[0]) * 0x9E3779B97F4A7C15ull;
         key = (key ^ (uintptr_t) n->ne[1]) * 0x9E3779B97F4A7C15ull;
         key = (key ^ (uintptr_t) n->ne[2]) * 0x9E3779B97F4A7C15ull;
@@ -3899,15 +3938,28 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
             }
         }
     };
+    auto fold_tail = [](uintptr_t & key, const ggml_tensor * n) {
+        key = (key ^ (uintptr_t) n->op)    * 0x9E3779B97F4A7C15ull;
+        key = (key ^ (uintptr_t) n->type)  * 0x9E3779B97F4A7C15ull;
+        key = (key ^ (uintptr_t) n->ne[0]) * 0x9E3779B97F4A7C15ull;
+        key = (key ^ (uintptr_t) n->ne[1]) * 0x9E3779B97F4A7C15ull;
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            const ggml_tensor * s = n->src[j];
+            if (s != nullptr) {
+                key = (key ^ (uintptr_t) s->op)   * 0x9E3779B97F4A7C15ull;
+                key = (key ^ (uintptr_t) s->type) * 0x9E3779B97F4A7C15ull;
+            }
+        }
+    };
     uintptr_t key = (uintptr_t) cgraph->nodes[0];
     key ^= (uintptr_t) cgraph->n_nodes * 0x517CC1B727220A95ull;
-    const int head_end = std::min(cgraph->n_nodes, 8);
+    const int head_end = std::min(cgraph->n_nodes, 4);
     for (int i = 0; i < head_end; ++i) {
-        fold_node(key, cgraph->nodes[i]);
+        fold_head(key, cgraph->nodes[i]);
     }
     const int tail_start = std::max(head_end, cgraph->n_nodes - 4);
     for (int i = tail_start; i < cgraph->n_nodes; ++i) {
-        fold_node(key, cgraph->nodes[i]);
+        fold_tail(key, cgraph->nodes[i]);
     }
     return (const void *) key;
 }
@@ -3971,10 +4023,10 @@ static size_t ggml_cuda_max_cached_graphs() {
                 return (size_t) v;
             }
         }
-        // Bound simultaneous live cudaGraphExec_t per context so the CUDA driver's
-        // internal graph pool never inflates by hundreds of MiB across transient shapes
-        // (12 covers 6 pipelined decode lanes x 2 shapes at ~60 MiB max).
-        return (size_t) 12;
+        // Bound simultaneous live cudaGraphExec_t per context high enough to cover
+        // multi-lane decode + MTP verification + prefill shapes without LRU thrashing,
+        // while relying on the 10s idle sweep and OOM eviction fallback for pressure.
+        return (size_t) 64;
     }();
     return limit;
 }
@@ -3986,7 +4038,10 @@ static bool ggml_cuda_graph_instantiate_checked(ggml_backend_cuda_context * cuda
     if (cuda_ctx->live_cuda_graph_count(graph_key) >= max_graphs) {
         std::unique_lock<std::mutex> lock(ggml_cuda_lock);
         ggml_cuda_lock_cv.wait(lock, [] { return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
-        cuda_ctx->evict_lru_cuda_graphs(graph_key, max_graphs);
+        const size_t evicted_lru = cuda_ctx->evict_lru_cuda_graphs(graph_key, max_graphs);
+        if (ggml_cuda_graph_stats_enabled() && evicted_lru > 0) {
+            ggml_cuda_graph_stats().lru_evicts.fetch_add(evicted_lru, std::memory_order_relaxed);
+        }
     }
 #ifdef GGML_DIAGNOSTICS
     // Test builds only: GGML_CUDA_TEST_GRAPH_OOM_AFTER=N fails instantiations N.. (COUNT of them).
@@ -4070,6 +4125,10 @@ static bool ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
             stat == cudaErrorMemoryAllocation) {
         if (ggml_cuda_graph_debug_enabled()) {
             GGML_LOG_DEBUG("%s: CUDA graph update failed\n", __func__);
+        }
+
+        if (ggml_cuda_graph_stats_enabled()) {
+            ggml_cuda_graph_stats().update_reinstantiates.fetch_add(1, std::memory_order_relaxed);
         }
 
         // The pre-existing graph exec cannot be updated due to violated constraints
@@ -6010,8 +6069,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             executable_ready = ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
         if (executable_ready) {
+            if (ggml_cuda_graph_stats_enabled()) {
+                auto & st = ggml_cuda_graph_stats();
+                if (!had_instance) {
+                    st.instantiates.fetch_add(1, std::memory_order_relaxed);
+                } else if (cuda_graph_update_required) {
+                    st.updates.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    st.hits.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
             CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+            ggml_cuda_graph_stats_maybe_log(cuda_ctx->device);
         } else {
+            if (ggml_cuda_graph_stats_enabled()) {
+                ggml_cuda_graph_stats().eager_fallbacks.fetch_add(1, std::memory_order_relaxed);
+            }
             // Capture recorded this computation but did not execute it. Run the
             // same nodes once through the ordinary launch path; never lose a car.
             graph->warmup_complete = false;
@@ -6084,6 +6157,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+#ifdef USE_CUDA_GRAPH
+    } else if (!use_cuda_graph && ggml_cuda_graph_stats_enabled()) {
+        ggml_cuda_graph_stats().eager_fallbacks.fetch_add(1, std::memory_order_relaxed);
+#endif
     }
 
     try {
@@ -7598,11 +7675,6 @@ static ggml_backend_t ggml_backend_cuda_init_background(ggml_backend_dev_t dev) 
     if (backend != nullptr) {
         auto * bg_ctx = (ggml_backend_cuda_context *) backend->context;
         bg_ctx->stream_priority = 0;
-#ifdef USE_CUDA_GRAPH
-        // Background backends run variable-length prefill chunks and fallback batches;
-        // capturing one-shot CUDA graphs here wastes ~150+ MiB/GPU of driver pool VRAM.
-        bg_ctx->disable_cuda_graphs = true;
-#endif
     }
     return backend;
 }

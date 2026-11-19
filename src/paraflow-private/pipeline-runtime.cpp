@@ -12,6 +12,12 @@
 #include <set>
 #include <limits>
 #include <cinttypes>
+#include <cstdlib>
+
+static bool paraflow_env_flag_enabled(const char * name) {
+    const char * v = std::getenv(name);
+    return v != nullptr && std::atoi(v) != 0;
+}
 
 bool llama_context::set_pipeline_peer(const llama_context * peer) {
     if (decode_pipelined || !pipe_scheds.empty()) { return false; }
@@ -91,11 +97,17 @@ void llama_context::set_decode_pipelined(bool enable) {
         const auto reserve_shapes = llama_pipeline_reserve_shapes(n_tokens_max, n_seqs_max, tight_reserve);
         const size_t max_nodes = graph_max_nodes(n_tokens_max);
 
+        const bool pipe_snapshots = paraflow_env_flag_enabled("PARAFLOW_PIPE_INPUT_SNAPSHOTS");
+        if (pipe_snapshots) {
+            LLAMA_LOG_INFO("%s: enabling input snapshots on pipe_scheds via PARAFLOW_PIPE_INPUT_SNAPSHOTS\n", __func__);
+        }
         for (int i = 0; i < n_pipe_scheds; ++i) {
             if (!pipe_scheds[i]) {
                 pipe_scheds[i].reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(),
                         backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
-                ggml_backend_sched_set_input_snapshots(pipe_scheds[i].get(), true);
+                if (pipe_snapshots) {
+                    ggml_backend_sched_set_input_snapshots(pipe_scheds[i].get(), true);
+                }
                 pipe_gf_res[i].reset(new llm_graph_result(max_nodes));
 
                 // Reserve the normal lane's generation shapes up front. The last
@@ -196,7 +208,10 @@ void llama_context::set_decode_pipelined(bool enable) {
 
             prefill_sched.reset(ggml_backend_sched_new(prefill_backend_ptrs.data(), backend_buft.data(),
                     prefill_backend_ptrs.size(), max_nodes_pp, /*parallel =*/ true, cparams.op_offload));
-            ggml_backend_sched_set_input_snapshots(prefill_sched.get(), true);
+            if (paraflow_env_flag_enabled("PARAFLOW_PREFILL_INPUT_SNAPSHOTS")) {
+                ggml_backend_sched_set_input_snapshots(prefill_sched.get(), true);
+                LLAMA_LOG_INFO("%s: enabling input snapshots on prefill_sched via PARAFLOW_PREFILL_INPUT_SNAPSHOTS\n", __func__);
+            }
             prefill_gf_res.reset(new llm_graph_result(max_nodes_pp));
 
             sched_cur       = prefill_sched.get();
