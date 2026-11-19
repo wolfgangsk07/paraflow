@@ -869,28 +869,42 @@ bool llama_memory_recurrent::seq_move_cell(llama_seq_id seq_id, uint32_t dst, ll
                 }
             }
         }
-        // Allocate every scratch row before the first write, so refusal is atomic.
+        // Prefer fast device scratch when available; fall back to host staging if VRAM is tight.
         std::map<ggml_backend_buffer_type_t, ggml_backend_buffer_ptr> scratch;
+        size_t host_scratch_max = 0;
         for (const auto & entry : scratch_sizes) {
             ggml_backend_buffer_ptr buffer(ggml_backend_buft_alloc_buffer(entry.first, entry.second));
-            if (!buffer) { return false; }
-            scratch.emplace(entry.first, std::move(buffer));
+            if (buffer) {
+                scratch.emplace(entry.first, std::move(buffer));
+            } else {
+                host_scratch_max = std::max(host_scratch_max, entry.second);
+            }
         }
+        std::vector<uint8_t> host_scratch(host_scratch_max);
         for (auto * tensor : tensors) {
             const uint32_t planes = tensor->ne[1] / size;
             for (uint32_t plane = 0; plane < planes; ++plane) {
-                auto from_a = row_view(tensor, plane * size + src);
-                auto from_b = row_view(tensor, plane * size + dst);
+                const uint32_t row_a = plane * size + src;
+                const uint32_t row_b = plane * size + dst;
+                auto from_a = row_view(tensor, row_a);
+                auto from_b = row_view(tensor, row_b);
                 if (have_a && have_b) {
                     const auto buft = ggml_backend_buffer_get_type(tensor->buffer);
-                    ggml_tensor temporary = from_a;
-                    temporary.buffer = scratch.at(buft).get();
-                    temporary.data = ggml_backend_buffer_get_base(temporary.buffer);
-                    temporary.view_src = nullptr;
-                    temporary.view_offs = 0;
-                    ggml_backend_tensor_copy(&from_a, &temporary);
-                    ggml_backend_tensor_copy(&from_b, &from_a);
-                    ggml_backend_tensor_copy(&temporary, &from_b);
+                    auto it = scratch.find(buft);
+                    if (it != scratch.end()) {
+                        ggml_tensor temporary = from_a;
+                        temporary.buffer = it->second.get();
+                        temporary.data = ggml_backend_buffer_get_base(temporary.buffer);
+                        temporary.view_src = nullptr;
+                        temporary.view_offs = 0;
+                        ggml_backend_tensor_copy(&from_a, &temporary);
+                        ggml_backend_tensor_copy(&from_b, &from_a);
+                        ggml_backend_tensor_copy(&temporary, &from_b);
+                    } else {
+                        ggml_backend_tensor_get(tensor, host_scratch.data(), size_t{row_a} * tensor->nb[1], tensor->nb[1]);
+                        ggml_backend_tensor_copy(&from_b, &from_a);
+                        ggml_backend_tensor_set(tensor, host_scratch.data(), size_t{row_b} * tensor->nb[1], tensor->nb[1]);
+                    }
                 } else if (have_a) {
                     ggml_backend_tensor_copy(&from_a, &from_b);
                 } else if (have_b) {

@@ -1280,6 +1280,7 @@ struct ggml_cuda_graph {
     bool warmup_complete = false;
     uint64_t uid = 0;
     int64_t last_used_time = 0;
+    uint64_t last_used_seq = 0;
     struct node_properties {
         ggml_tensor node;
         void *   node_src_data_ptrs[GGML_MAX_SRC];
@@ -1480,11 +1481,16 @@ struct ggml_backend_cuda_context {
     std::mutex staging_mtx;
 
 #ifdef USE_CUDA_GRAPH
-    // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
+    // Per-context opt-out (e.g. background prefill streams whose one-shot chunk shapes
+    // would otherwise inflate the CUDA driver's graph memory pool for zero decode benefit).
+    bool disable_cuda_graphs = false;
+
+    // Map from graph key to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
 
     int64_t last_graph_eviction_sweep = 0;
+    uint64_t graph_lru_clock = 0;
 
     ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
         const int64_t time_now = ggml_time_us();
@@ -1493,7 +1499,7 @@ struct ggml_backend_cuda_context {
         if (time_now - last_graph_eviction_sweep >= 5'000'000) {
             last_graph_eviction_sweep = time_now;
             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
-                if (time_now - it->second->last_used_time >= 10'000'000) {
+                if (it->first != first_node_ptr && time_now - it->second->last_used_time >= 10'000'000) {
                     it = cuda_graphs.erase(it);
                 } else {
                     ++it;
@@ -1506,7 +1512,48 @@ struct ggml_backend_cuda_context {
             it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
         }
         it->second->last_used_time = time_now;
+        it->second->last_used_seq  = ++graph_lru_clock;
         return it->second.get();
+    }
+
+    size_t live_cuda_graph_count(const void * exclude_key = nullptr) const {
+        size_t n = 0;
+        for (const auto & [key, graph] : cuda_graphs) {
+            if (key != exclude_key && graph && graph->instance != nullptr) {
+                ++n;
+            }
+        }
+        return n;
+    }
+
+    size_t evict_lru_cuda_graphs(const void * keep_key, size_t max_live) {
+        size_t evicted = 0;
+        if (cuda_graphs.size() > max_live * 4) {
+            for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
+                if (it->first != keep_key && (!it->second || it->second->instance == nullptr)) {
+                    it = cuda_graphs.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        while (live_cuda_graph_count(keep_key) >= max_live) {
+            auto victim = cuda_graphs.end();
+            for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ++it) {
+                if (it->first == keep_key || !it->second || it->second->instance == nullptr) {
+                    continue;
+                }
+                if (victim == cuda_graphs.end() || it->second->last_used_seq < victim->second->last_used_seq) {
+                    victim = it;
+                }
+            }
+            if (victim == cuda_graphs.end()) {
+                break;
+            }
+            cuda_graphs.erase(victim);
+            ++evicted;
+        }
+        return evicted;
     }
 
     // Check if any CUDA graph is enabled for this context (used by kernels that need to know

@@ -3962,9 +3962,32 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     return res;
 }
 
+static size_t ggml_cuda_max_cached_graphs() {
+    static const size_t limit = [] {
+        const char * env = std::getenv("GGML_CUDA_MAX_GRAPHS");
+        if (env && *env) {
+            const long v = std::strtol(env, nullptr, 10);
+            if (v >= 1) {
+                return (size_t) v;
+            }
+        }
+        // Bound simultaneous live cudaGraphExec_t per context so the CUDA driver's
+        // internal graph pool never inflates by hundreds of MiB across transient shapes
+        // (12 covers 6 pipelined decode lanes x 2 shapes at ~60 MiB max).
+        return (size_t) 12;
+    }();
+    return limit;
+}
+
 static bool ggml_cuda_graph_instantiate_checked(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     GGML_ASSERT(graph->instance == nullptr);
+    const size_t max_graphs = ggml_cuda_max_cached_graphs();
+    if (cuda_ctx->live_cuda_graph_count(graph_key) >= max_graphs) {
+        std::unique_lock<std::mutex> lock(ggml_cuda_lock);
+        ggml_cuda_lock_cv.wait(lock, [] { return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+        cuda_ctx->evict_lru_cuda_graphs(graph_key, max_graphs);
+    }
 #ifdef GGML_DIAGNOSTICS
     // Test builds only: GGML_CUDA_TEST_GRAPH_OOM_AFTER=N fails instantiations N.. (COUNT of them).
     static const int64_t test_oom_after = [] {
@@ -5981,8 +6004,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-        bool executable_ready = graph->instance != nullptr || ggml_cuda_graph_instantiate_checked(cuda_ctx, graph_key);
-        if (executable_ready && cuda_graph_update_required) { // Update graph executable
+        const bool had_instance = graph->instance != nullptr;
+        bool executable_ready = had_instance || ggml_cuda_graph_instantiate_checked(cuda_ctx, graph_key);
+        if (had_instance && executable_ready && cuda_graph_update_required) { // Update graph executable
             executable_ready = ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
         if (executable_ready) {
@@ -6002,6 +6026,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+    if (cuda_ctx->disable_cuda_graphs) {
+        return false;
+    }
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (graph->graph == nullptr) {
@@ -6027,22 +6054,24 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const void * graph_key = nullptr;
 
 #ifdef USE_CUDA_GRAPH
-    graph_key = ggml_cuda_graph_get_key(cgraph);
+    if (!cuda_ctx->disable_cuda_graphs) {
+        graph_key = ggml_cuda_graph_get_key(cgraph);
 
-    ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+        ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
-    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (graph->is_enabled()) {
-        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
-        if (graph_compatible) {
-            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+        ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+        if (graph->is_enabled()) {
+            const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+            if (graph_compatible) {
+                const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
-            // Pipelined decode alternates graph shapes per lane. Instead of falling back to
-            // eager launches until a graph is stable again, re-capture and update the
-            // executable graph whenever node properties change.
-            graph->warmup_complete = true;
-            use_cuda_graph = true;
-            cuda_graph_update_required = properties_changed || graph->instance == nullptr;
+                // Pipelined decode alternates graph shapes per lane. Instead of falling back to
+                // eager launches until a graph is stable again, re-capture and update the
+                // executable graph whenever node properties change.
+                graph->warmup_complete = true;
+                use_cuda_graph = true;
+                cuda_graph_update_required = properties_changed || graph->instance == nullptr;
+            }
         }
     }
 #endif // USE_CUDA_GRAPH
@@ -6238,8 +6267,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     }
 
 #ifdef USE_CUDA_GRAPH
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
-    const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+    const bool use_cuda_graph = !cuda_ctx->disable_cuda_graphs &&
+            ggml_cuda_graph_set_enabled(cuda_ctx, ggml_cuda_graph_get_key(cgraph));
 #else
     const bool use_cuda_graph = false;
     GGML_UNUSED(cuda_ctx);
@@ -7567,7 +7596,13 @@ static ggml_backend_t ggml_backend_cuda_init_background(ggml_backend_dev_t dev) 
 
     ggml_backend_t backend = ggml_backend_cuda_init(dev_ctx->device);
     if (backend != nullptr) {
-        ((ggml_backend_cuda_context *) backend->context)->stream_priority = 0;
+        auto * bg_ctx = (ggml_backend_cuda_context *) backend->context;
+        bg_ctx->stream_priority = 0;
+#ifdef USE_CUDA_GRAPH
+        // Background backends run variable-length prefill chunks and fallback batches;
+        // capturing one-shot CUDA graphs here wastes ~150+ MiB/GPU of driver pool VRAM.
+        bg_ctx->disable_cuda_graphs = true;
+#endif
     }
     return backend;
 }

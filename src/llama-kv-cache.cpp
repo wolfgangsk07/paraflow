@@ -1071,20 +1071,26 @@ int32_t llama_kv_cache::seq_stream(llama_seq_id seq_id) const {
 }
 
 bool llama_kv_cache::swap_stream_device(uint32_t sa, uint32_t sb, uint32_t na, uint32_t nb) {
-    const uint32_t n_max = std::max(na, nb);
+    const uint32_t n_max     = std::max(na, nb);
+    const uint32_t n_overlap = std::min(na, nb);
     if (n_max == 0) {
         return true;
     }
 
-    // one scratch slice per buffer type (device), kept for later exchanges
+    // Bounded chunked scratch per buffer type (device) so swapping long streams stays O(1) VRAM
+    // and one-sided swaps (n_overlap == 0) allocate zero scratch.
+    constexpr uint32_t k_swap_chunk = 1024;
+    const uint32_t chunk_rows = std::min(n_overlap, k_swap_chunk);
     std::map<ggml_backend_buffer_type_t, size_t> need;
-    for (const auto & layer : layers) {
-        for (const ggml_tensor * t : { layer.k_stream[sa], layer.v_stream[sa] }) {
-            if (t == nullptr || t->buffer == nullptr) {
-                continue;
+    if (chunk_rows > 0) {
+        for (const auto & layer : layers) {
+            for (const ggml_tensor * t : { layer.k_stream[sa], layer.v_stream[sa] }) {
+                if (t == nullptr || t->buffer == nullptr) {
+                    continue;
+                }
+                auto & n = need[ggml_backend_buffer_get_type(t->buffer)];
+                n = std::max(n, size_t{chunk_rows} * t->nb[1]);
             }
-            auto & n = need[ggml_backend_buffer_get_type(t->buffer)];
-            n = std::max(n, size_t{na} * t->nb[1]);
         }
     }
     for (const auto & [buft, size] : need) {
@@ -1108,9 +1114,11 @@ bool llama_kv_cache::swap_stream_device(uint32_t sa, uint32_t sb, uint32_t na, u
         }
     }
 
-    auto rows = [](const ggml_tensor * t, uint32_t n) {
+    auto rows_slice = [](const ggml_tensor * t, uint32_t off, uint32_t n) {
         ggml_tensor v = *t;
         v.ne[1] = n;
+        v.data = (char *) t->data + size_t{off} * t->nb[1];
+        v.view_offs = t->view_offs + size_t{off} * t->nb[1];
         return v;
     };
     for (const auto & layer : layers) {
@@ -1119,22 +1127,29 @@ bool llama_kv_cache::swap_stream_device(uint32_t sa, uint32_t sb, uint32_t na, u
             if (ta == nullptr) {
                 continue;
             }
-            ggml_tensor a_n = rows(ta, na), b_dst = rows(tb, na);
-            ggml_tensor b_n = rows(tb, nb), a_dst = rows(ta, nb);
-            ggml_tensor tmp = a_n;
-            if (na > 0) {
+            for (uint32_t off = 0; off < n_overlap; off += k_swap_chunk) {
+                const uint32_t c = std::min(k_swap_chunk, n_overlap - off);
+                ggml_tensor a_c = rows_slice(ta, off, c);
+                ggml_tensor b_c = rows_slice(tb, off, c);
+                ggml_tensor tmp = a_c;
                 auto & buf = swap_scratch.at(ggml_backend_buffer_get_type(ta->buffer));
                 tmp.buffer    = buf.get();
                 tmp.data      = ggml_backend_buffer_get_base(buf.get());
                 tmp.view_src  = nullptr;
                 tmp.view_offs = 0;
-                ggml_backend_tensor_copy(&a_n, &tmp);
+                ggml_backend_tensor_copy(&a_c, &tmp);
+                ggml_backend_tensor_copy(&b_c, &a_c);
+                ggml_backend_tensor_copy(&tmp, &b_c);
             }
-            if (nb > 0) {
-                ggml_backend_tensor_copy(&b_n, &a_dst);
+            if (na > n_overlap) {
+                ggml_tensor a_tail = rows_slice(ta, n_overlap, na - n_overlap);
+                ggml_tensor b_tail = rows_slice(tb, n_overlap, na - n_overlap);
+                ggml_backend_tensor_copy(&a_tail, &b_tail);
             }
-            if (na > 0) {
-                ggml_backend_tensor_copy(&tmp, &b_dst);
+            if (nb > n_overlap) {
+                ggml_tensor b_tail = rows_slice(tb, n_overlap, nb - n_overlap);
+                ggml_tensor a_tail = rows_slice(ta, n_overlap, nb - n_overlap);
+                ggml_backend_tensor_copy(&b_tail, &a_tail);
             }
         }
     }
