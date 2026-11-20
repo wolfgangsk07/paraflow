@@ -16,7 +16,7 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
-template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
+template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool use_prefix_mask> // D == head size
 __launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
 static __global__ void flash_attn_ext_vec(
         const char * Q_ptr,
@@ -116,7 +116,7 @@ static __global__ void flash_attn_ext_vec(
     const half * maskh       = (const half *) (mask + nb33*(sequence % ne33) + nb31*ic0);
     const int32_t * mask_i32 = mask ? (const int32_t *) (mask + nb33*(sequence % ne33) + nb31*ic0) : nullptr;
 
-    const float slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
+    const float slope = use_prefix_mask ? 0.0f : get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
 
     static_assert(D % (2*WARP_SIZE) == 0, "D not divisible by 2*WARP_SIZE == 64.");
     constexpr int nwarps = nthreads / WARP_SIZE;
@@ -254,10 +254,22 @@ static __global__ void flash_attn_ext_vec(
     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
     K     += blockIdx.y*nthreads * nb11;
     V     += blockIdx.y*nthreads * nb21;
-    maskh += blockIdx.y*nthreads;
+    int32_t mask_lim[ncols];
+    if constexpr (use_prefix_mask) {
+        GGML_UNUSED_VARS(slope, maskh);
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            mask_lim[j] = (mask && (ncols == 1 || ic0 + j < int(ne01.z)))
+                ? (mask_i32[j] - mask_k_offset)
+                : INT_MAX;
+        }
+    } else {
+        GGML_UNUSED(mask_i32);
+        maskh += blockIdx.y*nthreads;
+    }
     for (int k_VKQ_0 = blockIdx.y*nthreads; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nthreads,
              // Increment pointers after each loop:
-             K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
+             K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += (use_prefix_mask ? 0 : gridDim.y*nthreads)) {
 
         // Calculate KQ tile and keep track of new maximum KQ values:
         float KQ_reg[ncols]; // KQ in registers.
@@ -281,11 +293,14 @@ static __global__ void flash_attn_ext_vec(
                     sum = logit_softcap*tanhf(sum);
                 }
 
-                if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
-                    if (mask_k_offset >= 0) {
-                        const int32_t lim = mask_i32[j] - mask_k_offset;
-                        sum += (k_VKQ_0 + i_KQ < lim) ? 0.0f : -INFINITY;
-                    } else {
+                if constexpr (use_prefix_mask) {
+                    if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
+                        if (k_VKQ_0 + nthreads > mask_lim[j]) {
+                            sum += (k_VKQ_0 + i_KQ < mask_lim[j]) ? 0.0f : -INFINITY;
+                        }
+                    }
+                } else {
+                    if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
                         sum += slope*__half2float(maskh[j*(nb31 / sizeof(half)) + i_KQ]);
                     }
                 }
@@ -546,7 +561,11 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
 
     const int nthreads = ggml_cuda_fattn_vec_get_nthreads_host(cc);
     const int nwarps   = nthreads / WARP_SIZE;
-    fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap>;
+    const ggml_tensor * mask = dst->src[3];
+    const bool use_prefix_mask = mask != nullptr && mask->type == GGML_TYPE_I32;
+    fattn_kernel_t fattn_kernel = use_prefix_mask
+        ? flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, true>
+        : flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, false>;
     const bool need_f16_K = type_K == GGML_TYPE_F16;
     const bool need_f16_V = type_V == GGML_TYPE_F16;
     constexpr size_t nbytes_shared = 0;

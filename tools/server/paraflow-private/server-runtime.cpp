@@ -1911,7 +1911,6 @@ private:
         bool changed = false;
         if (suspended_requests.empty() && std::none_of(slots.begin(), slots.end(),
                     [](const server_slot & slot) { return slot.resident_paused; })) { return; }
-        dft_join(__LINE__);
         const bool resident_eligible = active_ordinary() < budget && std::any_of(slots.begin(), slots.end(),
                 [](const server_slot & slot) { return slot.resident_paused; });
         const bool paged_eligible = std::any_of(suspended_requests.begin(), suspended_requests.end(),
@@ -1921,9 +1920,11 @@ private:
                             (old.task->params.priority > 0 || active_ordinary() < budget) &&
                             !(saved.capacity_page && old.task->params.priority <= 0 && active_vip() > 0);
                 });
-        // A paused task that cannot resume must not drain unrelated in-flight
+        // A paused task that cannot resume must not join dft_exec or drain unrelated in-flight
         // lanes on every scheduling round (notably while a VIP owns the budget).
+        // resident_eligible and paged_eligible read scheduler-owned slot/suspension metadata only; avoid joining dft_exec on every tick while a VIP owns the budget.
         if (!resident_eligible && !paged_eligible) { return; }
+        dft_join(__LINE__);
         pipeline_drain();
         std::stable_sort(suspended_requests.begin(), suspended_requests.end(), [](const suspended_request & a, const suspended_request & b) {
             const int ap = a.slot->task->params.priority, bp = b.slot->task->params.priority;
@@ -3371,20 +3372,28 @@ private:
             auto & lane = pipeline_lanes[i];
             if (!lane.in_flight && pipeline_prefill_lane_issuable()) { progressed |= pipeline_issue(i); }
         }
-        progressed |= std::any_of(pipeline_lanes.begin(), pipeline_lanes.end(),
+        const bool draft_pending_before = std::any_of(pipeline_lanes.begin(), pipeline_lanes.end(),
                 [](const pipeline_lane & lane) { return lane.shared_draft_staged && !lane.shared_draft_ready; });
+        if (!dft_exec) {
+            progressed |= draft_pending_before;
+        }
         pipeline_flush_ready_drafts();
         for (int i = 0; i < pipeline_count; ++i) {
             if (pipeline_lanes[i].shared_draft_staged && pipeline_lanes[i].shared_draft_ready) {
                 progressed |= pipeline_issue(i);
             }
         }
-        // Backpressure only when no work can be issued now. Never wait for an
-        // unfinished target ticket merely to enlarge a ready draft batch.
-        if (!progressed && !pipeline_fifo.empty()) {
+        const bool draft_pending_after = dft_exec && std::any_of(pipeline_lanes.begin(), pipeline_lanes.end(),
+                [](const pipeline_lane & lane) { return lane.shared_draft_staged && !lane.shared_draft_ready; });
+        // Backpressure only when no work can be issued now and no async draft is pending.
+        // Never wait for an unfinished target ticket merely to enlarge a ready draft batch.
+        if (!progressed && !draft_pending_after && !pipeline_fifo.empty()) {
             pipeline_settle(); progressed = true;
         }
-        if (!progressed) { pe(PE_SLEEP); std::this_thread::sleep_for(std::chrono::microseconds(100)); }
+        if (!progressed) {
+            pe(PE_SLEEP);
+            std::this_thread::sleep_for(std::chrono::microseconds(draft_pending_after ? 25 : 100));
+        }
     }
 
     void pipeline_step() {
@@ -3567,10 +3576,10 @@ private:
     }
 
     void load_system_prefix(server_slot & slot) {
-        dft_join(__LINE__);
         slot.system_cache_prefix_tokens = system_prefix_length(*slot.task);
         const int boundary = slot.system_cache_prefix_tokens;
         if (!boundary) { return; }
+        dft_join(__LINE__);
         const auto common = slot.prompt.tokens.get_common_prefix(slot.task->tokens);
         const auto next = slot.prompt.tokens.pos_next(common);
         const auto first = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);

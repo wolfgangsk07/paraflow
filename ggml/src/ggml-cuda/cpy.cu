@@ -1,6 +1,8 @@
 #include "cpy.cuh"
 #include "dequantize.cuh"
 #include "cpy-utils.cuh"
+#include <algorithm>
+#include <cstdint>
 #if defined(GGML_USE_MUSA) && defined(GGML_MUSA_MUDNN_COPY)
 #include "ggml-musa/mudnn.cuh"
 #endif // GGML_USE_MUSA && GGML_MUSA_MUDNN_COPY
@@ -426,17 +428,73 @@ static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tens
     return spitch >= width && dpitch >= width;
 }
 
-static bool ggml_cuda_cpy_has_same_type_kernel(enum ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_F32:
-        case GGML_TYPE_F16:
-        case GGML_TYPE_BF16:
-        case GGML_TYPE_I32:
-        case GGML_TYPE_I16:
-            return true;
-        default:
-            return false;
+static __global__ void cpy_2d_vec_kernel(
+        const char * __restrict__ src,
+        char       * __restrict__ dst,
+        const size_t width,
+        const size_t height,
+        const size_t spitch,
+        const size_t dpitch) {
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+    const size_t tid    = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t stride = (size_t) gridDim.x * blockDim.x;
+    for (size_t row = (size_t) blockIdx.y; row < height; row += (size_t) gridDim.y) {
+        const char * __restrict__ srow = src + row * spitch;
+        char       * __restrict__ drow = dst + row * dpitch;
+        const uintptr_t align = (uintptr_t) srow | (uintptr_t) drow | width;
+        if ((align & 15) == 0) {
+            const uint4 * __restrict__ s4 = (const uint4 *) srow;
+            uint4       * __restrict__ d4 = (uint4 *) drow;
+            const size_t w4 = width >> 4;
+            for (size_t col = tid; col < w4; col += stride) {
+                d4[col] = s4[col];
+            }
+        } else if ((align & 3) == 0) {
+            const uint32_t * __restrict__ s32 = (const uint32_t *) srow;
+            uint32_t       * __restrict__ d32 = (uint32_t *) drow;
+            const size_t w32 = width >> 2;
+            for (size_t col = tid; col < w32; col += stride) {
+                d32[col] = s32[col];
+            }
+        } else if ((align & 1) == 0) {
+            const uint16_t * __restrict__ s16 = (const uint16_t *) srow;
+            uint16_t       * __restrict__ d16 = (uint16_t *) drow;
+            const size_t w16 = width >> 1;
+            for (size_t col = tid; col < w16; col += stride) {
+                d16[col] = s16[col];
+            }
+        } else {
+            for (size_t col = tid; col < width; col += stride) {
+                drow[col] = srow[col];
+            }
+        }
     }
+}
+
+static void ggml_cpy_2d_vec_cuda(
+        const char * src, char * dst,
+        const size_t width, const size_t height,
+        const size_t spitch, const size_t dpitch,
+        cudaStream_t stream) {
+    if (width == 0 || height == 0) {
+        return;
+    }
+    const size_t pitch_width_align = width | spitch | dpitch;
+    size_t max_elems = width;
+    if ((pitch_width_align & 15) == 0) {
+        max_elems = width >> 4;
+    } else if ((pitch_width_align & 3) == 0) {
+        max_elems = width >> 2;
+    } else if ((pitch_width_align & 1) == 0) {
+        max_elems = width >> 1;
+    }
+    const unsigned int block_x = 128;
+    const unsigned int grid_x = (unsigned int) std::min<size_t>(std::max<size_t>(1, (max_elems + block_x - 1) / block_x), 65535);
+    const unsigned int grid_y = (unsigned int) std::min<size_t>(height, 65535);
+    const dim3 grid(grid_x, grid_y, 1);
+    const dim3 block(block_x, 1, 1);
+    cpy_2d_vec_kernel<<<grid, block, 0, stream>>>(src, dst, width, height, spitch, dpitch);
 }
 
 void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, ggml_tensor * src1) {
@@ -487,14 +545,16 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
         {
             CUDA_CHECK(cudaMemcpyAsync(src1_ddc, src0_ddc, ggml_nbytes(src0), cudaMemcpyDeviceToDevice, main_stream));
         }
-    } else if (ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch) &&
-            !(ggml_cuda_cpy_has_same_type_kernel(src0->type) && [&]() {
-                cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
-                return cudaStreamIsCapturing(main_stream, &cap) == cudaSuccess &&
-                       cap != cudaStreamCaptureStatusNone;
-            }())) {
-        CUDA_CHECK(cudaMemcpy2DAsync(src1_ddc, mc_dpitch, src0_ddc, mc_spitch,
-                                     mc_width, mc_height, cudaMemcpyDeviceToDevice, main_stream));
+    } else if (ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch)) {
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        const bool capturing = cudaStreamIsCapturing(main_stream, &cap) == cudaSuccess &&
+                               cap != cudaStreamCaptureStatusNone;
+        if (capturing) {
+            ggml_cpy_2d_vec_cuda(src0_ddc, src1_ddc, mc_width, mc_height, mc_spitch, mc_dpitch, main_stream);
+        } else {
+            CUDA_CHECK(cudaMemcpy2DAsync(src1_ddc, mc_dpitch, src0_ddc, mc_spitch,
+                                         mc_width, mc_height, cudaMemcpyDeviceToDevice, main_stream));
+        }
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
         if (can_be_transposed) {
             ggml_cpy_scalar_cuda<float, float, true>
