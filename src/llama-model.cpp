@@ -2449,6 +2449,50 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
     return ret;
 }
 
+static bool is_nextn_tensor_name(const char * name, uint32_t n_layer_trunk) {
+    if (name == nullptr) {
+        return false;
+    }
+    if (std::strncmp(name, "nextn.", 6) == 0 || std::strstr(name, ".nextn.") != nullptr) {
+        return true;
+    }
+    if (std::strncmp(name, "blk.", 4) == 0) {
+        const char * p = name + 4;
+        if (*p >= '0' && *p <= '9') {
+            uint64_t il = 0;
+            while (*p >= '0' && *p <= '9') {
+                il = il * 10 + (uint64_t) (*p - '0');
+                ++p;
+            }
+            if (*p == '.' && il >= n_layer_trunk) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+std::map<ggml_backend_buffer_type_t, size_t> llama_model::nextn_memory_breakdown() const {
+    std::map<ggml_backend_buffer_type_t, size_t> ret;
+    if (hparams.n_layer_nextn == 0) {
+        return ret;
+    }
+    const uint32_t n_trunk = hparams.n_layer();
+    for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+        ggml_backend_buffer_type_t buft_fallback = bufs.empty() ? nullptr : ggml_backend_buffer_get_type(bufs[0].get());
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+            if (t->view_src != nullptr || !is_nextn_tensor_name(ggml_get_name(t), n_trunk)) {
+                continue;
+            }
+            ggml_backend_buffer_type_t buft = t->buffer ? ggml_backend_buffer_get_type(t->buffer) : buft_fallback;
+            if (buft != nullptr) {
+                ret[buft] += ggml_backend_buft_get_alloc_size(buft, t);
+            }
+        }
+    }
+    return ret;
+}
+
 uint64_t llama_model::n_elements() const {
     return pimpl->n_elements;
 }

@@ -5788,6 +5788,10 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_get_pipeline_aux_memory_break
     return ctx->pipeline_auxiliary_memory_breakdown();
 }
 
+std::map<ggml_backend_buffer_type_t, size_t> llama_get_model_nextn_memory_breakdown(const struct llama_model * model) {
+    return model ? model->nextn_memory_breakdown() : std::map<ggml_backend_buffer_type_t, size_t>{};
+}
+
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
 }

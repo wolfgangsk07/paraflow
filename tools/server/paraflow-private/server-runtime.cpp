@@ -1105,7 +1105,7 @@ struct paraflow_dash_susp { // a request whose KV was paged out to host RAM
 };
 struct paraflow_dash_dev {
     char     name[32];
-    uint64_t model, context, compute, used, total;
+    uint64_t model = 0, draft_model = 0, draft_context = 0, draft_compute = 0, vision = 0, context = 0, compute = 0, used = 0, total = 0;
 };
 struct paraflow_dash_snap {
     uint64_t seq = 0;
@@ -3799,6 +3799,8 @@ private:
         mtmd_pool.reset(); // joins the encoders before their contexts go away
         mtmd_free(mctx);
         mctx = nullptr;
+        mtmd_split_devs.clear();
+        dash_mtmd_mem.clear();
     }
 
     void handle_sleeping_state(bool new_state) {
@@ -3910,6 +3912,8 @@ private:
         SRV_TRC("local path '%s'\n", params.model.path.c_str());
 
         std::string & mmproj_path = params_base.mmproj.path;
+        mtmd_split_devs.clear();
+        dash_mtmd_mem.clear();
         mtmd_context_params mparams = mtmd_context_params_default();
         if (has_mmproj) {
             mparams.use_gpu          = params_base.mmproj_use_gpu;
@@ -3922,19 +3926,70 @@ private:
             mparams.image_max_tokens = params_base.image_max_tokens;
             mparams.batch_max_tokens = params_base.mtmd_batch_max_tokens;
             mparams.media_marker     = get_media_marker();
-            // split the encoder layers over every GPU of the model (LLAMA_MTMD_SPLIT=0 keeps it on one device)
-            const char * split_env = getenv("LLAMA_MTMD_SPLIT");
-            if (mparams.use_gpu && mparams.device == nullptr && (!split_env || atoi(split_env) != 0)) {
-                mtmd_split_devs = params_base.devices;
-                if (mtmd_split_devs.empty()) {
+            // place the encoder on LLAMA_MTMD_DEVICES (e.g. "CUDA2,CUDA5" or "2,5") when set,
+            // otherwise split over every GPU of the model unless LLAMA_MTMD_SPLIT=0.
+            if (mparams.use_gpu && mparams.device == nullptr) {
+                std::vector<ggml_backend_dev_t> gpu_devs = params_base.devices;
+                if (gpu_devs.empty()) {
                     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-                        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) { mtmd_split_devs.push_back(dev); }
+                        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) { gpu_devs.push_back(dev); }
                     }
                 }
-                if (mtmd_split_devs.size() > 1) {
-                    mparams.devices   = mtmd_split_devs.data();
-                    mparams.n_devices = (int) mtmd_split_devs.size();
+                std::vector<ggml_backend_dev_t> selected;
+                const char * mtmd_devs_env = getenv("LLAMA_MTMD_DEVICES");
+                if (mtmd_devs_env && *mtmd_devs_env) {
+                    const std::string spec(mtmd_devs_env);
+                    size_t pos = 0;
+                    while (pos <= spec.size()) {
+                        size_t comma = spec.find(',', pos);
+                        if (comma == std::string::npos) { comma = spec.size(); }
+                        size_t b = pos, e = comma;
+                        while (b < e && (spec[b] == ' ' || spec[b] == '\t')) { ++b; }
+                        while (e > b && (spec[e - 1] == ' ' || spec[e - 1] == '\t')) { --e; }
+                        if (e > b) {
+                            const std::string tok = spec.substr(b, e - b);
+                            ggml_backend_dev_t matched = nullptr;
+                            for (ggml_backend_dev_t dev : gpu_devs) {
+                                if (std::strcmp(ggml_backend_dev_name(dev), tok.c_str()) == 0) {
+                                    matched = dev;
+                                    break;
+                                }
+                            }
+                            if (!matched && std::all_of(tok.begin(), tok.end(), [](unsigned char ch) { return ch >= '0' && ch <= '9'; })) {
+                                const size_t idx = (size_t) std::strtoul(tok.c_str(), nullptr, 10);
+                                if (idx < gpu_devs.size()) { matched = gpu_devs[idx]; }
+                            }
+                            if (!matched) {
+                                SRV_WRN("[mtmd] ignoring unknown device '%s' in LLAMA_MTMD_DEVICES\n", tok.c_str());
+                            } else if (std::find(selected.begin(), selected.end(), matched) == selected.end()) {
+                                selected.push_back(matched);
+                            }
+                        }
+                        if (comma == spec.size()) { break; }
+                        pos = comma + 1;
+                    }
+                    if (selected.size() == 1) {
+                        mparams.device    = selected[0];
+                        mparams.devices   = nullptr;
+                        mparams.n_devices = 0;
+                        SRV_INF("[mtmd] LLAMA_MTMD_DEVICES applied (1 device: %s)\n", ggml_backend_dev_name(mparams.device));
+                    } else if (selected.size() > 1) {
+                        mtmd_split_devs   = std::move(selected);
+                        mparams.devices   = mtmd_split_devs.data();
+                        mparams.n_devices = (int) mtmd_split_devs.size();
+                        SRV_INF("[mtmd] LLAMA_MTMD_DEVICES applied (%d device(s))\n", mparams.n_devices);
+                    }
+                }
+                if (mparams.device == nullptr && mparams.n_devices == 0) {
+                    const char * split_env = getenv("LLAMA_MTMD_SPLIT");
+                    if (!split_env || atoi(split_env) != 0) {
+                        mtmd_split_devs = std::move(gpu_devs);
+                        if (mtmd_split_devs.size() > 1) {
+                            mparams.devices   = mtmd_split_devs.data();
+                            mparams.n_devices = (int) mtmd_split_devs.size();
+                        }
+                    }
                 }
             }
             // progress callback
@@ -4104,6 +4159,11 @@ private:
                 return false;
             }
             SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
+            for (const auto & [dev, size] : mmproj_usage.backend_mem_usage) {
+                if (dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    dash_mtmd_mem[ggml_backend_dev_name(dev)] += size;
+                }
+            }
 
             const char * pool_env = getenv("LLAMA_MTMD_POOL");
             if (!use_mixed_batch() && mparams.use_gpu && mtmd_support_vision(mctx) && (!pool_env || atoi(pool_env) != 0)) {
@@ -6728,26 +6788,64 @@ private:
             }
             if (dft_idle) {
                 std::map<std::string, paraflow_dash_dev> devs;
-                const auto add = [&](ggml_backend_buffer_type_t buft, size_t model_b, size_t ctx_b, size_t comp_b) {
-                    if (!buft || ggml_backend_buft_is_host(buft)) { return; }
+                const auto dev_name_of = [&](ggml_backend_buffer_type_t buft, std::string & name) -> bool {
+                    if (!buft || ggml_backend_buft_is_host(buft)) { return false; }
                     ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-                    const std::string name = dev ? ggml_backend_dev_name(dev) : ggml_backend_buft_name(buft);
-                    auto & e = devs[name];
-                    e.model += model_b; e.context += ctx_b; e.compute += comp_b;
+                    name = dev ? ggml_backend_dev_name(dev) : ggml_backend_buft_name(buft);
+                    return true;
                 };
-                for (const auto & [buft, mb] : llama_get_memory_breakdown(ctx_tgt)) { add(buft, mb.model, mb.context, mb.compute); }
-                for (const auto & [buft, sz] : llama_get_pipeline_aux_memory_breakdown(ctx_tgt)) { add(buft, 0, 0, sz); }
+                for (const auto & [buft, mb] : llama_get_memory_breakdown(ctx_tgt)) {
+                    std::string name;
+                    if (!dev_name_of(buft, name)) { continue; }
+                    auto & e = devs[name];
+                    e.model += mb.model; e.context += mb.context; e.compute += mb.compute;
+                }
+                for (const auto & [buft, sz] : llama_get_pipeline_aux_memory_breakdown(ctx_tgt)) {
+                    std::string name;
+                    if (!dev_name_of(buft, name)) { continue; }
+                    devs[name].compute += sz;
+                }
                 if (ctx_dft) {
                     const bool shared = llama_get_model(ctx_dft) == llama_get_model(ctx_tgt);
-                    for (const auto & [buft, mb] : llama_get_memory_breakdown(ctx_dft)) { add(buft, shared ? 0 : mb.model, mb.context, mb.compute); }
-                    for (const auto & [buft, sz] : llama_get_pipeline_aux_memory_breakdown(ctx_dft)) { add(buft, 0, 0, sz); }
+                    if (shared) {
+                        for (const auto & [buft, sz] : llama_get_model_nextn_memory_breakdown(llama_get_model(ctx_tgt))) {
+                            std::string name;
+                            if (!dev_name_of(buft, name)) { continue; }
+                            auto & e = devs[name];
+                            const uint64_t mv = std::min<uint64_t>(e.model, sz);
+                            e.model       -= mv;
+                            e.draft_model += mv;
+                        }
+                    }
+                    for (const auto & [buft, mb] : llama_get_memory_breakdown(ctx_dft)) {
+                        std::string name;
+                        if (!dev_name_of(buft, name)) { continue; }
+                        auto & e = devs[name];
+                        if (!shared) { e.draft_model += mb.model; }
+                        e.draft_context += mb.context;
+                        e.draft_compute += mb.compute;
+                    }
+                    for (const auto & [buft, sz] : llama_get_pipeline_aux_memory_breakdown(ctx_dft)) {
+                        std::string name;
+                        if (!dev_name_of(buft, name)) { continue; }
+                        devs[name].draft_compute += sz;
+                    }
+                }
+                for (const auto & [name, sz] : dash_mtmd_mem) {
+                    devs[name].vision += sz;
                 }
                 d.n_dev = 0;
                 for (auto & [name, e] : devs) {
                     if (d.n_dev >= 16) { break; }
                     auto & o = d.dev[d.n_dev++];
                     snprintf(o.name, sizeof(o.name), "%s", name.c_str());
-                    o.model = e.model; o.context = e.context; o.compute = e.compute;
+                    o.model         = e.model;
+                    o.draft_model   = e.draft_model;
+                    o.draft_context = e.draft_context;
+                    o.draft_compute = e.draft_compute;
+                    o.vision        = e.vision;
+                    o.context       = e.context;
+                    o.compute       = e.compute;
                     o.used = 0;
                     const auto it = dash_dev_total.find(name);
                     o.total = it != dash_dev_total.end() ? it->second : 0;
@@ -6773,6 +6871,7 @@ private:
 
     std::map<std::string, uint64_t> dash_dev_total;
     std::map<std::string, ggml_backend_dev_t> dash_devs;
+    std::map<std::string, uint64_t> dash_mtmd_mem;
 
     paraflow_dash_bucket & dash_hist_bucket(int64_t k) {
         auto & b = dash_hist[k % PARAFLOW_DASH_BUCKETS];
@@ -9320,8 +9419,9 @@ void server_routes::init_routes() {
         o += "],\"devices\":[";
         for (int i = 0; i < d.n_dev; ++i) {
             const auto & e = d.dev[i];
-            snprintf(b, sizeof(b), "%s{\"name\":\"%s\",\"model\":%" PRIu64 ",\"context\":%" PRIu64 ",\"compute\":%" PRIu64 ",\"used\":%" PRIu64 ",\"total\":%" PRIu64 "}",
-                     i ? "," : "", e.name, e.model, e.context, e.compute, e.used, e.total);
+            snprintf(b, sizeof(b),
+                     "%s{\"name\":\"%s\",\"model\":%" PRIu64 ",\"draft_model\":%" PRIu64 ",\"draft_context\":%" PRIu64 ",\"draft_compute\":%" PRIu64 ",\"vision\":%" PRIu64 ",\"context\":%" PRIu64 ",\"compute\":%" PRIu64 ",\"used\":%" PRIu64 ",\"total\":%" PRIu64 "}",
+                     i ? "," : "", e.name, e.model, e.draft_model, e.draft_context, e.draft_compute, e.vision, e.context, e.compute, e.used, e.total);
             o += b;
         }
         o += "]";

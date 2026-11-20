@@ -113,6 +113,9 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
 // compute buffers of the pipelined generation scheduler (not part of llama_get_memory_breakdown)
 LLAMA_API std::map<ggml_backend_buffer_type_t, size_t> llama_get_pipeline_aux_memory_breakdown(const struct llama_context * ctx);
 
+// weight memory belonging to embedded NextN / MTP draft layers (subset of model weights)
+LLAMA_API std::map<ggml_backend_buffer_type_t, size_t> llama_get_model_nextn_memory_breakdown(const struct llama_model * model);
+
 // the backend buffers that a state write of this memory would touch - empty caches report none
 LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t mem);
 
