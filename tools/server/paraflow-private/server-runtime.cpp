@@ -215,6 +215,15 @@ struct server_batch {
         tokens.reserve(n_tokens_alloc);
     }
 
+    void reset_for(llama_context * ctx, int32_t alloc_n, int32_t embd_n) {
+        if (n_tokens_alloc != alloc_n || n_embd != embd_n) {
+            *this = {};
+            init(ctx, alloc_n, embd_n);
+        } else {
+            clear();
+        }
+    }
+
     bool add(int32_t id_slot, llama_token token, llama_pos pos, bool output, bool is_prompt) {
         if ((int32_t)tokens.size() >= n_tokens_alloc) {
             return false;
@@ -2414,7 +2423,7 @@ private:
                     dp.drafting = false;
                     if (dp.result) { dp.result->clear(); }
                     if (dp.result_q) { dp.result_q->clear(); }
-                    const size_t len = dp.prompt ? dp.prompt->size() : 0;
+                    const size_t len = dp.prompt && !dp.prompt->empty() ? dp.prompt->size() : (size_t) std::max<llama_pos>(0, dp.pos0);
                     if (victim < 0 || len > victim_len) { victim = id; victim_len = len; }
                 }
                 ++pipeline_draft_step_failures;
@@ -3000,8 +3009,7 @@ private:
         // Recheck the budget for every car, including that immediate reissue.
         ensure_generation_capacity();
         pipeline_filter = lane_id;
-        batch = {};
-        batch.init(ctx_tgt, llama_n_batch(ctx_tgt), llama_model_n_embd_inp(model_tgt));
+        batch.reset_for(ctx_tgt, llama_n_batch(ctx_tgt), llama_model_n_embd_inp(model_tgt));
         if (lane.shared_draft_staged) {
             GGML_ASSERT(pipeline_ready_draft_batch && lane.shared_draft_ready);
             lane.shared_draft_staged = lane.shared_draft_ready = false;
@@ -3137,7 +3145,8 @@ private:
                 GGML_ASSERT(owner < 0 || owner == lane_id);
                 owner = lane_id;
             }
-            lane.batch = std::move(batch);
+            std::swap(lane.batch, batch);
+            batch.clear();
             lane.in_flight = true;
             lane.issued_us = ggml_time_us();
             if (pipeline_work_mixed) { ++pipeline_work_issued[lane_id]; }
@@ -3167,7 +3176,8 @@ private:
         lane.in_flight = false;
         pipeline_filter = lane_id;
         pipeline_settling = true;
-        batch = std::move(lane.batch);
+        std::swap(batch, lane.batch);
+        lane.batch.clear();
         try {
             if (lane.prefill_slot >= 0) {
                 const auto & slot = slots.at(lane.prefill_slot);
@@ -7144,13 +7154,7 @@ private:
     void prepare_decode_generations(std::vector<server_slot *> & generating, std::vector<server_slot *> & drafting) {
         struct dft_item { common_speculative * spec; int id; bool set; common_speculative_draft_params params; };
         std::vector<dft_item> dft_items;
-        if (dft_exec) {
-            std::vector<std::tuple<common_speculative *, int, bool>> mask;
-            for (const auto & slot : slots) { mask.emplace_back(slot.spec, slot.id, slot.can_speculate()); }
-            dft_run([mask = std::move(mask)]() {
-                for (const auto & m : mask) { common_speculative_set_enabled(std::get<0>(m), std::get<1>(m), std::get<2>(m)); }
-            });
-        } else {
+        if (!dft_exec) {
             for (const auto & slot : slots) {
                 common_speculative_set_enabled(slot.spec, slot.id, slot.can_speculate());
             }
@@ -7276,7 +7280,12 @@ private:
                             slot.spec_ckpt.update_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
-                        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        const bool uses_prompt = common_speculative_uses_prompt(slot.spec);
+                        if (uses_prompt) {
+                            slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        } else {
+                            slot.spec_prompt.clear();
+                        }
 
                         const bool spec_reject = slot.use_spec_rejection();
 
@@ -7285,7 +7294,7 @@ private:
                             /* .n_max    = */ n_draft_max,
                             /* .pos0     = */ slot.prompt.tokens.pos_next(),
                             /* .id_last  = */ slot.sampled,
-                            /* .prompt   = */ &slot.spec_prompt,
+                            /* .prompt   = */ uses_prompt ? &slot.spec_prompt : nullptr,
                             /* .result   = */ &slot.spec_draft,
                             /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
                             /* .temp     = */ slot.task->params.sampling.temp,
@@ -7300,12 +7309,16 @@ private:
             }
         });
 
-        if (dft_exec && !dft_items.empty()) {
-            const bool async = dft_route;
+        if (dft_exec) {
+            std::vector<std::tuple<common_speculative *, int, bool>> mask;
+            mask.reserve(slots.size());
+            for (const auto & slot : slots) { mask.emplace_back(slot.spec, slot.id, slot.can_speculate()); }
+            const bool async = dft_route && !dft_items.empty();
             if (async) {
                 for (const auto & it : dft_items) { if (it.set) { dft_done[it.id].store(false, std::memory_order_relaxed); } }
             }
-            dft_run([this, items = std::move(dft_items), async]() {
+            dft_run([this, mask = std::move(mask), items = std::move(dft_items), async]() {
+                for (const auto & m : mask) { common_speculative_set_enabled(std::get<0>(m), std::get<1>(m), std::get<2>(m)); }
                 for (const auto & it : items) {
                     auto & dp = common_speculative_get_draft_params(it.spec, it.id);
                     if (it.set) { dp = it.params; } else { dp.drafting = false; }

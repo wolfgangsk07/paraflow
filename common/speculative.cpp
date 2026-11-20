@@ -3186,7 +3186,7 @@ void common_speculative_draft(common_speculative * spec) {
 
                 if (!result.empty()) {
                     SPC_DBG("called impl %s, hist size = %zu, call_count = %zu, gen = %zu\n",
-                            common_speculative_type_to_str(impl.get()->type).c_str(), dp.prompt->size(),
+                            common_speculative_type_to_str(impl.get()->type).c_str(), dp.prompt ? dp.prompt->size() : (size_t) 0,
                             impl.get()->n_call_draft, result.size());
 
                     // remember which implementation was used
@@ -3220,6 +3220,18 @@ void common_speculative_draft(common_speculative * spec) {
 bool common_speculative_supports_draft_step(const common_speculative * spec) {
     return spec && spec->impls.size() == 1 && spec->impls[0]->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP &&
             static_cast<const common_speculative_impl_draft_mtp &>(*spec->impls[0]).supports_step();
+}
+
+bool common_speculative_uses_prompt(const common_speculative * spec) {
+    if (!spec) {
+        return false;
+    }
+    for (const auto & impl : spec->impls) {
+        if (impl && impl->type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void common_speculative_draft_step(common_speculative * spec) {

@@ -107,6 +107,7 @@ void common_speculative_draft(common_speculative * spec);
 // until its drafting flag clears, and drain pending steps before cancel/restore.
 // Only an independent, single-head MTP implementation supports this interface.
 bool common_speculative_supports_draft_step(const common_speculative * spec);
+bool common_speculative_uses_prompt(const common_speculative * spec);
 void common_speculative_draft_step(common_speculative * spec);
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
