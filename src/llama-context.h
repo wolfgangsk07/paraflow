@@ -520,7 +520,6 @@ private:
 
     std::vector<int32_t> seq_direct_topk;
     int32_t              cur_logits_topk = 0;
-    int32_t              pf_reserved_logits_topk = 0;
 
     // Retained lane outputs cannot be recycled while faster lanes submit again.
     // Unretained prompt/legacy tickets keep the existing rotating-slab policy.

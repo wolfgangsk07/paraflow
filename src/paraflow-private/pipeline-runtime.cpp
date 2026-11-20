@@ -219,7 +219,6 @@ void llama_context::set_decode_pipelined(bool enable) {
 
             const int32_t prev_topk = cur_logits_topk;
             cur_logits_topk = 0;
-            pf_reserved_logits_topk = 0;
             const bool pf_ok = graph_reserve(n_tokens_pp,
                             llama_prefill_initial_reserve_sequences(model, cparams, cparams.n_seq_max),
                             llama_prefill_initial_reserve_sequences(model, cparams, cparams.n_seq_max) != cparams.n_seq_max

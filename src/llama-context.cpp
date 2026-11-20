@@ -2491,7 +2491,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         if (can_slab) {
             int32_t batch_topk = 0;
-            if (n_outputs_all > 0 && n_vocab >= 128 && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+            const bool will_use_prefill_sched = decode_pipelined && prefill_sched &&
+                    (pipe_lane_hint < 0 || n_tokens_all > cparams.n_outputs_max || n_outputs_all < n_tokens_all);
+            if (!will_use_prefill_sched && n_outputs_all > 0 && n_vocab >= 128 && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
                 int32_t max_k = 0;
                 bool all_eligible = true;
                 for (const auto & tok : batch_inp.tokens) {
@@ -2611,9 +2613,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
             // needs to happen before the graph is built
             n_outputs = n_outputs_new;
-            if (pf_cur && n_outputs > 0) {
-                pf_reserved_logits_topk = cur_logits_topk;
-            }
         }
 
         if (!decode_pipelined && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
@@ -3611,10 +3610,10 @@ llm_graph_params llama_context::graph_params(
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
-        /*.logits_topk =*/ n_outputs > 0
-                ? cur_logits_topk
-                : (decode_pipelined && cur_sched() == prefill_sched.get()
-                        ? pf_reserved_logits_topk
+        /*.logits_topk =*/ (decode_pipelined && cur_sched() == prefill_sched.get())
+                ? 0
+                : (n_outputs > 0
+                        ? cur_logits_topk
                         : (decode_pipelined && gf_res_cur != nullptr
                                 ? default_pipelined_logits_topk()
                                 : 0)),
@@ -3631,10 +3630,10 @@ void llama_context::pf_sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgra
     auto * lctx = static_cast<llama_context *>(user_data);
     const uint64_t n = lctx->pf_reallocs.fetch_add(1, std::memory_order_relaxed) + 1;
     if (paraflow_issue_profile_enabled() && (n <= 15 || n % 25 == 0)) {
-        std::fprintf(stderr, "PF_REALLOC n=%llu backend_ids_changed=%d graph_size_changed=%d nodes=%d splits=%d n_outputs=%d cur_topk=%d pf_topk=%d\n",
+        std::fprintf(stderr, "PF_REALLOC n=%llu backend_ids_changed=%d graph_size_changed=%d nodes=%d splits=%d n_outputs=%d cur_topk=%d\n",
                 (unsigned long long) n, (int) backend_ids_changed, (int) graph_size_changed,
                 ggml_graph_n_nodes(gf), ggml_backend_sched_get_n_splits(sched),
-                lctx->n_outputs, lctx->cur_logits_topk, lctx->pf_reserved_logits_topk);
+                lctx->n_outputs, lctx->cur_logits_topk);
     }
 }
 
