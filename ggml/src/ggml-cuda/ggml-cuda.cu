@@ -3996,12 +3996,17 @@ static const void * ggml_cuda_graph_get_key(const ggml_backend_cuda_context * cu
     for (int i = tail_start; i < cgraph->n_nodes; ++i) {
         fold_tail(key, cgraph->nodes[i]);
     }
+    int n_nonempty = 0;
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * n = cgraph->nodes[i];
+        if (!ggml_cuda_is_view_or_noop(n) && (n->flags & GGML_TENSOR_FLAG_COMPUTE) != 0) {
+            ++n_nonempty;
+        }
         if (n->op == GGML_OP_FLASH_ATTN_EXT && !ggml_is_empty(n)) {
             key = (key ^ (uintptr_t) ggml_cuda_flash_attn_ext_graph_key_tag(cuda_ctx->device, n)) * 0x9E3779B97F4A7C15ull;
         }
     }
+    key = (key ^ (uintptr_t) n_nonempty) * 0x9E3779B97F4A7C15ull;
     return (const void *) key;
 }
 

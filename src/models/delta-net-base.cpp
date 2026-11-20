@@ -593,6 +593,9 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         res->add_fused_node({n_seq_tokens > 1 ? LLM_FUSED_OP_GDN_CH : LLM_FUSED_OP_GDN_AR, out, il});
         const size_t scores = S_v * H_v * n_seq_tokens * n_seqs * sizeof(float);
         const size_t state_bytes = D * n_seqs * sizeof(float);
+        // Keep DFS node ordering identical across n_seq_tokens <= K and > K so
+        // prefill_sched never reallocates on K-token prompt tails.
+        ggml_build_forward_expand(gf, out);
         auto * initial = n_seq_tokens > K ?
             ggml_view_2d(ctx0, out, D, n_seqs, D * sizeof(float), scores + K * state_bytes) :
             ggml_reshape_2d(ctx0, s, D, n_seqs);
