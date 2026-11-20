@@ -2173,7 +2173,11 @@ private:
         if (task.type != SERVER_TASK_TYPE_COMPLETION) { return false; }
         const bool mtp_ok = dft_exec && pipeline_ready_draft_batch;
         const bool vip_free = !vip_pause_needed();
-        if ((params_base.vip_enable && task.params.priority > 0 && !vip_free) || (task.params.mtp && !mtp_ok) || system_cache_limit != 0) { return false; }
+        if ((params_base.vip_enable && task.params.priority > 0 && !vip_free) || (task.params.mtp && !mtp_ok)) { return false; }
+        if (system_cache_limit != 0) {
+            const int sys_boundary = system_prefix_length(task);
+            if (sys_boundary > 0 && find_system_prefix(task, sys_boundary) != nullptr) { return false; }
+        }
         if (!suspended_requests.empty() || (queue_tasks.has_pending_vip() && !vip_free)) { return false; }
         bool mtp_seen = task.params.mtp;
         for (const auto & slot : slots) {

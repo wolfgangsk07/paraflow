@@ -2611,6 +2611,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
             // needs to happen before the graph is built
             n_outputs = n_outputs_new;
+            if (pf_cur && n_outputs > 0) {
+                pf_reserved_logits_topk = cur_logits_topk;
+            }
         }
 
         if (!decode_pipelined && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
@@ -3610,9 +3613,11 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.logits_topk =*/ n_outputs > 0
                 ? cur_logits_topk
-                : (decode_pipelined && (cur_sched() == prefill_sched.get() || gf_res_cur != nullptr)
-                        ? default_pipelined_logits_topk()
-                        : 0),
+                : (decode_pipelined && cur_sched() == prefill_sched.get()
+                        ? pf_reserved_logits_topk
+                        : (decode_pipelined && gf_res_cur != nullptr
+                                ? default_pipelined_logits_topk()
+                                : 0)),
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
@@ -3623,12 +3628,14 @@ int32_t llama_context::default_pipelined_logits_topk() const {
 }
 
 void llama_context::pf_sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data) {
-    GGML_UNUSED(sched);
-    GGML_UNUSED(gf);
-    GGML_UNUSED(backend_ids_changed);
-    GGML_UNUSED(graph_size_changed);
     auto * lctx = static_cast<llama_context *>(user_data);
-    lctx->pf_reallocs.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t n = lctx->pf_reallocs.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (paraflow_issue_profile_enabled() && (n <= 15 || n % 25 == 0)) {
+        std::fprintf(stderr, "PF_REALLOC n=%llu backend_ids_changed=%d graph_size_changed=%d nodes=%d splits=%d n_outputs=%d cur_topk=%d pf_topk=%d\n",
+                (unsigned long long) n, (int) backend_ids_changed, (int) graph_size_changed,
+                ggml_graph_n_nodes(gf), ggml_backend_sched_get_n_splits(sched),
+                lctx->n_outputs, lctx->cur_logits_topk, lctx->pf_reserved_logits_topk);
+    }
 }
 
 void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data) {

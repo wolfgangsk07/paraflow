@@ -7856,6 +7856,15 @@ static ggml_backend_t ggml_backend_cuda_init_background(ggml_backend_dev_t dev) 
     if (backend != nullptr) {
         auto * bg_ctx = (ggml_backend_cuda_context *) backend->context;
         bg_ctx->stream_priority = 0;
+#ifdef USE_CUDA_GRAPH
+        static const bool bg_graphs_disabled = []() {
+            const char * env = std::getenv("GGML_CUDA_BG_GRAPHS");
+            return env != nullptr && std::atoi(env) == 0;
+        }();
+        if (bg_graphs_disabled) {
+            bg_ctx->disable_cuda_graphs = true;
+        }
+#endif
     }
     return backend;
 }
