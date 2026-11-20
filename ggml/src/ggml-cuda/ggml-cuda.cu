@@ -3889,18 +3889,6 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
 
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
 
-#if defined(GGML_USE_VMM)
-    if (cuda_ctx->pools[cuda_ctx->device][cuda_ctx->curr_stream_no] != nullptr) {
-        if (auto * vmm = dynamic_cast<ggml_cuda_pool_vmm *>(cuda_ctx->pools[cuda_ctx->device][cuda_ctx->curr_stream_no].get())) {
-            if (vmm->has_reclaimable(0, size_t(32) << 20)) {
-                ggml_cuda_capture_fence fence;
-                (void) fence;
-                vmm->trim_locked(0, size_t(32) << 20);
-            }
-        }
-    }
-#endif
-
     GGML_UNUSED(backend);
 }
 
