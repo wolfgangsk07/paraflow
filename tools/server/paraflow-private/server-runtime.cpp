@@ -2048,6 +2048,16 @@ private:
     // Test-only fault injection: report prompt tickets not-ready until this long after issue
     // (simulates a slow prompt car so QA fixtures exercise generation overtaking). 0 = off.
     const int64_t pipeline_test_prompt_hold_us = server_test_hook("LLAMA_PIPE_TEST_PROMPT_HOLD_US");
+    // Opt-in peak-shaving: when > 0 and generating slots are active, require at least K
+    // settled decode cars between consecutive prefill chunks (0 = disabled / TTFT priority).
+    const int pipeline_prefill_pace_decodes = []() {
+        const char * env = std::getenv("PARAFLOW_PREFILL_PACE_DECODES");
+        if (!env || !*env) { return 0; }
+        return std::max(0, std::atoi(env));
+    }();
+    uint64_t pipeline_decode_since_prefill = 0;
+    int64_t pipeline_last_prefill_issue_us = 0;
+    mutable uint64_t pipeline_prefill_pace_waits = 0;
     bool pipeline_on = false;
     bool pipeline_async_drafts = false;
     // Experimental ready-only coalescing. One main-thread owner for all mutable
@@ -2937,6 +2947,21 @@ private:
         return false;
     }
 
+    bool pipeline_prefill_paced_out() const {
+        if (pipeline_prefill_pace_decodes <= 0) { return false; }
+        if (pipeline_decode_since_prefill >= (uint64_t) pipeline_prefill_pace_decodes) { return false; }
+        const bool any_active_gen = std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+            return slot.is_processing() && !slot.resident_paused && slot.state == SLOT_STATE_GENERATING;
+        });
+        if (!any_active_gen) { return false; }
+        // Failsafe: never starve prefill > 250ms if decode pauses unexpectedly
+        if (pipeline_last_prefill_issue_us > 0 &&
+                ggml_time_us() - pipeline_last_prefill_issue_us >= 250000) {
+            return false;
+        }
+        return true;
+    }
+
     int pipeline_next_prefill(int lane_id) {
         if (!pipeline_prefill_allowed()) { return -1; }
         if (pipeline_prefill_lanes > 0 && lane_id < pipeline_count) { return -1; }
@@ -2945,6 +2970,7 @@ private:
             in_flight += lane.in_flight && lane.prefill_slot >= 0;
         }
         if (in_flight >= std::max(1, params_base.pipe_pf_inflight)) { return -1; }
+        if (pipeline_prefill_paced_out()) { ++pipeline_prefill_pace_waits; return -1; }
         for (int pass = 0; pass < 2; ++pass)
         for (size_t i = 0; i < slots.size(); ++i) {
             const size_t index = (pipeline_prefill_next + i) % slots.size();
@@ -2964,10 +2990,13 @@ private:
         int in_flight = 0;
         for (const auto & lane : pipeline_lanes) { in_flight += lane.in_flight && lane.prefill_slot >= 0; }
         if (in_flight >= std::max(1, params_base.pipe_pf_inflight)) { return false; }
-        return std::any_of(slots.begin(), slots.end(), [this](const server_slot & slot) {
+        const bool has_prompt = std::any_of(slots.begin(), slots.end(), [this](const server_slot & slot) {
             return !slot.resident_paused && slot.task &&
                 (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT) && !mtmd_pending(slot);
         });
+        if (!has_prompt) { return false; }
+        if (pipeline_prefill_paced_out()) { ++pipeline_prefill_pace_waits; return false; }
+        return true;
     }
 
     bool pipeline_can_run() const {
@@ -3055,7 +3084,11 @@ private:
                     [](const server_batch::token & token) { return token.is_prompt; });
             pipeline_prompt_payload += prompt_payload;
             pipeline_decode_payload += batch.size() - prompt_payload;
-            if (prompt_payload) { ++pipeline_prefill_cars; }
+            if (prompt_payload) {
+                ++pipeline_prefill_cars;
+                pipeline_decode_since_prefill = 0;
+                pipeline_last_prefill_issue_us = ggml_time_us();
+            }
             else { ++pipeline_decode_cars; }
             if (prompt_payload && prompt_payload < size_t(batch.size())) { ++pipeline_mixed_cars; }
             batch.render(0, batch.size());
@@ -3225,6 +3258,7 @@ private:
         pipeline_filter = -1;
         pipeline_profile_process_us += ggml_time_us() - process_start;
         pe(PE_SETTLE_E, lane_id);
+        if (lane.prefill_slot < 0) { ++pipeline_decode_since_prefill; }
         ++pipeline_profile_count;
         return lane_id;
     }
@@ -6282,6 +6316,7 @@ private:
                                 {"issue_decode_us", pipeline_issue_kind_us[2]}, {"issue_decode_n", pipeline_issue_kind_n[2]},
                                 {"mixed_cars", pipeline_mixed_cars},
                                 {"prompt_payload", pipeline_prompt_payload}, {"decode_payload", pipeline_decode_payload},
+                                {"prefill_pace_decodes", pipeline_prefill_pace_decodes}, {"prefill_pace_waits", pipeline_prefill_pace_waits},
                             };
                             json draft_histogram = json::object();
                             for (const auto & entry : pipeline_draft_batch_histogram) { draft_histogram[std::to_string(entry.first)] = entry.second; }
